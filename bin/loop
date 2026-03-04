@@ -1,0 +1,623 @@
+#!/bin/bash
+# Simple Loop — autonomous agent loop CLI
+#
+# Usage: loop <command> [args]
+# See 'loop help' for available commands.
+
+set -uo pipefail
+
+# ── Path Resolution ──────────────────────────────────────────
+
+# Find .loop/ directory by walking up from cwd
+find_loop_dir() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.loop" ]; then
+            echo "$dir/.loop"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# Simple Loop install location
+SIMPLE_LOOP_HOME="${SIMPLE_LOOP_HOME:-$HOME/.local/share/simple-loop}"
+LIB_DIR="$SIMPLE_LOOP_HOME/lib"
+TEMPLATES_DIR="$SIMPLE_LOOP_HOME/templates"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+die() { echo "Error: $1" >&2; exit 1; }
+
+require_loop_dir() {
+    LOOP_DIR=$(find_loop_dir) || die "No .loop/ found. Run 'loop init' first."
+    PROJECT_DIR="$(dirname "$LOOP_DIR")"
+    STATE_DIR="$LOOP_DIR/state"
+    SIGNALS_DIR="$STATE_DIR/signals"
+    LOG_DIR="$LOOP_DIR/logs"
+    LOG_FILE="$LOG_DIR/daemon.log"
+    PID_FILE="$STATE_DIR/daemon.pid"
+
+    # Source project config
+    [ -f "$LOOP_DIR/config.sh" ] && source "$LOOP_DIR/config.sh"
+}
+
+pid_alive() {
+    [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+# ── init ─────────────────────────────────────────────────────
+
+cmd_init() {
+    if [ -d ".loop" ]; then
+        die ".loop/ already exists in this directory."
+    fi
+
+    echo ""
+    echo "╔══════════════════════════════════════╗"
+    echo "║       Simple Loop — Setup            ║"
+    echo "╚══════════════════════════════════════╝"
+    echo ""
+
+    # Detect project context
+    local is_git=false
+    local main_branch="main"
+    local detected_framework=""
+
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        is_git=true
+        # Detect main branch
+        if git show-ref --verify --quiet refs/heads/main 2>/dev/null; then
+            main_branch="main"
+        elif git show-ref --verify --quiet refs/heads/master 2>/dev/null; then
+            main_branch="master"
+        fi
+    fi
+
+    # Detect framework
+    if [ -f "package.json" ]; then
+        detected_framework="Node.js"
+    elif [ -f "Cargo.toml" ]; then
+        detected_framework="Rust"
+    elif [ -f "go.mod" ]; then
+        detected_framework="Go"
+    elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+        detected_framework="Python"
+    elif [ -f "*.csproj" ] 2>/dev/null || [ -f "*.sln" ] 2>/dev/null; then
+        detected_framework=".NET"
+    fi
+
+    if [ -n "$detected_framework" ]; then
+        echo "  Detected: $detected_framework project"
+    fi
+    if [ "$is_git" = true ]; then
+        echo "  Git repo: yes (main branch: $main_branch)"
+    fi
+    echo ""
+
+    # Ask questions
+    local project_name
+    local verify_cmd
+    local ntfy_topic
+    local confirm_branch
+
+    read -p "  What's your project called? " project_name
+    project_name="${project_name:-$(basename "$PWD")}"
+
+    echo ""
+    read -p "  What command verifies your project builds/passes? (e.g. npm test, cargo build)
+  > " verify_cmd
+
+    echo ""
+    read -p "  Want push notifications? Enter an ntfy.sh topic, or press Enter to skip.
+  > " ntfy_topic
+
+    if [ "$is_git" = true ]; then
+        echo ""
+        read -p "  Main branch? [$main_branch] " confirm_branch
+        main_branch="${confirm_branch:-$main_branch}"
+    fi
+
+    echo ""
+    echo "  Creating .loop/..."
+
+    # Scaffold directories
+    mkdir -p .loop/{agents,prompts,briefs,state/signals,evaluations,knowledge,logs}
+
+    # Write config
+    cat > .loop/config.sh <<CONF
+# .loop/config.sh — project configuration
+PROJECT_NAME="$project_name"
+HEARTBEAT_INTERVAL=300        # Idle interval (seconds)
+WORKER_COOLDOWN=30            # Between worker iterations
+MAX_ITERATIONS=20             # Safety limit per brief
+NTFY_TOPIC="$ntfy_topic"     # ntfy.sh topic (empty = no push notifications)
+VERIFY_CMD="$verify_cmd"     # Command to run after each task
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="$main_branch"
+CONF
+
+    # Copy templates
+    if [ -d "$TEMPLATES_DIR" ]; then
+        # From installed location
+        cp "$TEMPLATES_DIR/prompts/worker.md" .loop/prompts/worker.md
+        cp "$TEMPLATES_DIR/prompts/conductor.md" .loop/prompts/conductor.md
+        cp "$TEMPLATES_DIR/agents/spec.md" .loop/agents/spec.md
+        cp "$TEMPLATES_DIR/agents/coder.md" .loop/agents/coder.md
+        cp "$TEMPLATES_DIR/agents/reviewer.md" .loop/agents/reviewer.md
+        cp "$TEMPLATES_DIR/agents/researcher.md" .loop/agents/researcher.md
+        cp "$TEMPLATES_DIR/brief-template.md" .loop/briefs/.template.md
+    else
+        # Running from source — look relative to this script
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        if [ -d "$script_dir/templates" ]; then
+            cp "$script_dir/templates/prompts/worker.md" .loop/prompts/worker.md
+            cp "$script_dir/templates/prompts/conductor.md" .loop/prompts/conductor.md
+            cp "$script_dir/templates/agents/spec.md" .loop/agents/spec.md
+            cp "$script_dir/templates/agents/coder.md" .loop/agents/coder.md
+            cp "$script_dir/templates/agents/reviewer.md" .loop/agents/reviewer.md
+            cp "$script_dir/templates/agents/researcher.md" .loop/agents/researcher.md
+            cp "$script_dir/templates/brief-template.md" .loop/briefs/.template.md
+        else
+            echo "  Warning: template directory not found. Creating minimal templates."
+            echo "# Worker Prompt — edit this" > .loop/prompts/worker.md
+            echo "# Conductor Prompt — edit this" > .loop/prompts/conductor.md
+            echo "# Spec Agent — edit this" > .loop/agents/spec.md
+            echo "# Coder Agent — edit this" > .loop/agents/coder.md
+            echo "# Reviewer Agent — edit this" > .loop/agents/reviewer.md
+            echo "# Researcher Agent — edit this" > .loop/agents/researcher.md
+        fi
+    fi
+
+    # Sed project name into templates
+    if command -v sed >/dev/null 2>&1; then
+        find .loop/prompts .loop/agents -name '*.md' -exec \
+            sed -i '' "s/{{PROJECT_NAME}}/$project_name/g" {} + 2>/dev/null || true
+    fi
+
+    # Initialize state files
+    cat > .loop/state/running.json <<'JSON'
+{
+  "active": [],
+  "completed_pending_eval": [],
+  "history": []
+}
+JSON
+
+    cat > .loop/state/goals.md <<'MD'
+# Goals
+
+What are you building? The conductor reads this to decide what to work on.
+
+## Current Priority
+
+<!-- Write your goals here. Be specific about what "done" looks like. -->
+MD
+
+    echo '{}' > .loop/state/metrics.jsonl 2>/dev/null; truncate -s 0 .loop/state/metrics.jsonl 2>/dev/null || true
+    : > .loop/state/metrics.jsonl
+    : > .loop/state/log.jsonl
+
+    cat > .loop/knowledge/learnings.md <<'MD'
+# Project Learnings
+
+Agent-writable knowledge base. Add findings, patterns, and gotchas here.
+MD
+
+    # Add logs to gitignore
+    if [ -f ".gitignore" ]; then
+        if ! grep -q '\.loop/logs' .gitignore 2>/dev/null; then
+            echo "" >> .gitignore
+            echo "# Simple Loop logs" >> .gitignore
+            echo ".loop/logs/" >> .gitignore
+        fi
+    elif [ "$is_git" = true ]; then
+        echo ".loop/logs/" > .gitignore
+    fi
+
+    echo ""
+    echo "  ✓ .loop/ created"
+    echo ""
+    echo "  Next steps:"
+    echo "    1. Edit .loop/state/goals.md — what do you want to build?"
+    echo "    2. Run: loop brief \"your first task\""
+    echo "    3. Run: loop start"
+    echo ""
+}
+
+# ── brief ────────────────────────────────────────────────────
+
+cmd_brief() {
+    require_loop_dir
+    local title="${1:-}"
+    local no_interactive=false
+
+    # Parse flags
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-interactive) no_interactive=true; shift ;;
+            *) title="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$title" ] && die "Usage: loop brief \"title\" [--no-interactive]"
+
+    # Generate brief number
+    local count
+    count=$(find "$LOOP_DIR/briefs" -name 'brief-*.md' 2>/dev/null | wc -l | tr -d ' ')
+    local num=$(printf "%03d" $((count + 1)))
+    local slug
+    slug=$(echo "$title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | head -c 40)
+    local brief_file="$LOOP_DIR/briefs/brief-${num}-${slug}.md"
+
+    if [ "$no_interactive" = true ]; then
+        # Just create from template
+        local template="$LOOP_DIR/briefs/.template.md"
+        if [ -f "$template" ]; then
+            sed "s/\[title\]/$title/g; s/NNN/$num/g; s/slug/$slug/g" "$template" > "$brief_file"
+        else
+            cat > "$brief_file" <<BRIEF
+# Brief: $title
+
+**Branch:** brief-${num}-${slug}
+**Model:** sonnet
+
+## Goal
+[What you're trying to accomplish. 1-2 sentences.]
+
+## Tasks
+1. [One iteration of work]
+2. [One iteration of work]
+3. [One iteration of work]
+
+## Completion Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Verification
+- Builds clean
+BRIEF
+        fi
+
+        echo "Created: $brief_file"
+        echo "Edit this file, then queue it with: loop start"
+
+        # Open in editor if available
+        if [ -n "${EDITOR:-}" ]; then
+            "$EDITOR" "$brief_file"
+        fi
+    else
+        # Interactive spec agent session
+        echo "Starting spec session for: $title"
+        echo ""
+
+        local spec_agent="$LOOP_DIR/agents/spec.md"
+        if [ ! -f "$spec_agent" ]; then
+            die "Spec agent not found at $spec_agent. Run 'loop init' first."
+        fi
+
+        # Run Claude with spec agent
+        cd "$PROJECT_DIR"
+        claude --agent-file "$spec_agent" \
+            -p "Help me write a brief for: \"$title\"
+
+The brief should be saved to: $brief_file
+Brief number: $num
+Branch name: brief-${num}-${slug}
+
+Read .loop/state/goals.md for project context.
+Read .loop/knowledge/learnings.md for accumulated knowledge.
+Follow the brief format in .loop/briefs/.template.md if it exists."
+
+        if [ -f "$brief_file" ]; then
+            echo ""
+            echo "Brief created: $brief_file"
+        else
+            echo ""
+            echo "No brief file was created. You can create one manually:"
+            echo "  loop brief \"$title\" --no-interactive"
+        fi
+    fi
+}
+
+# ── start ────────────────────────────────────────────────────
+
+cmd_start() {
+    require_loop_dir
+    local interval="${1:-${HEARTBEAT_INTERVAL:-300}}"
+
+    if pid_alive; then
+        die "Daemon already running (PID $(cat "$PID_FILE")). Use 'loop stop' first."
+    fi
+
+    mkdir -p "$LOG_DIR" "$SIGNALS_DIR"
+
+    local daemon_script="$LIB_DIR/daemon.sh"
+    if [ ! -f "$daemon_script" ]; then
+        # Try relative to this script (running from source)
+        daemon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/daemon.sh"
+    fi
+    [ -f "$daemon_script" ] || die "daemon.sh not found. Is Simple Loop installed?"
+
+    echo "Starting daemon (interval=${interval}s)..."
+
+    # Use caffeinate on macOS to prevent sleep
+    if command -v caffeinate >/dev/null 2>&1; then
+        caffeinate -s bash "$daemon_script" "$PROJECT_DIR" "$interval" \
+            >> "$LOG_FILE" 2>&1 &
+    else
+        bash "$daemon_script" "$PROJECT_DIR" "$interval" \
+            >> "$LOG_FILE" 2>&1 &
+    fi
+    local daemon_pid=$!
+
+    sleep 1
+
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+        echo "Daemon running (PID $daemon_pid). Logs: loop logs -f"
+    else
+        die "Daemon failed to start. Check: loop logs"
+    fi
+}
+
+# ── stop ─────────────────────────────────────────────────────
+
+cmd_stop() {
+    require_loop_dir
+
+    if ! [ -f "$PID_FILE" ]; then
+        echo "No PID file found. Daemon not running."
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$PID_FILE")
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Stale PID file (process $pid not running). Cleaning up."
+        rm -f "$PID_FILE"
+        return 0
+    fi
+
+    echo "Stopping daemon (PID $pid)..."
+
+    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+    pkill -P "$pid" 2>/dev/null
+
+    sleep 1
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Graceful stop failed, sending SIGKILL..."
+        kill -9 "$pid" 2>/dev/null
+        pkill -9 -P "$pid" 2>/dev/null
+    fi
+
+    rm -f "$PID_FILE"
+    echo "Stopped."
+}
+
+# ── status ───────────────────────────────────────────────────
+
+cmd_status() {
+    require_loop_dir
+
+    echo ""
+    echo "╔══════════════════════════════════════╗"
+    echo "║       Simple Loop Status             ║"
+    echo "╚══════════════════════════════════════╝"
+    echo ""
+
+    # Daemon
+    if pid_alive; then
+        echo "  Daemon:   RUNNING (PID $(cat "$PID_FILE"))"
+    else
+        echo "  Daemon:   STOPPED"
+    fi
+
+    # Project
+    echo "  Project:  ${PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
+    echo "  Dir:      $PROJECT_DIR"
+
+    # Pause state
+    if [ -f "$SIGNALS_DIR/pause.json" ]; then
+        local reason
+        reason=$(python3 -c "import json; print(json.load(open('$SIGNALS_DIR/pause.json')).get('reason','unknown'))" 2>/dev/null || echo "unknown")
+        echo "  Signal:   PAUSED ($reason)"
+    else
+        echo "  Signal:   clear"
+    fi
+
+    # Active briefs
+    if [ -f "$STATE_DIR/running.json" ]; then
+        python3 -c "
+import json, sys
+with open('$STATE_DIR/running.json') as f:
+    rc = json.load(f)
+active = rc.get('active', [])
+pending = rc.get('completed_pending_eval', [])
+if active:
+    for b in active:
+        print(f\"  Active:   {b.get('brief', '?')} ({b.get('branch', '?')})\")
+elif pending:
+    for b in pending:
+        print(f\"  Pending:  {b.get('brief', '?')} (awaiting eval)\")
+else:
+    print('  Briefs:   none active')
+" 2>/dev/null || echo "  Briefs:   no state"
+    else
+        echo "  Briefs:   no state file"
+    fi
+
+    echo ""
+
+    # Recent logs
+    if [ -f "$LOG_FILE" ]; then
+        echo "  Recent log:"
+        grep '^\[' "$LOG_FILE" 2>/dev/null | tail -5 | while IFS= read -r line; do
+            echo "    $line"
+        done
+    fi
+    echo ""
+}
+
+# ── logs ─────────────────────────────────────────────────────
+
+cmd_logs() {
+    require_loop_dir
+
+    if [ "${1:-}" = "-f" ]; then
+        if [ -f "$LOG_FILE" ]; then
+            tail -f "$LOG_FILE"
+        else
+            die "No log file at $LOG_FILE"
+        fi
+    else
+        if [ -f "$LOG_FILE" ]; then
+            grep '^\[' "$LOG_FILE" 2>/dev/null | tail -30
+        else
+            echo "No logs yet."
+        fi
+    fi
+}
+
+# ── pause ────────────────────────────────────────────────────
+
+cmd_pause() {
+    require_loop_dir
+    local reason="${1:-manual pause}"
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    mkdir -p "$SIGNALS_DIR"
+    printf '{"reason":"%s","timestamp":"%s"}' "$reason" "$timestamp" > "$SIGNALS_DIR/pause.json"
+
+    # Commit and push if in git
+    if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cd "$PROJECT_DIR"
+        git add ".loop/state/signals/pause.json"
+        git commit -m "loop: pause — $reason" -q 2>/dev/null
+        git push "${GIT_REMOTE:-origin}" "${GIT_MAIN_BRANCH:-main}" -q 2>/dev/null || true
+    fi
+
+    echo "Paused: $reason"
+}
+
+# ── resume ───────────────────────────────────────────────────
+
+cmd_resume() {
+    require_loop_dir
+    local instruction="${1:-}"
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    mkdir -p "$SIGNALS_DIR"
+
+    if [ -n "$instruction" ]; then
+        printf '{"instruction":"%s","timestamp":"%s"}' "$instruction" "$timestamp" > "$SIGNALS_DIR/resume.json"
+    else
+        printf '{"timestamp":"%s"}' "$timestamp" > "$SIGNALS_DIR/resume.json"
+    fi
+
+    # Commit and push if in git
+    if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cd "$PROJECT_DIR"
+        git add ".loop/state/signals/resume.json"
+        [ -f "$SIGNALS_DIR/pause.json" ] && git rm -q ".loop/state/signals/pause.json" 2>/dev/null || true
+        git commit -m "loop: resume" -q 2>/dev/null
+        git push "${GIT_REMOTE:-origin}" "${GIT_MAIN_BRANCH:-main}" -q 2>/dev/null || true
+    fi
+
+    echo "Resumed."
+    [ -n "$instruction" ] && echo "Instruction: $instruction"
+}
+
+# ── metrics ──────────────────────────────────────────────────
+
+cmd_metrics() {
+    require_loop_dir
+
+    local metrics_script="$LIB_DIR/metrics-report.py"
+    if [ ! -f "$metrics_script" ]; then
+        metrics_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/metrics-report.py"
+    fi
+
+    if [ -f "$metrics_script" ]; then
+        python3 "$metrics_script" "$PROJECT_DIR" "$@"
+    else
+        # Inline fallback
+        local metrics_file="$STATE_DIR/metrics.jsonl"
+        if [ ! -f "$metrics_file" ] || [ ! -s "$metrics_file" ]; then
+            echo "No metrics data yet."
+            return 0
+        fi
+        python3 -c "
+import json, sys
+from collections import defaultdict
+
+total = 0
+by_source = defaultdict(lambda: {'cost': 0, 'count': 0})
+
+with open('$metrics_file') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            e = json.loads(line)
+            cost = e.get('cost_usd', 0)
+            total += cost
+            src = e.get('source', 'unknown')
+            by_source[src]['cost'] += cost
+            by_source[src]['count'] += 1
+        except: continue
+
+print(f'Total cost: \${total:.2f}')
+for src, data in sorted(by_source.items()):
+    print(f'  {src}: \${data[\"cost\"]:.2f} ({data[\"count\"]} sessions)')
+" "$@"
+    fi
+}
+
+# ── help ─────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<'EOF'
+Usage: loop <command> [args]
+
+Commands:
+  init                     Set up .loop/ in current directory (interactive)
+  brief "title"            Write a brief with the spec agent (interactive)
+  brief --no-interactive   Create brief from template, open in $EDITOR
+  start [interval]         Start the daemon (default: 300s heartbeat)
+  stop                     Stop the daemon
+  status                   Show daemon state, active brief, recent logs
+  logs [-f]                Show/follow daemon logs
+  pause [reason]           Pause daemon (commits + pushes signal)
+  resume [instruction]     Resume daemon (commits + pushes signal)
+  metrics [--since DATE]   Cost report from metrics
+  help                     Show this message
+
+Quickstart:
+  loop init                # Answer a few questions
+  loop brief "add auth"    # Write a brief with the spec agent
+  loop start               # Start the autonomous loop
+  loop status              # Check progress
+EOF
+}
+
+# ── Dispatch ─────────────────────────────────────────────────
+
+case "${1:-help}" in
+    init)    shift; cmd_init "$@" ;;
+    brief)   shift; cmd_brief "$@" ;;
+    start)   shift; cmd_start "$@" ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    logs)    shift; cmd_logs "$@" ;;
+    pause)   shift; cmd_pause "$@" ;;
+    resume)  shift; cmd_resume "$@" ;;
+    metrics) shift; cmd_metrics "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)       echo "Unknown command: $1"; cmd_help; exit 1 ;;
+esac
