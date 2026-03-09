@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Research module state files",
+  "files": {
+    "findings.md": {
+      "description": "Accumulated research findings, structured by question",
+      "format": "markdown",
+      "created_on": "brief_init",
+      "updated_by": "worker"
+    },
+    "sources.json": {
+      "description": "Sources examined during research",
+      "format": "json_array",
+      "created_on": "brief_init",
+      "updated_by": "worker",
+      "item_schema": {
+        "url": "string",
+        "type": "web_page|paper|repo|file",
+        "title": "string",
+        "status": "found|reading|read|irrelevant",
+        "summary": "string",
+        "found_at_iteration": "number"
+      }
+    },
+    "coverage.json": {
+      "description": "Per-question coverage assessment",
+      "format": "json_object",
+      "created_on": "brief_init",
+      "updated_by": "worker|evaluator",
+      "schema": {
+        "questions": [
+          {
+            "question": "string",
+            "status": "open|partial|answered",
+            "source_count": "number",
+            "confidence": "low|medium|high",
+            "notes": "string"
+          }
+        ],
+        "overall_coverage": "number (0-1)"
+      }
+    },
+    "search-log.jsonl": {
+      "description": "Log of searches performed",
+      "format": "jsonl",
+      "created_on": "brief_init",
+      "updated_by": "worker"
+    },
+    "eval-log.jsonl": {
+      "description": "Evaluator decisions over time",
+      "format": "jsonl",
+      "created_on": "brief_init",
+      "updated_by": "evaluator"
+    }
+  }
+}

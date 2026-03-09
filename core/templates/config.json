@@ -1,0 +1,14 @@
+{
+  "project_name": "",
+  "version": "0.2.0",
+  "heartbeat_interval": 300,
+  "worker_cooldown": 30,
+  "max_iterations": 20,
+  "verify_cmd": "",
+  "ntfy_topic": "",
+  "git": {
+    "remote": "origin",
+    "main_branch": "main"
+  },
+  "modules": []
+}

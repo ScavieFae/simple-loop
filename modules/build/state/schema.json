@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Build module state files",
+  "files": {
+    "running.json": {
+      "description": "Brief lifecycle tracking — active, pending eval, history",
+      "format": "json_object",
+      "created_on": "module_init",
+      "updated_by": "conductor|daemon",
+      "schema": {
+        "active": [
+          {
+            "brief": "string",
+            "branch": "string",
+            "brief_file": "string",
+            "dispatched_at": "iso8601"
+          }
+        ],
+        "completed_pending_eval": [],
+        "history": []
+      }
+    },
+    "log.jsonl": {
+      "description": "Conductor decision log",
+      "format": "jsonl",
+      "created_on": "module_init",
+      "updated_by": "conductor"
+    },
+    "learnings.md": {
+      "description": "Accumulated learnings from worker iterations",
+      "format": "markdown",
+      "created_on": "module_init",
+      "updated_by": "worker"
+    },
+    "metrics.jsonl": {
+      "description": "Per-iteration cost and token tracking",
+      "format": "jsonl",
+      "created_on": "module_init",
+      "updated_by": "daemon"
+    }
+  }
+}

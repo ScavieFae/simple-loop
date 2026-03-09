@@ -1,0 +1,41 @@
+{
+  "name": "build",
+  "version": "0.2.0",
+  "description": "Autonomous build loop: brief → worker → evaluate → commit. The v1 simple-loop behavior as a module.",
+  "requires_core": ">=0.2.0",
+  "depends_on": [],
+  "config_schema": {
+    "max_iterations": {
+      "type": "number",
+      "default": 20,
+      "description": "Maximum worker iterations per brief"
+    },
+    "verify_cmd": {
+      "type": "string",
+      "default": "",
+      "description": "Command to run after each task (e.g., 'npm test')"
+    },
+    "default_model": {
+      "type": "string",
+      "default": "sonnet",
+      "description": "Default Claude model for workers"
+    },
+    "max_consecutive_failures": {
+      "type": "number",
+      "default": 3,
+      "description": "Escalate after this many consecutive worker failures"
+    }
+  },
+  "loop": {
+    "mode": "brief",
+    "default_interval": 30
+  },
+  "agents": [
+    "agents/worker.md",
+    "agents/conductor.md",
+    "agents/spec.md"
+  ],
+  "skills": [
+    "skills/write-brief"
+  ]
+}

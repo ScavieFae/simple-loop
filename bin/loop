@@ -25,6 +25,46 @@ find_loop_dir() {
 SIMPLE_LOOP_HOME="${SIMPLE_LOOP_HOME:-$HOME/.local/share/simple-loop}"
 LIB_DIR="$SIMPLE_LOOP_HOME/lib"
 TEMPLATES_DIR="$SIMPLE_LOOP_HOME/templates"
+CORE_DIR="$SIMPLE_LOOP_HOME/core"
+MODULES_DIR="$SIMPLE_LOOP_HOME/modules"
+
+# Resolve source dir (for running from repo without install)
+resolve_source_dir() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    echo "$script_dir"
+}
+
+# Find module dir — checks installed location, then source repo
+find_module_dir() {
+    local module_name="$1"
+    if [ -d "$MODULES_DIR/$module_name" ]; then
+        echo "$MODULES_DIR/$module_name"
+    else
+        local source_dir
+        source_dir="$(resolve_source_dir)"
+        if [ -d "$source_dir/modules/$module_name" ]; then
+            echo "$source_dir/modules/$module_name"
+        else
+            return 1
+        fi
+    fi
+}
+
+# Find core dir — checks installed location, then source repo
+find_core_dir() {
+    if [ -d "$CORE_DIR" ]; then
+        echo "$CORE_DIR"
+    else
+        local source_dir
+        source_dir="$(resolve_source_dir)"
+        if [ -d "$source_dir/core" ]; then
+            echo "$source_dir/core"
+        else
+            return 1
+        fi
+    fi
+}
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -123,7 +163,7 @@ cmd_init() {
     echo "  Creating .loop/..."
 
     # Scaffold directories
-    mkdir -p .loop/{agents,prompts,briefs,state/signals,evaluations,knowledge,logs}
+    mkdir -p .loop/{agents,prompts,briefs,state/signals,evaluations,knowledge,logs,modules}
 
     # Write config
     cat > .loop/config.sh <<CONF
@@ -206,6 +246,38 @@ MD
 Agent-writable knowledge base. Add findings, patterns, and gotchas here.
 MD
 
+    # Create v2 config.json alongside v1 config.sh
+    cat > .loop/config.json <<CJSON
+{
+  "project_name": "$project_name",
+  "version": "0.2.0",
+  "heartbeat_interval": 300,
+  "worker_cooldown": 30,
+  "max_iterations": 20,
+  "verify_cmd": "$verify_cmd",
+  "ntfy_topic": "$ntfy_topic",
+  "git": {
+    "remote": "origin",
+    "main_branch": "$main_branch"
+  },
+  "modules": []
+}
+CJSON
+
+    # Create persistent documents
+    local core_src
+    core_src=$(find_core_dir 2>/dev/null) || true
+
+    for doc in SPEC.md HANDOFF.md RUNNING.md TROUBLESHOOTING.md; do
+        if [ ! -f "$doc" ]; then
+            if [ -n "$core_src" ] && [ -f "$core_src/templates/$doc" ]; then
+                sed "s/{{PROJECT_NAME}}/$project_name/g" "$core_src/templates/$doc" > "$doc"
+            else
+                echo "# ${doc%.md}" > "$doc"
+            fi
+        fi
+    done
+
     # Add logs to gitignore
     if [ -f ".gitignore" ]; then
         if ! grep -q '\.loop/logs' .gitignore 2>/dev/null; then
@@ -217,13 +289,26 @@ MD
         echo ".loop/logs/" > .gitignore
     fi
 
+    # Check Agent Teams
+    if command -v claude >/dev/null 2>&1; then
+        local teams_enabled
+        teams_enabled=$(claude config get enableAgentTeams 2>/dev/null || echo "")
+        if [ "$teams_enabled" != "true" ]; then
+            echo ""
+            echo "  ⚠  Recommendation: enable Agent Teams for best results"
+            echo "     claude config set enableAgentTeams true"
+        fi
+    fi
+
     echo ""
     echo "  ✓ .loop/ created"
+    echo "  ✓ SPEC.md, HANDOFF.md, RUNNING.md, TROUBLESHOOTING.md created"
     echo ""
     echo "  Next steps:"
-    echo "    1. Edit .loop/state/goals.md — what do you want to build?"
-    echo "    2. Run: loop brief \"your first task\""
-    echo "    3. Run: loop start"
+    echo "    1. Edit SPEC.md — what is this project and what are you building?"
+    echo "    2. Add a module:  loop add research   or   loop add build"
+    echo "    3. Write a brief: loop brief \"your first task\""
+    echo "    4. Start the loop: loop start"
     echo ""
 }
 
@@ -579,28 +664,383 @@ for src, data in sorted(by_source.items()):
     fi
 }
 
+# ── add ──────────────────────────────────────────────────────
+
+cmd_add() {
+    require_loop_dir
+    local module_name="${1:-}"
+    [ -z "$module_name" ] && die "Usage: loop add <module>  (e.g., loop add research)"
+
+    # Check if already installed
+    if [ -d "$LOOP_DIR/modules/$module_name" ]; then
+        die "Module '$module_name' is already installed. Use 'loop update' to refresh."
+    fi
+
+    # Find the module
+    local module_src
+    module_src=$(find_module_dir "$module_name") || die "Module '$module_name' not found.
+
+Available modules:
+  research   — Autonomous research: search, read, synthesize, evaluate
+  build      — Autonomous build loop: brief → worker → evaluate → commit"
+
+    echo ""
+    echo "Installing module: $module_name"
+
+    # Check for Agent Teams
+    if command -v claude >/dev/null 2>&1; then
+        local teams_enabled
+        teams_enabled=$(claude config get enableAgentTeams 2>/dev/null || echo "")
+        if [ "$teams_enabled" != "true" ]; then
+            echo ""
+            echo "  ⚠  Agent Teams is not enabled. Simple-loop modules use Agent Teams"
+            echo "     to dispatch research agents and parallel workers."
+            echo ""
+            echo "     Enable it:  claude config set enableAgentTeams true"
+            echo ""
+            read -p "  Continue without Agent Teams? [y/N] " confirm
+            if [ "${confirm:-n}" != "y" ] && [ "${confirm:-n}" != "Y" ]; then
+                echo "  Aborted. Enable Agent Teams and try again."
+                return 1
+            fi
+        fi
+    fi
+
+    # Create module directory
+    mkdir -p "$LOOP_DIR/modules/$module_name"
+
+    # Copy module config (from module.json defaults)
+    if [ -f "$module_src/module.json" ]; then
+        python3 -c "
+import json, sys
+
+with open('$module_src/module.json') as f:
+    module = json.load(f)
+
+# Extract config defaults from schema
+config = {}
+for key, spec in module.get('config_schema', {}).items():
+    if 'default' in spec:
+        config[key] = spec['default']
+
+with open('$LOOP_DIR/modules/$module_name/config.json', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+" || die "Failed to create module config."
+    fi
+
+    # Create state directory with empty state files
+    if [ -d "$module_src/state" ] && [ -f "$module_src/state/schema.json" ]; then
+        mkdir -p "$LOOP_DIR/modules/$module_name/state"
+    fi
+
+    # Copy/symlink skills to .claude/skills/
+    if [ -d "$module_src/skills" ]; then
+        mkdir -p "$PROJECT_DIR/.claude/skills"
+        for skill_dir in "$module_src/skills"/*/; do
+            [ -d "$skill_dir" ] || continue
+            local skill_name
+            skill_name=$(basename "$skill_dir")
+            local target_dir="$PROJECT_DIR/.claude/skills/loop-${module_name}-${skill_name}"
+            if [ -L "$target_dir" ]; then
+                rm "$target_dir"
+            fi
+            ln -sf "$skill_dir" "$target_dir"
+            echo "  Skill: /loop-${module_name}-${skill_name}"
+        done
+    fi
+
+    # Install core skills if not already present
+    local core_src
+    core_src=$(find_core_dir 2>/dev/null) || true
+    if [ -n "$core_src" ] && [ -d "$core_src/skills" ]; then
+        mkdir -p "$PROJECT_DIR/.claude/skills"
+        for skill_dir in "$core_src/skills"/*/; do
+            [ -d "$skill_dir" ] || continue
+            local skill_name
+            skill_name=$(basename "$skill_dir")
+            local target_dir="$PROJECT_DIR/.claude/skills/loop-${skill_name}"
+            if [ ! -L "$target_dir" ] && [ ! -d "$target_dir" ]; then
+                ln -sf "$skill_dir" "$target_dir"
+                echo "  Skill: /loop-${skill_name} (core)"
+            fi
+        done
+    fi
+
+    # Inject claude-instructions into CLAUDE.md
+    if [ -f "$module_src/claude-instructions.md" ]; then
+        local claude_md="$PROJECT_DIR/CLAUDE.md"
+        local marker="<!-- simple-loop:${module_name} -->"
+
+        if [ -f "$claude_md" ] && grep -q "$marker" "$claude_md" 2>/dev/null; then
+            echo "  CLAUDE.md: instructions already present, skipping"
+        else
+            echo "" >> "$claude_md"
+            cat "$module_src/claude-instructions.md" >> "$claude_md"
+            echo "  CLAUDE.md: appended ${module_name} instructions"
+        fi
+    fi
+
+    # Create persistent docs if they don't exist
+    for doc in SPEC.md HANDOFF.md RUNNING.md TROUBLESHOOTING.md; do
+        if [ ! -f "$PROJECT_DIR/$doc" ]; then
+            local template_doc
+            if [ -n "$core_src" ] && [ -f "$core_src/templates/$doc" ]; then
+                template_doc="$core_src/templates/$doc"
+            fi
+            if [ -n "${template_doc:-}" ] && [ -f "$template_doc" ]; then
+                local project_name="${PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
+                sed "s/{{PROJECT_NAME}}/$project_name/g" "$template_doc" > "$PROJECT_DIR/$doc"
+            fi
+            echo "  Created: $doc"
+        fi
+    done
+
+    # Update config.json modules list
+    if [ -f "$LOOP_DIR/config.json" ]; then
+        python3 -c "
+import json
+with open('$LOOP_DIR/config.json') as f:
+    config = json.load(f)
+modules = config.get('modules', [])
+if '$module_name' not in modules:
+    modules.append('$module_name')
+config['modules'] = modules
+with open('$LOOP_DIR/config.json', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+"
+    fi
+
+    echo ""
+    echo "  ✓ Module '$module_name' installed"
+    echo ""
+}
+
+# ── remove ───────────────────────────────────────────────────
+
+cmd_remove() {
+    require_loop_dir
+    local module_name="${1:-}"
+    [ -z "$module_name" ] && die "Usage: loop remove <module>"
+
+    if [ ! -d "$LOOP_DIR/modules/$module_name" ]; then
+        die "Module '$module_name' is not installed."
+    fi
+
+    echo ""
+    echo "Removing module: $module_name"
+
+    # Remove symlinked skills
+    if [ -d "$PROJECT_DIR/.claude/skills" ]; then
+        for skill_link in "$PROJECT_DIR/.claude/skills"/loop-${module_name}-*; do
+            if [ -L "$skill_link" ]; then
+                rm "$skill_link"
+                echo "  Removed skill: $(basename "$skill_link")"
+            fi
+        done
+    fi
+
+    # Remove claude-instructions block from CLAUDE.md
+    local claude_md="$PROJECT_DIR/CLAUDE.md"
+    if [ -f "$claude_md" ]; then
+        local start_marker="<!-- simple-loop:${module_name} -->"
+        local end_marker="<!-- /simple-loop:${module_name} -->"
+        if grep -q "$start_marker" "$claude_md" 2>/dev/null; then
+            python3 -c "
+import re
+with open('$claude_md') as f:
+    content = f.read()
+pattern = r'\n*<!-- simple-loop:${module_name} -->.*?<!-- /simple-loop:${module_name} -->\n*'
+content = re.sub(pattern, '\n', content, flags=re.DOTALL)
+with open('$claude_md', 'w') as f:
+    f.write(content)
+"
+            echo "  CLAUDE.md: removed ${module_name} instructions"
+        fi
+    fi
+
+    # Remove module directory (but not state — user may want to keep findings)
+    read -p "  Remove module state (findings, sources, etc.)? [y/N] " remove_state
+    if [ "${remove_state:-n}" = "y" ] || [ "${remove_state:-n}" = "Y" ]; then
+        rm -rf "$LOOP_DIR/modules/$module_name"
+        echo "  Removed: .loop/modules/$module_name/ (including state)"
+    else
+        rm -f "$LOOP_DIR/modules/$module_name/config.json"
+        echo "  Removed config. State preserved at: .loop/modules/$module_name/state/"
+    fi
+
+    # Update config.json
+    if [ -f "$LOOP_DIR/config.json" ]; then
+        python3 -c "
+import json
+with open('$LOOP_DIR/config.json') as f:
+    config = json.load(f)
+modules = config.get('modules', [])
+if '$module_name' in modules:
+    modules.remove('$module_name')
+config['modules'] = modules
+with open('$LOOP_DIR/config.json', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+"
+    fi
+
+    echo ""
+    echo "  ✓ Module '$module_name' removed"
+    echo ""
+}
+
+# ── update ───────────────────────────────────────────────────
+
+cmd_update() {
+    require_loop_dir
+
+    echo ""
+    echo "Updating simple-loop..."
+
+    local core_src
+    core_src=$(find_core_dir 2>/dev/null) || die "Core directory not found. Is simple-loop installed?"
+
+    # Re-sync core skills
+    if [ -d "$core_src/skills" ] && [ -d "$PROJECT_DIR/.claude/skills" ]; then
+        for skill_dir in "$core_src/skills"/*/; do
+            [ -d "$skill_dir" ] || continue
+            local skill_name
+            skill_name=$(basename "$skill_dir")
+            local target_dir="$PROJECT_DIR/.claude/skills/loop-${skill_name}"
+            if [ -L "$target_dir" ] || [ -d "$target_dir" ]; then
+                rm -rf "$target_dir"
+                ln -sf "$skill_dir" "$target_dir"
+                echo "  Updated core skill: /loop-${skill_name}"
+            fi
+        done
+    fi
+
+    # Re-sync each installed module
+    if [ -f "$LOOP_DIR/config.json" ]; then
+        local modules
+        modules=$(python3 -c "
+import json
+with open('$LOOP_DIR/config.json') as f:
+    config = json.load(f)
+for m in config.get('modules', []):
+    print(m)
+" 2>/dev/null)
+
+        while IFS= read -r module_name; do
+            [ -z "$module_name" ] && continue
+            local module_src
+            module_src=$(find_module_dir "$module_name" 2>/dev/null) || continue
+
+            echo "  Updating module: $module_name"
+
+            # Re-sync module skills
+            if [ -d "$module_src/skills" ]; then
+                for skill_dir in "$module_src/skills"/*/; do
+                    [ -d "$skill_dir" ] || continue
+                    local skill_name
+                    skill_name=$(basename "$skill_dir")
+                    local target_dir="$PROJECT_DIR/.claude/skills/loop-${module_name}-${skill_name}"
+                    rm -rf "$target_dir"
+                    ln -sf "$skill_dir" "$target_dir"
+                done
+            fi
+
+            # Re-inject claude-instructions
+            if [ -f "$module_src/claude-instructions.md" ]; then
+                local claude_md="$PROJECT_DIR/CLAUDE.md"
+                local start_marker="<!-- simple-loop:${module_name} -->"
+                local end_marker="<!-- /simple-loop:${module_name} -->"
+
+                if [ -f "$claude_md" ] && grep -q "$start_marker" "$claude_md" 2>/dev/null; then
+                    # Replace existing block
+                    python3 -c "
+import re
+with open('$claude_md') as f:
+    content = f.read()
+with open('$module_src/claude-instructions.md') as f:
+    new_instructions = f.read()
+pattern = r'<!-- simple-loop:${module_name} -->.*?<!-- /simple-loop:${module_name} -->'
+content = re.sub(pattern, new_instructions.strip(), content, flags=re.DOTALL)
+with open('$claude_md', 'w') as f:
+    f.write(content)
+"
+                fi
+            fi
+        done <<< "$modules"
+    fi
+
+    echo ""
+    echo "  ✓ Updated"
+    echo ""
+}
+
+# ── modules ──────────────────────────────────────────────────
+
+cmd_modules() {
+    require_loop_dir
+
+    echo ""
+    echo "Installed modules:"
+
+    if [ -f "$LOOP_DIR/config.json" ]; then
+        python3 -c "
+import json
+with open('$LOOP_DIR/config.json') as f:
+    config = json.load(f)
+modules = config.get('modules', [])
+if not modules:
+    print('  (none)')
+else:
+    for m in modules:
+        print(f'  - {m}')
+" 2>/dev/null
+    else
+        echo "  (no config.json — v1 project?)"
+    fi
+
+    echo ""
+    echo "Available modules:"
+    echo "  research   — Autonomous research: search, read, synthesize, evaluate"
+    echo "  build      — Autonomous build loop: brief → worker → evaluate → commit"
+    echo ""
+}
+
 # ── help ─────────────────────────────────────────────────────
 
 cmd_help() {
     cat <<'EOF'
 Usage: loop <command> [args]
 
-Commands:
+Project setup:
   init                     Set up .loop/ in current directory (interactive)
+  add <module>             Install a module (research, build)
+  remove <module>          Remove a module
+  update                   Update core + module skills and instructions
+  modules                  List installed and available modules
+
+Work:
   brief "title"            Write a brief with the spec agent (interactive)
   brief --no-interactive   Create brief from template, open in $EDITOR
   start [interval]         Start the daemon (default: 300s heartbeat)
   stop                     Stop the daemon
+
+Monitor:
   status                   Show daemon state, active brief, recent logs
   logs [-f]                Show/follow daemon logs
+  metrics [--since DATE]   Cost report from metrics
+
+Signals:
   pause [reason]           Pause daemon (commits + pushes signal)
   resume [instruction]     Resume daemon (commits + pushes signal)
-  metrics [--since DATE]   Cost report from metrics
+
   help                     Show this message
 
 Quickstart:
   loop init                # Answer a few questions
-  loop brief "add auth"    # Write a brief with the spec agent
+  loop add research        # Install the research module
+  loop brief "your topic"  # Write a brief
   loop start               # Start the autonomous loop
   loop status              # Check progress
 EOF
@@ -610,6 +1050,10 @@ EOF
 
 case "${1:-help}" in
     init)    shift; cmd_init "$@" ;;
+    add)     shift; cmd_add "$@" ;;
+    remove)  shift; cmd_remove "$@" ;;
+    update)  cmd_update ;;
+    modules) cmd_modules ;;
     brief)   shift; cmd_brief "$@" ;;
     start)   shift; cmd_start "$@" ;;
     stop)    cmd_stop ;;

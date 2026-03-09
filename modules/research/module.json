@@ -1,0 +1,41 @@
+{
+  "name": "research",
+  "version": "0.2.0",
+  "description": "Autonomous research: search, read, synthesize, evaluate coverage, iterate",
+  "requires_core": ">=0.2.0",
+  "depends_on": [],
+  "config_schema": {
+    "max_iterations": {
+      "type": "number",
+      "default": 25,
+      "description": "Maximum research iterations before stopping"
+    },
+    "eval_interval": {
+      "type": "number",
+      "default": 5,
+      "description": "Run coverage evaluation every N iterations"
+    },
+    "output_format": {
+      "type": "string",
+      "default": "markdown",
+      "description": "Format for findings output"
+    },
+    "search_tools": {
+      "type": "array",
+      "default": ["web_search", "grep", "glob", "read"],
+      "description": "Tools available to the research worker"
+    }
+  },
+  "loop": {
+    "mode": "brief",
+    "default_interval": 60
+  },
+  "agents": [
+    "agents/worker.md",
+    "agents/evaluator.md"
+  ],
+  "skills": [
+    "skills/research-brief",
+    "skills/research-tick"
+  ]
+}
