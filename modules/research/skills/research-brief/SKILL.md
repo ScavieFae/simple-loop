@@ -55,9 +55,69 @@ Help the user write a research brief that can be executed autonomously by the re
 
 Save the brief to `.loop/briefs/research-NNN-slug.md` where NNN is the next available number.
 
-Initialize the research state:
-- `.loop/modules/research/state/findings.md` — empty with section headers from questions
-- `.loop/modules/research/state/sources.json` — empty array (or seed with starting points)
-- `.loop/modules/research/state/coverage.json` — all questions "open"
-- `.loop/modules/research/state/search-log.jsonl` — empty
-- `.loop/modules/research/state/eval-log.jsonl` — empty
+## Initialize research state
+
+After writing the brief, initialize all state files in `.loop/modules/research/state/`:
+
+### findings.md
+Create with section headers derived from the brief's questions:
+```markdown
+# Findings: [Topic]
+
+## [Question 1 as heading]
+
+(no findings yet)
+
+## [Question 2 as heading]
+
+(no findings yet)
+
+...
+
+## Sources
+```
+
+### sources.json
+**Seed with starting points.** Parse any URLs, repo paths, paper titles, or file paths from the brief's "Starting points" section. Each becomes a pre-loaded source entry:
+
+```json
+[
+  {
+    "url": "https://example.com/paper",
+    "type": "web_page",
+    "title": "From starting points",
+    "status": "found",
+    "summary": "Provided as starting point — not yet read",
+    "found_at_iteration": 0
+  }
+]
+```
+
+Use `"found_at_iteration": 0` to mark these as pre-seeded. The worker will see them as unread sources and prioritize reading them in early iterations.
+
+For local file paths (e.g., a repo directory or a specific file the user points to), use `"type": "file"`. For GitHub repo URLs, use `"type": "repo"`.
+
+If no starting points are provided, initialize as an empty array `[]`.
+
+### coverage.json
+Initialize with all questions from the brief set to "open":
+```json
+{
+  "questions": [
+    {
+      "question": "The exact question text from the brief",
+      "status": "open",
+      "source_count": 0,
+      "confidence": "low",
+      "notes": ""
+    }
+  ],
+  "overall_coverage": 0.0
+}
+```
+
+### search-log.jsonl
+Empty file.
+
+### eval-log.jsonl
+Empty file.

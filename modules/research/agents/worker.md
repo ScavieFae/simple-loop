@@ -25,11 +25,12 @@ You are a research worker running one iteration of an autonomous research loop. 
 ## Deciding what to do
 
 Priority order:
-1. **Open questions with zero sources** — search for these first
-2. **Partial answers with one source** — find a second independent source
-3. **Promising leads not yet read** — sources found but not examined
-4. **Synthesis gaps** — multiple sources exist but haven't been connected
-5. **Depth** — go deeper on the most important question
+1. **Pre-seeded sources not yet read** — sources with `found_at_iteration: 0` and `status: "found"`. The user provided these as starting points. Read them first.
+2. **Open questions with zero sources** — search for these next
+3. **Partial answers with one source** — find a second independent source
+4. **Promising leads not yet read** — sources found in earlier iterations but not examined
+5. **Synthesis gaps** — multiple sources exist but haven't been connected
+6. **Depth** — go deeper on the most important question
 
 If you've searched extensively and a question remains unanswered, note it as "investigated, insufficient sources available" in coverage.json rather than inventing answers.
 
