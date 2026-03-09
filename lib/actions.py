@@ -25,6 +25,7 @@ def init_paths(project_dir):
         "project_dir": project_dir,
         "loop_dir": loop_dir,
         "state_dir": state_dir,
+        "worktrees_dir": os.path.join(loop_dir, "worktrees"),
         "running_file": os.path.join(state_dir, "running.json"),
         "pending_dispatch": os.path.join(state_dir, "pending-dispatch.json"),
         "pending_merge": os.path.join(state_dir, "pending-merge.json"),
@@ -126,8 +127,49 @@ def move_to_eval(paths, brief_id):
 
 # ─── Action: dispatch ─────────────────────────────────────────────────
 
+def worktree_dir_for(paths, brief):
+    """Return the worktree path for a brief."""
+    return os.path.join(paths["worktrees_dir"], brief)
+
+
+def ensure_worktree(paths, brief, branch, config=None):
+    """Create a worktree for a brief if it doesn't already exist. Returns worktree path."""
+    wt_dir = worktree_dir_for(paths, brief)
+    if os.path.exists(wt_dir):
+        return wt_dir
+
+    if config is None:
+        config = read_config(paths["loop_dir"])
+    remote = config["GIT_REMOTE"]
+    main_branch = config["GIT_MAIN_BRANCH"]
+    project_dir = paths["project_dir"]
+
+    os.makedirs(paths["worktrees_dir"], exist_ok=True)
+
+    # Try existing local branch, then remote tracking, then create new
+    if git(project_dir, "show-ref", "--verify", "--quiet",
+           f"refs/heads/{branch}", check=False).returncode == 0:
+        git(project_dir, "worktree", "add", wt_dir, branch)
+    elif git(project_dir, "show-ref", "--verify", "--quiet",
+             f"refs/remotes/{remote}/{branch}", check=False).returncode == 0:
+        git(project_dir, "worktree", "add", wt_dir, branch)
+    else:
+        git(project_dir, "worktree", "add", "-b", branch, wt_dir, main_branch)
+
+    return wt_dir
+
+
+def remove_worktree(paths, brief):
+    """Remove a worktree for a brief."""
+    wt_dir = worktree_dir_for(paths, brief)
+    if os.path.exists(wt_dir):
+        git(paths["project_dir"], "worktree", "remove", wt_dir, "--force", check=False)
+    # Clean up any stale worktree entries
+    git(paths["project_dir"], "worktree", "prune", check=False)
+
+
 def dispatch(paths):
-    """Process pending-dispatch.json: create branch, init progress, update state."""
+    """Process pending-dispatch.json: create worktree + branch, init progress, update state."""
     if not os.path.exists(paths["pending_dispatch"]):
         print("No pending-dispatch.json found", file=sys.stderr)
         return False
@@ -146,14 +188,16 @@ def dispatch(paths):
 
     project_dir = paths["project_dir"]
 
-    # Ensure on main branch
-    git(project_dir, "checkout", main_branch, check=False)
-    git(project_dir, "pull", "--ff-only", remote, main_branch, check=False)
+    # Fetch latest (no checkout needed — main tree untouched)
+    git(project_dir, "fetch", remote, check=False)
 
-    # Create branch
-    git(project_dir, "checkout", "-b", branch, main_branch)
+    # Create worktree with new branch
+    wt_dir = ensure_worktree(paths, brief, branch, config)
 
-    # Initialize progress.json
+    # Initialize progress.json in the worktree
+    wt_progress = os.path.join(wt_dir, ".loop", "state", "progress.json")
+    os.makedirs(os.path.dirname(wt_progress), exist_ok=True)
+
     progress = {
         "brief": brief,
         "brief_file": brief_file,
@@ -163,18 +207,15 @@ def dispatch(paths):
         "tasks_remaining": [],
         "learnings": [],
     }
-    with open(paths["progress_file"], "w") as f:
+    with open(wt_progress, "w") as f:
         json.dump(progress, f, indent=2)
         f.write("\n")
 
-    git(project_dir, "add", paths["progress_file"])
-    git(project_dir, "commit", "-m", f"Initialize brief {brief}")
-    git(project_dir, "push", "-u", remote, branch)
+    git(wt_dir, "add", ".loop/state/progress.json")
+    git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
+    git(wt_dir, "push", "-u", remote, branch)
 
-    # Return to main branch
-    git(project_dir, "checkout", main_branch)
-
-    # Update running.json
+    # Update running.json on main (main tree untouched except this state file)
     rc = load_running(paths)
     rc.setdefault("active", []).append({
         "brief": brief,
@@ -189,14 +230,14 @@ def dispatch(paths):
     os.remove(paths["pending_dispatch"])
 
     log_action(paths, "dispatch", {"brief": brief, "branch": branch, "notes": notes})
-    print(f"Dispatched {brief} on branch {branch}")
+    print(f"Dispatched {brief} on branch {branch} (worktree: {wt_dir})")
     return True
 
 
 # ─── Action: merge ────────────────────────────────────────────────────
 
 def merge(paths):
-    """Process pending-merge.json: merge branch to main."""
+    """Process pending-merge.json: merge branch to main, remove worktree."""
     if not os.path.exists(paths["pending_merge"]):
         print("No pending-merge.json found", file=sys.stderr)
         return False
@@ -215,18 +256,29 @@ def merge(paths):
 
     project_dir = paths["project_dir"]
 
-    # Ensure on main branch with latest
-    git(project_dir, "checkout", main_branch, check=False)
-    git(project_dir, "pull", "--ff-only", remote, main_branch, check=False)
-    git(project_dir, "fetch", remote, branch, check=False)
+    # Verify main tree is on main branch (should always be true with worktrees)
+    current = git(project_dir, "branch", "--show-current", check=False).stdout.strip()
+    if current != main_branch:
+        git(project_dir, "checkout", main_branch)
 
-    # Merge
+    git(project_dir, "fetch", remote, check=False)
+    git(project_dir, "pull", "--ff-only", remote, main_branch, check=False)
+
+    # Merge the branch (using local ref if available, otherwise remote)
     merge_msg = f"Merge {brief}: {title}"
     if evaluation:
         merge_msg += f"\n\nEvaluation: {evaluation}"
-    git(project_dir, "merge", f"{remote}/{branch}", "--no-ff", "-m", merge_msg)
 
-    # Delete remote branch
+    if git(project_dir, "show-ref", "--verify", "--quiet",
+           f"refs/heads/{branch}", check=False).returncode == 0:
+        git(project_dir, "merge", branch, "--no-ff", "-m", merge_msg)
+    else:
+        git(project_dir, "merge", f"{remote}/{branch}", "--no-ff", "-m", merge_msg)
+
+    # Remove worktree before deleting branch
+    remove_worktree(paths, brief)
+
+    # Delete branches
     git(project_dir, "push", remote, "--delete", branch, check=False)
     git(project_dir, "branch", "-d", branch, check=False)
 
@@ -256,12 +308,58 @@ def merge(paths):
     return True
 
 
+# ─── Action: cleanup ─────────────────────────────────────────────────
+
+def cleanup_worktrees(paths):
+    """Remove worktrees for briefs that are no longer active."""
+    project_dir = paths["project_dir"]
+    worktrees_dir = paths["worktrees_dir"]
+
+    if not os.path.exists(worktrees_dir):
+        print("No worktrees directory.")
+        return True
+
+    # Prune stale git worktree entries
+    git(project_dir, "worktree", "prune", check=False)
+
+    # Get active brief IDs
+    rc = load_running(paths)
+    active_briefs = set()
+    for entry in rc.get("active", []):
+        active_briefs.add(entry.get("brief", ""))
+    for entry in rc.get("completed_pending_eval", []):
+        active_briefs.add(entry.get("brief", ""))
+
+    cleaned = 0
+    for name in os.listdir(worktrees_dir):
+        wt_path = os.path.join(worktrees_dir, name)
+        if not os.path.isdir(wt_path):
+            continue
+        if name not in active_briefs:
+            print(f"  Removing worktree: {name}")
+            git(project_dir, "worktree", "remove", wt_path, "--force", check=False)
+            # Fallback if git worktree remove fails
+            if os.path.exists(wt_path):
+                import shutil
+                shutil.rmtree(wt_path, ignore_errors=True)
+            cleaned += 1
+
+    if cleaned:
+        git(project_dir, "worktree", "prune", check=False)
+        print(f"  Cleaned {cleaned} worktree(s).")
+    else:
+        print("  Nothing to clean up.")
+
+    log_action(paths, "cleanup", {"cleaned": cleaned})
+    return True
+
+
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <action> <project_dir> [args]", file=sys.stderr)
-        print("Actions: move-to-eval <brief_id>, dispatch, merge", file=sys.stderr)
+        print("Actions: move-to-eval <brief_id>, dispatch, merge, cleanup", file=sys.stderr)
         sys.exit(1)
 
     action = sys.argv[1]
@@ -285,6 +383,8 @@ def main():
             success = dispatch(paths)
         elif action == "merge":
             success = merge(paths)
+        elif action == "cleanup":
+            success = cleanup_worktrees(paths)
         else:
             print(f"Unknown action: {action}", file=sys.stderr)
             sys.exit(1)

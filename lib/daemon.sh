@@ -235,33 +235,35 @@ run_worker_iteration() {
     local brief_id="$1"
     local branch="$2"
 
-    daemon_log "WORKER: starting iteration for $brief_id on $branch"
+    # Resolve worktree — create if needed
+    local WORKTREE_DIR="$PROJECT_DIR/.loop/worktrees/$brief_id"
 
-    cd "$PROJECT_DIR"
+    if [ ! -d "$WORKTREE_DIR" ]; then
+        daemon_log "WORKER: creating worktree for $brief_id"
+        mkdir -p "$PROJECT_DIR/.loop/worktrees"
 
-    # Checkout brief branch
-    git stash -q 2>/dev/null
-    if ! git checkout "$branch" -q 2>/dev/null; then
-        if git show-ref --verify --quiet "refs/remotes/${GIT_REMOTE}/$branch" 2>/dev/null; then
-            git checkout -b "$branch" "${GIT_REMOTE}/$branch" -q 2>/dev/null || {
-                daemon_log "WORKER ERROR: cannot checkout $branch"
-                git checkout "$GIT_MAIN_BRANCH" -q 2>/dev/null
-                return 1
-            }
+        if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+            git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch" -q 2>/dev/null
+        elif git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/remotes/${GIT_REMOTE}/$branch" 2>/dev/null; then
+            git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch" -q 2>/dev/null
         else
             daemon_log "WORKER: creating branch $branch from $GIT_MAIN_BRANCH"
-            git checkout -b "$branch" "$GIT_MAIN_BRANCH" -q 2>/dev/null || {
-                daemon_log "WORKER ERROR: cannot create $branch"
-                git checkout "$GIT_MAIN_BRANCH" -q 2>/dev/null
-                return 1
-            }
+            git -C "$PROJECT_DIR" worktree add -b "$branch" "$WORKTREE_DIR" "$GIT_MAIN_BRANCH" -q 2>/dev/null
+        fi
+
+        if [ ! -d "$WORKTREE_DIR" ]; then
+            daemon_log "WORKER ERROR: failed to create worktree for $branch"
+            return 1
         fi
     fi
 
-    git pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null || true
+    daemon_log "WORKER: starting iteration for $brief_id in worktree"
 
-    # Initialize progress.json if missing
-    local PROGRESS_FILE="$LOOP_DIR/state/progress.json"
+    # Pull latest into worktree (doesn't touch main tree)
+    git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null || true
+
+    # Initialize progress.json if missing (in worktree)
+    local PROGRESS_FILE="$WORKTREE_DIR/.loop/state/progress.json"
     if [ ! -f "$PROGRESS_FILE" ]; then
         local brief_file
         brief_file=$(python3 -c "
@@ -274,16 +276,16 @@ for b in rc.get('active', []):
         break
 " 2>/dev/null)
 
-        if [ -z "$brief_file" ] || [ ! -f "$PROJECT_DIR/$brief_file" ]; then
+        if [ -z "$brief_file" ] || [ ! -f "$WORKTREE_DIR/$brief_file" ]; then
             daemon_log "WORKER: no brief file found for $brief_id — skipping"
-            git checkout "$GIT_MAIN_BRANCH" -q 2>/dev/null
             return 0
         fi
 
         daemon_log "WORKER: initializing progress.json for $brief_id"
+        mkdir -p "$(dirname "$PROGRESS_FILE")"
         echo "{\"brief\": \"$brief_id\", \"brief_file\": \"$brief_file\", \"iteration\": 0, \"status\": \"running\", \"tasks_completed\": [], \"tasks_remaining\": [], \"learnings\": []}" > "$PROGRESS_FILE"
-        git add "$PROGRESS_FILE"
-        git commit -m "Initialize progress for $brief_id" -q 2>/dev/null
+        git -C "$WORKTREE_DIR" add ".loop/state/progress.json"
+        git -C "$WORKTREE_DIR" commit -m "Initialize progress for $brief_id" -q 2>/dev/null
     fi
 
     # Safety: check iteration count
@@ -300,9 +302,9 @@ p['learnings'] = p.get('learnings', []) + ['Daemon: max iterations ($MAX_ITERATI
 with open('$PROGRESS_FILE', 'w') as f:
     json.dump(p, f, indent=2)
 "
-        git add "$PROGRESS_FILE" && git commit -m "Max iterations reached — marking blocked" -q 2>/dev/null
-        git push -u "$GIT_REMOTE" "$branch" 2>&1 || true
-        git checkout "$GIT_MAIN_BRANCH" -q 2>/dev/null
+        git -C "$WORKTREE_DIR" add ".loop/state/progress.json"
+        git -C "$WORKTREE_DIR" commit -m "Max iterations reached — marking blocked" -q 2>/dev/null
+        git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || true
         return 0
     fi
 
@@ -311,35 +313,43 @@ with open('$PROGRESS_FILE', 'w') as f:
     local MODEL_FLAG=""
     local brief_file_path
     brief_file_path=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
-    if [ -n "$brief_file_path" ] && [ -f "$PROJECT_DIR/$brief_file_path" ]; then
-        model=$(grep -m1 '^\*\*Model:\*\*' "$PROJECT_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    if [ -n "$brief_file_path" ] && [ -f "$WORKTREE_DIR/$brief_file_path" ]; then
+        model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
         if [ -n "$model" ] && [ "$model" != "opus" ]; then
             MODEL_FLAG="--model $model"
             daemon_log "WORKER: using model '$model' (from brief)"
         fi
     fi
 
-    # Run one iteration
+    # Run one iteration IN THE WORKTREE (main tree untouched)
     local WORKER_LOG="$LOG_DIR/worker_${brief_id}_$(date +%Y%m%d_%H%M%S).log"
     local WORKER_JSON=$(mktemp)
     local WORKER_START=$(date +%s)
 
+    # Read prompt from main tree (canonical), execute in worktree
+    local PROMPT_CONTENT
+    PROMPT_CONTENT=$(cat "$WORKER_PROMPT")
+
+    cd "$WORKTREE_DIR"
+
     claude --dangerously-skip-permissions \
         --output-format json \
         $MODEL_FLAG \
-        -p "$(cat "$WORKER_PROMPT")" \
+        -p "$PROMPT_CONTENT" \
         > "$WORKER_JSON" 2>>"$WORKER_LOG"
 
     local WORKER_EXIT=$?
     local WORKER_END=$(date +%s)
     local WORKER_DURATION=$((WORKER_END - WORKER_START))
 
+    cd "$PROJECT_DIR"
+
     parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '${model:-default}', 'exit_code': $WORKER_EXIT}"
     rm -f "$WORKER_JSON"
 
-    # Push results
+    # Push results from worktree
     if [ "$WORKER_EXIT" -eq 0 ]; then
-        git push -u "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "WORKER: push failed (non-fatal)"
+        git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "WORKER: push failed (non-fatal)"
         daemon_log "WORKER: iteration complete (${WORKER_DURATION}s), pushed to $branch"
         notify "$brief_id: iteration done (${WORKER_DURATION}s)"
         CONSECUTIVE_WORKER_FAILURES=0
@@ -349,14 +359,12 @@ with open('$PROGRESS_FILE', 'w') as f:
         CONSECUTIVE_WORKER_FAILURES=$((CONSECUTIVE_WORKER_FAILURES + 1))
 
         if [ "$WORKER_DURATION" -le 10 ] && grep -q "out of extra usage" "$WORKER_LOG" 2>/dev/null; then
-            git checkout "$GIT_MAIN_BRANCH" -q 2>/dev/null
             handle_rate_limit "$WORKER_LOG"
             return 1
         fi
     fi
 
-    # Return to main branch
-    git checkout "$GIT_MAIN_BRANCH" -q 2>/dev/null
+    # No checkout needed — main tree was never touched
 
     return $WORKER_EXIT
 }
@@ -406,19 +414,17 @@ while true; do
         fi
     fi
 
-    # --- Git sync ---
+    # --- Git sync (worktree-safe: never stash, never force-checkout) ---
     cd "$PROJECT_DIR"
-    CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
-    if [ "$CURRENT_BRANCH" != "$GIT_MAIN_BRANCH" ]; then
-        daemon_log "GIT CLEANUP: on '$CURRENT_BRANCH', switching to $GIT_MAIN_BRANCH"
-        git stash -q 2>/dev/null
-        git checkout "$GIT_MAIN_BRANCH" -q 2>/dev/null || git checkout -f "$GIT_MAIN_BRANCH" -q 2>/dev/null
-    fi
-    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-        git stash -q 2>/dev/null
-    fi
     git fetch "$GIT_REMOTE" --quiet 2>/dev/null
-    git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+
+    CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+    if [ "$CURRENT_BRANCH" = "$GIT_MAIN_BRANCH" ]; then
+        # Only pull if we're on main — don't disturb user's branch
+        git pull --ff-only "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+    else
+        daemon_log "GIT SYNC: main tree on '$CURRENT_BRANCH' (not $GIT_MAIN_BRANCH) — fetch only"
+    fi
 
     DID_WORK=false
 

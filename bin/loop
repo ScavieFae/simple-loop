@@ -278,15 +278,18 @@ CJSON
         fi
     done
 
-    # Add logs to gitignore
+    # Add logs and worktrees to gitignore
     if [ -f ".gitignore" ]; then
         if ! grep -q '\.loop/logs' .gitignore 2>/dev/null; then
             echo "" >> .gitignore
-            echo "# Simple Loop logs" >> .gitignore
+            echo "# Simple Loop" >> .gitignore
             echo ".loop/logs/" >> .gitignore
+            echo ".loop/worktrees/" >> .gitignore
+        elif ! grep -q '\.loop/worktrees' .gitignore 2>/dev/null; then
+            echo ".loop/worktrees/" >> .gitignore
         fi
     elif [ "$is_git" = true ]; then
-        echo ".loop/logs/" > .gitignore
+        printf ".loop/logs/\n.loop/worktrees/\n" > .gitignore
     fi
 
     # Check Agent Teams
@@ -517,14 +520,18 @@ cmd_status() {
     # Active briefs
     if [ -f "$STATE_DIR/running.json" ]; then
         python3 -c "
-import json, sys
+import json, sys, os
 with open('$STATE_DIR/running.json') as f:
     rc = json.load(f)
 active = rc.get('active', [])
 pending = rc.get('completed_pending_eval', [])
+worktrees_dir = '$LOOP_DIR/worktrees'
 if active:
     for b in active:
-        print(f\"  Active:   {b.get('brief', '?')} ({b.get('branch', '?')})\")
+        brief = b.get('brief', '?')
+        wt = os.path.join(worktrees_dir, brief)
+        wt_marker = ' [worktree]' if os.path.isdir(wt) else ''
+        print(f\"  Active:   {brief} ({b.get('branch', '?')}){wt_marker}\")
 elif pending:
     for b in pending:
         print(f\"  Pending:  {b.get('brief', '?')} (awaiting eval)\")
@@ -1007,6 +1014,28 @@ else:
     echo ""
 }
 
+# ── cleanup ──────────────────────────────────────────────────
+
+cmd_cleanup() {
+    require_loop_dir
+
+    echo ""
+    echo "Cleaning up worktrees..."
+
+    local actions_script="$LIB_DIR/actions.py"
+    if [ ! -f "$actions_script" ]; then
+        actions_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/actions.py"
+    fi
+
+    if [ -f "$actions_script" ]; then
+        python3 "$actions_script" cleanup "$PROJECT_DIR"
+    else
+        die "actions.py not found. Is Simple Loop installed?"
+    fi
+
+    echo ""
+}
+
 # ── help ─────────────────────────────────────────────────────
 
 cmd_help() {
@@ -1035,6 +1064,9 @@ Signals:
   pause [reason]           Pause daemon (commits + pushes signal)
   resume [instruction]     Resume daemon (commits + pushes signal)
 
+Maintenance:
+  cleanup                  Remove worktrees for completed/merged briefs
+
   help                     Show this message
 
 Quickstart:
@@ -1062,6 +1094,7 @@ case "${1:-help}" in
     pause)   shift; cmd_pause "$@" ;;
     resume)  shift; cmd_resume "$@" ;;
     metrics) shift; cmd_metrics "$@" ;;
+    cleanup) cmd_cleanup ;;
     help|--help|-h) cmd_help ;;
     *)       echo "Unknown command: $1"; cmd_help; exit 1 ;;
 esac
