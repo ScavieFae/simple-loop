@@ -73,6 +73,7 @@ After `loop init`, your project gets a `.loop/` directory:
 │   ├── goals.md       # What to build (you write this)
 │   ├── metrics.jsonl  # Cost and token data per session
 │   ├── log.jsonl      # Decision log
+│   ├── last_pull.json # Last /pull timestamp (for filtering "what's new")
 │   └── signals/       # pause.json, resume.json, escalate.json
 ├── evaluations/       # Post-brief eval cards
 ├── knowledge/
@@ -131,6 +132,25 @@ Add JWT-based login to the API. Users POST credentials, get back a token.
 | **researcher** | Investigation | On demand for unfamiliar territory |
 
 Customize any agent by editing the files in `.loop/agents/`.
+
+## Skills
+
+Skills are slash commands that agents (or humans) invoke during work sessions. Simple Loop ships core skills that any project can use, plus module-specific skills for research and build workflows.
+
+### Core skills
+
+| Skill | Trigger | What it does |
+|-------|---------|-------------|
+| `/push` | "push", "ship it", "send it" | Scope audit → HANDOFF.md → RUNNING.md → commit + push |
+| `/pull` | "pull", "catch me up", "what changed" | Git pull → parallel HANDOFF/state scanners → briefing |
+| `/update-handoff` | Manual | Append one entry to HANDOFF.md |
+| `/update-running` | Manual | Append one entry to RUNNING.md |
+| `/update-trouble` | Manual | Document a bug investigation in TROUBLESHOOTING.md |
+| `/file-issue` | Manual | File a GitHub issue |
+
+`/push` and `/pull` are session-boundary workflows — they orchestrate the atomic update skills into a coherent ritual. `/push` captures context on the way out; `/pull` absorbs it on the way in.
+
+**Extending:** Projects can override `/push` or `/pull` by placing a project-level skill in `.claude/skills/push/SKILL.md` or `.claude/skills/pull/SKILL.md`. Use this to add project-specific steps (experiment tracking, deploy gates, interface contract checks) while keeping the core communicate-capture-ship pattern.
 
 ## Push notifications
 
