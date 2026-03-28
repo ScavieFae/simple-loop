@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Docs module state files",
+  "files": {
+    "manifest.json": {
+      "description": "Page manifest — maps doc pages to source files, tracks staleness",
+      "format": "json_object",
+      "created_on": "module_init",
+      "updated_by": "writer",
+      "schema": {
+        "pages": [
+          {
+            "id": "string (slug)",
+            "title": "string",
+            "doc_path": "string (relative to docs_dir)",
+            "source_files": ["string (relative to project root)"],
+            "page_type": "architecture|experiment|api|howto|research|custom",
+            "last_generated": "ISO 8601 timestamp",
+            "nav_section": "string (which nav section this belongs to)"
+          }
+        ],
+        "nav_sections": [
+          {
+            "id": "string",
+            "title": "string",
+            "order": "number"
+          }
+        ]
+      }
+    },
+    "build-log.jsonl": {
+      "description": "Build history — timestamps, success/failure, changed pages",
+      "format": "jsonl",
+      "created_on": "first_build",
+      "updated_by": "docs-build skill"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "daily_limit": 30.00,
+  "weekly_limit": 150.00,
+  "daily_spent": 0.00,
+  "weekly_spent": 0.00,
+  "last_reset_daily": "",
+  "last_reset_weekly": "",
+  "experiments_run": 0,
+  "experiments_kept": 0,
+  "experiments_discarded": 0,
+  "total_spent": 0.00
+}

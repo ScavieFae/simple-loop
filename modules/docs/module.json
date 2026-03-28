@@ -1,0 +1,41 @@
+{
+  "name": "docs",
+  "version": "0.1.0",
+  "description": "Living documentation site via Zensical. Agents write markdown, the module builds and serves a static site.",
+  "requires_core": ">=0.2.0",
+  "depends_on": [],
+  "config_schema": {
+    "site_name": {
+      "type": "string",
+      "default": "{{PROJECT_NAME}}",
+      "description": "Display name for the docs site"
+    },
+    "docs_dir": {
+      "type": "string",
+      "default": "docs",
+      "description": "Source directory for markdown content (relative to project root)"
+    },
+    "build_dir": {
+      "type": "string",
+      "default": ".loop/modules/docs/state/site",
+      "description": "Output directory for built site"
+    },
+    "serve_port": {
+      "type": "number",
+      "default": 8000,
+      "description": "Port for local dev server"
+    },
+    "prebuild_script": {
+      "type": "string",
+      "default": "",
+      "description": "Script to run before build (e.g., generate content from repo state)"
+    }
+  },
+  "agents": [
+    "agents/writer.md"
+  ],
+  "skills": [
+    "skills/docs-build",
+    "skills/docs-serve"
+  ]
+}
