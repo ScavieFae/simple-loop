@@ -83,9 +83,9 @@ After processing all in-flight experiments:
 6. **If APPROVED — spawn Coder agent** in an isolated worktree:
    ```
    Agent tool with:
-     subagent_type: general-purpose
+     subagent_type: loop-coder
      isolation: "worktree"
-     prompt: [from .loop/agents/coder.md + approved hypothesis + director conditions]
+     prompt: [approved hypothesis + director conditions]
    ```
    The Coder agent:
    - Creates a branch named `{experiment-id}`
@@ -135,11 +135,11 @@ After processing all in-flight experiments:
 
 ## Agent Roles
 
-| Role | Prompt file | When |
-|------|-------------|------|
-| Hypothesis | `.loop/modules/autoresearch/agents/hypothesis.md` | New cycle — propose experiment |
-| Research Director | `.loop/modules/autoresearch/agents/research-director.md` | Review hypothesis, evaluate results |
-| Coder | `.loop/agents/coder.md` | Implement approved experiment on branch |
+| Role | How to invoke | When |
+|------|---------------|------|
+| Hypothesis | Explore subagent with prompt body from `.loop/modules/autoresearch/agents/hypothesis.md` | New cycle — propose experiment |
+| Research Director | Explore subagent with prompt body from `.loop/modules/autoresearch/agents/research-director.md` | Review hypothesis, evaluate results |
+| Coder | `subagent_type: loop-coder` (workstation-installed via simple-loop) | Implement approved experiment on branch |
 
 ## Error Recovery
 

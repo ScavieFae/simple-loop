@@ -40,7 +40,7 @@ echo "  Mode:      $([ "$LINK_MODE" = true ] && echo 'symlink (live edits)' || e
 echo ""
 
 # Create directories
-mkdir -p "$INSTALL_DIR"/{lib,templates/prompts,templates/agents}
+mkdir -p "$INSTALL_DIR"/{lib,templates/prompts}
 mkdir -p "$INSTALL_DIR"/core/{agents,skills,templates}
 mkdir -p "$BIN_DIR"
 
@@ -51,11 +51,10 @@ cp "$SCRIPT_DIR/lib/assess.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/metrics-report.py" "$INSTALL_DIR/lib/" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/lib/daemon.sh"
 
-# Copy v1 templates (backward compat)
+# Copy daemon templates (per-project scaffolding for `loop init`)
 cp "$SCRIPT_DIR/templates/config.sh" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/templates/brief-template.md" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/templates/prompts/"*.md "$INSTALL_DIR/templates/prompts/"
-cp "$SCRIPT_DIR/templates/agents/"*.md "$INSTALL_DIR/templates/agents/"
 
 # Copy v2 core
 if [ -d "$SCRIPT_DIR/core" ]; then

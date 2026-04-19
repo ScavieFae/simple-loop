@@ -163,7 +163,7 @@ cmd_init() {
     echo "  Creating .loop/..."
 
     # Scaffold directories
-    mkdir -p .loop/{agents,prompts,briefs,state/signals,evaluations,knowledge,logs,modules}
+    mkdir -p .loop/{prompts,briefs,state/signals,evaluations,knowledge,logs,modules}
 
     # Write config
     cat > .loop/config.sh <<CONF
@@ -178,15 +178,14 @@ GIT_REMOTE="origin"
 GIT_MAIN_BRANCH="$main_branch"
 CONF
 
-    # Copy templates
+    # Copy daemon prompts and brief template.
+    # Generic agents (coder, reviewer, research) are workstation-installed via
+    # `bash install.sh` to ~/.claude/agents/loop-*.md and addressable as
+    # subagent_type values. Per-project overrides go in <project>/.claude/agents/.
     if [ -d "$TEMPLATES_DIR" ]; then
         # From installed location
         cp "$TEMPLATES_DIR/prompts/worker.md" .loop/prompts/worker.md
         cp "$TEMPLATES_DIR/prompts/conductor.md" .loop/prompts/conductor.md
-        cp "$TEMPLATES_DIR/agents/spec.md" .loop/agents/spec.md
-        cp "$TEMPLATES_DIR/agents/coder.md" .loop/agents/coder.md
-        cp "$TEMPLATES_DIR/agents/reviewer.md" .loop/agents/reviewer.md
-        cp "$TEMPLATES_DIR/agents/researcher.md" .loop/agents/researcher.md
         cp "$TEMPLATES_DIR/brief-template.md" .loop/briefs/.template.md
     else
         # Running from source — look relative to this script
@@ -195,19 +194,11 @@ CONF
         if [ -d "$script_dir/templates" ]; then
             cp "$script_dir/templates/prompts/worker.md" .loop/prompts/worker.md
             cp "$script_dir/templates/prompts/conductor.md" .loop/prompts/conductor.md
-            cp "$script_dir/templates/agents/spec.md" .loop/agents/spec.md
-            cp "$script_dir/templates/agents/coder.md" .loop/agents/coder.md
-            cp "$script_dir/templates/agents/reviewer.md" .loop/agents/reviewer.md
-            cp "$script_dir/templates/agents/researcher.md" .loop/agents/researcher.md
             cp "$script_dir/templates/brief-template.md" .loop/briefs/.template.md
         else
             echo "  Warning: template directory not found. Creating minimal templates."
             echo "# Worker Prompt — edit this" > .loop/prompts/worker.md
             echo "# Conductor Prompt — edit this" > .loop/prompts/conductor.md
-            echo "# Spec Agent — edit this" > .loop/agents/spec.md
-            echo "# Coder Agent — edit this" > .loop/agents/coder.md
-            echo "# Reviewer Agent — edit this" > .loop/agents/reviewer.md
-            echo "# Researcher Agent — edit this" > .loop/agents/researcher.md
         fi
     fi
 
