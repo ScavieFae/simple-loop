@@ -1,6 +1,6 @@
 {
   "project_name": "",
-  "version": "0.3.0",
+  "version": "0.2.0",
   "heartbeat_interval": 300,
   "worker_cooldown": 30,
   "max_iterations": 20,
@@ -9,15 +9,6 @@
   "git": {
     "remote": "origin",
     "main_branch": "main"
-  },
-  "budget": {
-    "daily_limit": 30.00,
-    "weekly_limit": 150.00
-  },
-  "experiments": {
-    "max_concurrent": 1,
-    "stale_timeout_hours": 4,
-    "scale_tier_threshold": 10.00
   },
   "modules": []
 }

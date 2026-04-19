@@ -1,0 +1,47 @@
+{
+  "name": "autoresearch",
+  "version": "0.1.0",
+  "description": "Autonomous experiment loop: hypothesize → review → execute → evaluate, with budget gating and best-result tracking. Extracted from autonomous-world-model patterns.",
+  "requires_core": ">=0.2.0",
+  "depends_on": [],
+  "config_schema": {
+    "daily_budget": {
+      "type": "number",
+      "default": 30.00,
+      "description": "Maximum spend per day across experiments (USD)"
+    },
+    "weekly_budget": {
+      "type": "number",
+      "default": 150.00,
+      "description": "Maximum spend per week across experiments (USD)"
+    },
+    "max_concurrent_experiments": {
+      "type": "number",
+      "default": 1,
+      "description": "How many experiments may be in_flight at once"
+    },
+    "stale_timeout_hours": {
+      "type": "number",
+      "default": 4,
+      "description": "Hours of inactivity before an in_flight experiment is considered stale"
+    },
+    "scale_tier_threshold": {
+      "type": "number",
+      "default": 10.00,
+      "description": "Estimated cost (USD) above which an experiment requires human approval"
+    }
+  },
+  "loop": {
+    "mode": "heartbeat",
+    "default_interval": 3600,
+    "prompt": "prompts/conductor.md"
+  },
+  "agents": [
+    "agents/hypothesis.md",
+    "agents/research-director.md",
+    "agents/executor.md"
+  ],
+  "skills": [
+    "skills/consult-empirical"
+  ]
+}

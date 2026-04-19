@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Autoresearch module state files",
+  "files": {
+    "budget.json": {
+      "description": "Daily and weekly budget limits, spend tracking, and experiment counts",
+      "format": "json_object",
+      "created_on": "module_init",
+      "updated_by": "conductor",
+      "schema": {
+        "daily_limit": "number (USD)",
+        "weekly_limit": "number (USD)",
+        "daily_spent": "number (USD)",
+        "weekly_spent": "number (USD)",
+        "last_reset_daily": "ISO 8601 date",
+        "last_reset_weekly": "ISO 8601 date",
+        "experiments_run": "number",
+        "experiments_kept": "number",
+        "experiments_discarded": "number",
+        "total_spent": "number (USD)"
+      }
+    },
+    "best.json": {
+      "description": "Current best result, its config and metrics, and a history of all kept experiments",
+      "format": "json_object",
+      "created_on": "first_kept_experiment",
+      "updated_by": "conductor (Step A — Director KEPT verdict beats prior best)",
+      "schema": {
+        "current_best": {
+          "experiment_id": "string",
+          "primary_metric": "number",
+          "config": "object (full experiment config)",
+          "kept_at": "ISO 8601 timestamp"
+        },
+        "history": [
+          {
+            "experiment_id": "string",
+            "primary_metric": "number",
+            "kept_at": "ISO 8601 timestamp"
+          }
+        ]
+      }
+    },
+    "running.json": {
+      "description": "In-flight experiments, completed history, and prior best snapshot",
+      "format": "json_object",
+      "created_on": "module_init",
+      "updated_by": "conductor (Steps 3, A, B)",
+      "schema": {
+        "experiments": {
+          "in_flight": [
+            {
+              "id": "string",
+              "run_url": "string",
+              "pr_number": "number (optional)",
+              "branch": "string",
+              "started_at": "ISO 8601 timestamp",
+              "estimated_cost": "number (USD)"
+            }
+          ],
+          "max_concurrent": "number (mirrors config)",
+          "stale_timeout_hours": "number (mirrors config)"
+        },
+        "history": [
+          {
+            "id": "string",
+            "verdict": "kept|discarded",
+            "primary_metric": "number",
+            "completed_at": "ISO 8601 timestamp"
+          }
+        ],
+        "prior_best": "string (experiment_id) | null"
+      }
+    }
+  }
+}
