@@ -3,18 +3,40 @@
 #
 # Copies lib/, core/, modules/, and templates/ to ~/.local/share/simple-loop/
 # Symlinks bin/loop to ~/.local/bin/loop
+# Installs core skills and agents into ~/.claude/{skills,agents}/ (loop-* prefixed)
+#
+# Flags:
+#   --link    Symlink core skills/agents into ~/.claude/ instead of copying.
+#             Edits to the repo propagate immediately to all projects.
+#             Recommended for the simple-loop maintainer; coworkers should use
+#             the default copy mode and `loop update` to refresh.
 
 set -euo pipefail
+
+LINK_MODE=false
+for arg in "$@"; do
+    case "$arg" in
+        --link) LINK_MODE=true ;;
+        -h|--help)
+            sed -n '1,12p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) echo "Unknown flag: $arg" >&2; exit 1 ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="${SIMPLE_LOOP_HOME:-$HOME/.local/share/simple-loop}"
 BIN_DIR="$HOME/.local/bin"
+CLAUDE_DIR="$HOME/.claude"
 
 echo ""
 echo "Installing Simple Loop v0.2..."
-echo "  Source:  $SCRIPT_DIR"
-echo "  Install: $INSTALL_DIR"
-echo "  Binary:  $BIN_DIR/loop"
+echo "  Source:    $SCRIPT_DIR"
+echo "  Install:   $INSTALL_DIR"
+echo "  Binary:    $BIN_DIR/loop"
+echo "  Claude:    $CLAUDE_DIR (workstation skills + agents)"
+echo "  Mode:      $([ "$LINK_MODE" = true ] && echo 'symlink (live edits)' || echo 'copy (snapshot)')"
 echo ""
 
 # Create directories
@@ -52,6 +74,54 @@ if [ -d "$SCRIPT_DIR/core" ]; then
 
     # Core templates
     cp "$SCRIPT_DIR/core/templates/"* "$INSTALL_DIR/core/templates/" 2>/dev/null || true
+fi
+
+# ── Workstation install: core skills and agents into ~/.claude/ ──
+# Skills land at ~/.claude/skills/loop-<name>/, agents at ~/.claude/agents/loop-<name>.md.
+# The loop- prefix namespaces them so they don't collide with the user's own files.
+mkdir -p "$CLAUDE_DIR/skills" "$CLAUDE_DIR/agents"
+
+install_skill() {
+    local src_dir="$1"
+    local name
+    name=$(basename "$src_dir")
+    local target="$CLAUDE_DIR/skills/loop-${name}"
+    rm -rf "$target"
+    if [ "$LINK_MODE" = true ]; then
+        ln -s "$src_dir" "$target"
+    else
+        cp -R "$src_dir" "$target"
+    fi
+    echo "  Skill: /loop-${name}"
+}
+
+install_agent() {
+    local src_file="$1"
+    local name
+    name=$(basename "$src_file" .md)
+    local target="$CLAUDE_DIR/agents/loop-${name}.md"
+    rm -f "$target"
+    if [ "$LINK_MODE" = true ]; then
+        ln -s "$src_file" "$target"
+    else
+        cp "$src_file" "$target"
+    fi
+    echo "  Agent: loop-${name}"
+}
+
+if [ -d "$SCRIPT_DIR/core/skills" ]; then
+    for skill_dir in "$SCRIPT_DIR/core/skills"/*/; do
+        [ -d "$skill_dir" ] || continue
+        # Trim trailing slash so basename works
+        install_skill "${skill_dir%/}"
+    done
+fi
+
+if [ -d "$SCRIPT_DIR/core/agents" ]; then
+    for agent_file in "$SCRIPT_DIR/core/agents"/*.md; do
+        [ -f "$agent_file" ] || continue
+        install_agent "$agent_file"
+    done
 fi
 
 # Copy v2 modules
