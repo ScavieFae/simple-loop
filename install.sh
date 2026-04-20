@@ -183,12 +183,13 @@ if ! echo "$PATH" | grep -q "$BIN_DIR"; then
     echo ""
 fi
 
-# Check Agent Teams
+# Check Agent Teams (experimental, gated by an env var; requires Claude Code v2.1.32+)
 if command -v claude >/dev/null 2>&1; then
-    teams_enabled=$(claude config get enableAgentTeams 2>/dev/null || echo "")
-    if [ "$teams_enabled" != "true" ]; then
-        echo "  Recommendation: enable Agent Teams for best results"
-        echo "    claude config set enableAgentTeams true"
+    settings_file="$CLAUDE_DIR/settings.json"
+    if [ ! -f "$settings_file" ] || ! grep -q "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" "$settings_file" 2>/dev/null; then
+        echo "  Recommendation: enable Agent Teams for best results (Claude Code v2.1.32+)"
+        echo "    Add to ~/.claude/settings.json:"
+        echo '      "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }'
         echo ""
     fi
 fi
