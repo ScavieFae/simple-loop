@@ -1,102 +1,130 @@
 # Simple Loop
 
-An autonomous agent loop for Claude Code. Write a brief, start the daemon, watch it build.
+A workstation kit of skills, subagents, and opt-in orchestration loops for Claude Code. Install once; every project gets the core skills (`/loop-push`, `/loop-pull`) and subagents (`loop-coder`, `loop-reviewer`, `loop-research`). Opt individual projects into a daemon-driven build, research, or experiment loop when the work warrants it.
 
-Simple Loop gives any project a lightweight autonomous development loop: a daemon that runs Claude Code sessions to implement tasks from structured briefs, tracks progress, evaluates results, and reports costs.
+## What you get
 
-## How it works
+- **Workstation skills** — slash commands available in every Claude Code session
+- **Workstation subagents** — addressable via `subagent_type: loop-coder` etc.
+- **Modules** — opt-in per project via `loop add <name>`: research, build, autoresearch, docs
+- **Orchestration daemon** — opt-in per project via `loop init` for multi-iteration autonomous work
 
-1. **You write a brief** — a short document that says what to build, broken into single-iteration tasks
-2. **The daemon runs workers** — each worker is a fresh Claude Code session that does ONE task, verifies it, commits, and exits
-3. **The conductor evaluates** — when a brief is done, the conductor reviews the work and decides: merge, fix, or escalate
-4. **You get notified** — push notifications via ntfy.sh on completions, failures, and escalations
-
-The human stays at the director level (WHAT to build), the agents handle the implementation (HOW to build it).
-
-## Quick start
+## Install
 
 ```bash
-# Install
-git clone <this-repo> ~/simple-loop
-bash ~/simple-loop/install.sh
-
-# Set up a project
-cd your-project
-loop init          # answer ~5 questions
-loop brief "add user authentication"   # write a brief with the spec agent
-loop start         # start the autonomous loop
-loop status        # check progress
-loop logs -f       # watch it work
+git clone https://github.com/ScavieFae/simple-loop.git ~/simple-loop
+bash ~/simple-loop/install.sh           # default: copy (snapshot)
+# or
+bash ~/simple-loop/install.sh --link    # maintainer mode: symlink, edits go live
 ```
 
-## Requirements
+This installs the `loop` binary at `~/.local/bin/loop` and populates `~/.claude/skills/loop-*/` and `~/.claude/agents/loop-*.md` with the core surface. Coworkers should use the default copy mode and re-run install to refresh:
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed and authenticated
-- Python 3.8+
-- Git
-- Bash
+```bash
+cd ~/simple-loop && git pull && bash install.sh
+```
 
-## CLI Reference
+If you used `--link`, your installed copy *is* your repo checkout — `git pull` is enough.
+
+### Requirements
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI, authenticated
+- Python 3.8+, Git, Bash
+
+## Workstation skills
+
+| Skill | Triggers | What it does |
+|-------|----------|-------------|
+| `/loop-push` | "push", "ship it", "send it" | Scope audit → `HANDOFF.md` → `RUNNING.md` → commit + push |
+| `/loop-pull` | "pull", "catch me up", "what changed" | Git pull → parallel HANDOFF/state scanners → briefing |
+| `/loop-update-handoff` | manual | Append one entry to `HANDOFF.md` |
+| `/loop-update-running` | manual | Append one entry to `RUNNING.md` |
+| `/loop-update-trouble` | manual | Document a bug investigation in `TROUBLESHOOTING.md` |
+| `/loop-file-issue` | manual | File a GitHub issue with `gh` |
+
+`/loop-push` and `/loop-pull` are session-boundary workflows — they orchestrate the atomic update skills into a coherent ritual. Push captures context on the way out; pull absorbs it on the way in.
+
+**Project overrides:** drop a skill at `<project>/.claude/skills/loop-push/SKILL.md` to wrap or replace the workstation version with project-specific steps (deploy gates, contract checks, etc.) while keeping the same name.
+
+## Workstation subagents
+
+| Subagent | `subagent_type` | What it does |
+|----------|-----------------|-------------|
+| Coder | `loop-coder` | Implements one scoped task per iteration, verifies, commits |
+| Reviewer | `loop-reviewer` | Evaluates work against a brief's completion criteria |
+| Research | `loop-research` | Searches, reads, synthesizes findings with sources cited |
+
+**Project overrides:** `<project>/.claude/agents/loop-coder.md` shadows the workstation file.
+
+## Orchestration loop (opt-in per project)
+
+For projects you want to run autonomously across many iterations, `loop init` scaffolds a `.loop/` directory and the daemon takes over the busywork: pick a brief → spawn a coder for one task → verify → commit → repeat → evaluate when done. Most projects don't need this. Use it when the work is well-scoped enough to run while you sleep.
+
+```bash
+cd your-project
+loop init                                  # one-time, interactive
+loop add build                             # opt into the build module
+loop brief "add user authentication"       # write a brief interactively
+loop start                                 # start the daemon
+loop status                                # check progress
+loop logs -f                               # watch it work
+```
+
+### Modules
+
+Each module is installed per-project with `loop add <name>`. It symlinks the module's skills as `/loop-<module>-<skill>`, appends a CLAUDE.md section between markers, and provisions state under `.loop/modules/<module>/`.
+
+| Module | Loop style | What it does |
+|--------|-----------|-------------|
+| `build` | brief-driven | Autonomous implementation of structured briefs (the v1 simple-loop behavior) |
+| `research` | brief-driven | Autonomous search/synthesis on a set of research questions |
+| `autoresearch` | heartbeat | Hypothesize → review → execute → evaluate experiment cycles with budget gating (AWM-style) |
+| `docs` | on-demand | Living docs site via Zensical with a prebuild step |
+
+### CLI reference
 
 | Command | Description |
 |---------|-------------|
-| `loop init` | Interactive project setup — creates `.loop/` directory |
-| `loop brief "title"` | Write a brief with the spec agent (interactive) |
-| `loop brief --no-interactive "title"` | Create brief from template, open in `$EDITOR` |
-| `loop start [interval]` | Start the daemon (default: 300s idle heartbeat) |
+| `loop init` | Interactive project setup, creates `.loop/` |
+| `loop add <module>` | Install a module into the current project |
+| `loop brief "title"` | Write a brief interactively |
+| `loop brief --no-interactive "title"` | Create brief from template, opens in `$EDITOR` |
+| `loop start [interval]` | Start the daemon (default 300s heartbeat) |
 | `loop stop` | Stop the daemon |
-| `loop status` | Show daemon state, active brief, recent logs |
-| `loop logs [-f]` | Show/follow daemon logs |
-| `loop pause [reason]` | Pause daemon — commits + pushes signal |
-| `loop resume [instruction]` | Resume daemon — commits + pushes signal |
-| `loop metrics [--since DATE]` | Cost report from metrics |
+| `loop status` | Daemon state, active brief, recent logs |
+| `loop logs [-f]` | Show / follow daemon logs |
+| `loop pause [reason]` | Pause daemon (commits + pushes signal) |
+| `loop resume [instruction]` | Resume daemon |
+| `loop metrics [--since DATE]` | Cost report from `metrics.jsonl` |
 | `loop help` | Usage |
 
-## Project structure
+### Project layout
 
-After `loop init`, your project gets a `.loop/` directory:
+After `loop init`:
 
 ```
 .loop/
-├── config.sh          # Project settings (heartbeat interval, verify command, etc.)
-├── agents/            # Agent definitions (customizable)
-│   ├── spec.md        # Brief-writing partner
-│   ├── coder.md       # Implementation agent
-│   ├── reviewer.md    # Code review agent
-│   └── researcher.md  # Investigation agent
+├── config.json          # project settings (heartbeat, ntfy, git, modules list)
+├── config.sh            # legacy shell-style config (kept for compatibility)
 ├── prompts/
-│   ├── worker.md      # Per-iteration rules for the coder
-│   └── conductor.md   # Heartbeat prompt for the loop controller
-├── briefs/            # Brief definitions go here
+│   ├── worker.md        # per-iteration daemon worker prompt
+│   └── conductor.md     # heartbeat conductor prompt
+├── briefs/              # brief markdown files
 ├── state/
-│   ├── running.json   # Active/completed/history
-│   ├── goals.md       # What to build (you write this)
-│   ├── metrics.jsonl  # Cost and token data per session
-│   ├── log.jsonl      # Decision log
-│   ├── last_pull.json # Last /pull timestamp (for filtering "what's new")
-│   └── signals/       # pause.json, resume.json, escalate.json
-├── evaluations/       # Post-brief eval cards
-├── knowledge/
-│   └── learnings.md   # Agent-writable knowledge base
-└── logs/              # Session logs (gitignored)
+│   ├── running.json     # active / completed / history
+│   ├── goals.md         # what to build (you write this)
+│   ├── metrics.jsonl    # cost and tokens per session
+│   ├── log.jsonl        # decision log
+│   └── signals/         # pause / escalate
+├── evaluations/         # post-brief eval cards
+├── knowledge/           # agent-writable knowledge base
+├── modules/             # per-module config + state (after `loop add`)
+└── logs/                # session logs (gitignored)
 ```
 
-## Configuration
+There's no `.loop/agents/` — generic agents live globally in `~/.claude/agents/`. Project-specific agent overrides go in `<project>/.claude/agents/`.
 
-Edit `.loop/config.sh`:
-
-```bash
-PROJECT_NAME="my-project"
-HEARTBEAT_INTERVAL=300        # Seconds between idle heartbeats
-WORKER_COOLDOWN=30            # Seconds between worker iterations
-MAX_ITERATIONS=20             # Safety limit per brief
-NTFY_TOPIC="my-topic"        # ntfy.sh push notifications (empty = off)
-VERIFY_CMD="npm test"         # Run after each task (empty = skip)
-GIT_REMOTE="origin"
-GIT_MAIN_BRANCH="main"
-```
-
-## Brief format
+### Brief format
 
 ```markdown
 # Brief: Add user login
@@ -105,76 +133,34 @@ GIT_MAIN_BRANCH="main"
 **Model:** sonnet
 
 ## Goal
-Add JWT-based login to the API. Users POST credentials, get back a token.
+Add JWT-based login to the API. Users POST credentials, get a token back.
 
 ## Tasks
 1. Create auth middleware that validates JWT tokens
-2. Add POST /login endpoint that issues tokens
+2. Add `POST /login` endpoint that issues tokens
 3. Add token refresh endpoint
 
 ## Completion Criteria
-- [ ] POST /login returns JWT with 1h expiry
+- [ ] `POST /login` returns a JWT with 1h expiry
 - [ ] Protected routes reject invalid tokens
 - [ ] Token refresh extends session
 
 ## Verification
-- npm test passes
+- `npm test` passes
 - No new lint warnings
 ```
 
-## The four agents
+### Push notifications
 
-| Agent | Role | When it runs |
-|-------|------|-------------|
-| **spec** | Brief-writing partner | `loop brief` — interactive session |
-| **coder** | Implementation | Each worker iteration (daemon-spawned) |
-| **reviewer** | Code review | Evaluation phase (conductor-spawned) |
-| **researcher** | Investigation | On demand for unfamiliar territory |
+Set `ntfy_topic` in `.loop/config.json` and install the [ntfy](https://ntfy.sh) app. Events that notify: daemon start/stop, worker iteration completed, worker failure, brief completed (awaiting eval), brief merged, rate limit hit, escalation.
 
-Customize any agent by editing the files in `.loop/agents/`.
+### Multi-machine
 
-## Skills
+The daemon commits state to git and pushes. You can run the daemon on a remote machine, pause/resume from any machine (`loop pause` / `loop resume` write git-committed signals), and check status from anywhere.
 
-Skills are slash commands that agents (or humans) invoke during work sessions. Simple Loop ships core skills that any project can use, plus module-specific skills for research and build workflows.
+### Cost tracking
 
-### Core skills
-
-| Skill | Trigger | What it does |
-|-------|---------|-------------|
-| `/push` | "push", "ship it", "send it" | Scope audit → HANDOFF.md → RUNNING.md → commit + push |
-| `/pull` | "pull", "catch me up", "what changed" | Git pull → parallel HANDOFF/state scanners → briefing |
-| `/update-handoff` | Manual | Append one entry to HANDOFF.md |
-| `/update-running` | Manual | Append one entry to RUNNING.md |
-| `/update-trouble` | Manual | Document a bug investigation in TROUBLESHOOTING.md |
-| `/file-issue` | Manual | File a GitHub issue |
-
-`/push` and `/pull` are session-boundary workflows — they orchestrate the atomic update skills into a coherent ritual. `/push` captures context on the way out; `/pull` absorbs it on the way in.
-
-**Extending:** Projects can override `/push` or `/pull` by placing a project-level skill in `.claude/skills/push/SKILL.md` or `.claude/skills/pull/SKILL.md`. Use this to add project-specific steps (experiment tracking, deploy gates, interface contract checks) while keeping the core communicate-capture-ship pattern.
-
-## Push notifications
-
-Simple Loop uses [ntfy.sh](https://ntfy.sh) for push notifications. Set `NTFY_TOPIC` in config.sh and install the ntfy app on your phone.
-
-Events that trigger notifications:
-- Daemon started/stopped
-- Worker iteration completed
-- Worker failure
-- Brief completed (awaiting evaluation)
-- Brief merged
-- Rate limit hit
-- Escalation (needs human attention)
-
-## Multi-machine support
-
-The daemon commits state to git and pushes. You can:
-- Run the daemon on a remote machine
-- Pause/resume from any machine via `loop pause` / `loop resume` (signals are git-committed)
-- Check status from anywhere via `loop status`
-
-## Cost tracking
-
-Every Claude Code session logs cost, tokens, and duration to `.loop/state/metrics.jsonl`. Run `loop metrics` for a report:
+Every Claude Code session logs cost, tokens, and duration to `.loop/state/metrics.jsonl`. `loop metrics` summarizes:
 
 ```
 # Loop Metrics Report
@@ -188,9 +174,13 @@ Every Claude Code session logs cost, tokens, and duration to `.loop/state/metric
 
 ## Philosophy
 
-Simple Loop extracts a pattern that emerged over 40+ cycles of autonomous development: the daemon heartbeat, structured briefs, fresh sessions per task, cost tracking, and push notifications. It's not a framework — it's a kit. Take what works, customize what doesn't, delete what you don't need.
+Simple Loop separates two things that often get conflated:
 
-The key insight: **autonomous agents work best with clear, well-scoped briefs and mechanical iteration**. The daemon handles the boring parts (git sync, branch management, progress tracking, notifications). The human stays at the director level. The agents do the work.
+**The workstation surface** — skills and subagents you reach for constantly. `/loop-push` at session boundaries. `subagent_type: loop-research` when you need a parallel investigation. `/loop-pull` to orient at the start of a session. These should be in your hand, in every project, at all times. One install, no per-project setup.
+
+**The orchestration loop** — opt-in heavy machinery for projects that warrant autonomous, multi-iteration work. The daemon, the briefs, the heartbeat conductor. Not every project needs this. Use it when work is well-scoped enough that the human can stay at the director level and let the agents grind.
+
+The kit ships with both. Install once, get the workstation surface forever. Run `loop init` only when a project actually needs the orchestration loop.
 
 ## License
 
