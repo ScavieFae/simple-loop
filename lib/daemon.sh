@@ -233,6 +233,23 @@ Trigger reason: $reason" \
         fi
     else
         daemon_log "CONDUCTOR #$TURN: complete (${TURN_DURATION}s)"
+
+        # Brief-003 Thread 7: Auto-merge layer.
+        # If the conductor wrote an `escalate.json` with reason
+        # `human_approval_required_for_merge`, check whether the brief opted in
+        # via `**Auto-merge:** true` + validator verdict == `pass` + no
+        # `.loop/state/pause-auto-merge` kill-switch. When all three hold, swap
+        # escalate.json → pending-merge.json and log `auto_merge_approved`.
+        # Any other escalation class (infra failure, validator_block, etc.)
+        # still pages a human — auto-merge is strictly opt-in per brief.
+        if [ -f "$SIGNALS_DIR/escalate.json" ]; then
+            AM_OUT=$(python3 "$DAEMON_LIB_DIR/auto_merge.py" check-escalate "$PROJECT_DIR" 2>&1)
+            AM_RC=$?
+            if [ "$AM_RC" -eq 0 ] && [ -n "$AM_OUT" ]; then
+                daemon_log "AUTO-MERGE: $AM_OUT"
+            fi
+        fi
+
         # Push after conductor (it may have committed state changes)
         git -C "$PROJECT_DIR" push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
     fi

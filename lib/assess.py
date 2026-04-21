@@ -25,6 +25,7 @@ import time
 
 
 REVIEW_CYCLE_RE = re.compile(r"-cycle-(\d+)\.md$")
+AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECASE)
 
 
 def git_show(project_dir, ref, path):
@@ -51,6 +52,23 @@ def git_rev_parse(project_dir, ref):
     except Exception:
         pass
     return ""
+
+
+def read_auto_merge_flag(project_dir, ref, brief_file_rel):
+    """Thread 7: does this brief opt in to auto-merge?
+
+    Parses `**Auto-merge:** true` from the brief frontmatter. Absent or any
+    non-`true` value → False. Read via `git show <ref>:<path>` so the main
+    worktree can inspect a brief-branch file without a checkout.
+    """
+    content = git_show(project_dir, ref, brief_file_rel)
+    if not content:
+        return False
+    for line in content.splitlines():
+        m = AUTO_MERGE_LINE_RE.match(line)
+        if m:
+            return m.group(1).strip().lower().strip('"').strip("'") == "true"
+    return False
 
 
 def max_review_cycle(project_dir, ref, brief_id):
