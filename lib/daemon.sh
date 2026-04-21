@@ -75,7 +75,10 @@ echo $$ > "$PID_FILE"
 # ╚══════════════════════════════════════════════════════════════════╝
 
 daemon_log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_DIR/daemon.log"
+    # bin-loop's `>> "$LOG_FILE" 2>&1` outer redirect already appends stdout
+    # (and stderr) to daemon.log. `tee -a` here would double-write each line,
+    # which made `loop logs -f` print every entry twice.
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
 notify() {
