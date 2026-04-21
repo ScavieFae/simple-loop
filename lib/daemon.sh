@@ -466,9 +466,11 @@ run_validator_iteration() {
     local REVIEW_REL=".loop/modules/validator/state/reviews/${brief_id}-cycle-${cycle}.md"
 
     # Build prompt: agent spec + per-run context + required schema.
+    # Strip any leading YAML frontmatter — the claude CLI parses a prompt
+    # starting with `---` as a flag and aborts with "unknown option '---".
     local AGENT_SPEC=""
     if [ -f "$VALIDATOR_AGENT_FILE" ]; then
-        AGENT_SPEC=$(cat "$VALIDATOR_AGENT_FILE")
+        AGENT_SPEC=$(awk 'NR==1 && $0=="---"{in_fm=1; next} in_fm && $0=="---"{in_fm=0; next} !in_fm' "$VALIDATOR_AGENT_FILE")
     fi
 
     local NOW_ISO
