@@ -425,6 +425,40 @@ run_validator_iteration() {
     local brief_file
     brief_file=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
 
+    # Per-brief validator override (Thread 1 scope item). Brief frontmatter
+    # `**Validator:**` names an agent spec. Resolution:
+    #   - bare name (e.g. `loop-reviewer`, `reviewer`, `security-reviewer`)
+    #     → `core/agents/<name>.md` (with optional `loop-` prefix stripped)
+    #   - path containing `/`
+    #     → absolute path used as-is; relative path resolved under worktree
+    # Unresolvable overrides log and fall back to default. VALIDATOR_NAME
+    # carries through to the review artifact's `validator:` frontmatter.
+    local VALIDATOR_NAME="loop-reviewer"
+    local VALIDATOR_AGENT_FILE="$VALIDATOR_AGENT_DEFAULT"
+    if [ -n "$brief_file" ] && [ -f "$WORKTREE_DIR/$brief_file" ]; then
+        local brief_validator
+        brief_validator=$(grep -m1 '^\*\*Validator:\*\*' "$WORKTREE_DIR/$brief_file" 2>/dev/null \
+            | sed 's/.*\*\*Validator:\*\*[[:space:]]*//' | awk '{print $1}')
+        if [ -n "$brief_validator" ]; then
+            local resolved=""
+            if [[ "$brief_validator" == /* ]]; then
+                resolved="$brief_validator"
+            elif [[ "$brief_validator" == */* ]]; then
+                resolved="$WORKTREE_DIR/$brief_validator"
+            else
+                local base="${brief_validator#loop-}"
+                resolved="$(dirname "$VALIDATOR_AGENT_DEFAULT")/${base}.md"
+            fi
+            if [ -f "$resolved" ]; then
+                VALIDATOR_NAME="$brief_validator"
+                VALIDATOR_AGENT_FILE="$resolved"
+                daemon_log "VALIDATOR: using override '$brief_validator' (from brief)"
+            else
+                daemon_log "VALIDATOR: override '$brief_validator' unresolved at '$resolved' — using default loop-reviewer"
+            fi
+        fi
+    fi
+
     daemon_log "VALIDATOR: reviewing $brief_id cycle $cycle (commit ${commit_sha:0:8})"
 
     mkdir -p "$WORKTREE_DIR/.loop/modules/validator/state/reviews"
@@ -433,8 +467,8 @@ run_validator_iteration() {
 
     # Build prompt: agent spec + per-run context + required schema.
     local AGENT_SPEC=""
-    if [ -f "$VALIDATOR_AGENT_DEFAULT" ]; then
-        AGENT_SPEC=$(cat "$VALIDATOR_AGENT_DEFAULT")
+    if [ -f "$VALIDATOR_AGENT_FILE" ]; then
+        AGENT_SPEC=$(cat "$VALIDATOR_AGENT_FILE")
     fi
 
     local NOW_ISO
@@ -479,7 +513,7 @@ brief: $brief_id
 branch: $branch
 verdict: pass   # one of: pass | issues | block
 summary: <one-line verdict, <=120 chars>
-validator: loop-reviewer
+validator: $VALIDATOR_NAME
 reviewed_at: $NOW_ISO
 ---
 
