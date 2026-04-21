@@ -8,6 +8,13 @@
 #   Conductor: reads state, decides what to do (evaluate, dispatch, idle).
 #   Worker: does ONE task from the active brief, commits, exits.
 #   Both run as fresh Claude Code sessions. No long-lived processes.
+#
+# Model tier policy (2026-04-20, brief-003):
+#   heartbeat = haiku  (reserved — no heartbeat Claude calls today; assess.py is pure Python)
+#   conductor = opus   (substantive state-transition reasoning)
+#   validator = opus   (substantive spec-fit review; added by brief-003 Thread 1)
+#   worker    = per-brief from **Model:** frontmatter, default opus
+# Any new `claude` invocation in this file MUST name a --model flag explicitly.
 
 set -uo pipefail
 
@@ -198,7 +205,8 @@ invoke_conductor() {
 
     cd "$PROJECT_DIR"
 
-    claude --dangerously-skip-permissions \
+    # Tier: conductor = opus (see top-of-file model tier policy).
+    claude --model opus --dangerously-skip-permissions \
         --output-format json \
         -p "$(cat "$CONDUCTOR_PROMPT")
 
@@ -311,16 +319,19 @@ with open('$PROGRESS_FILE', 'w') as f:
         return 0
     fi
 
-    # Read model preference from brief
-    local model=""
-    local MODEL_FLAG=""
+    # Tier: worker = per-brief (see top-of-file model tier policy).
+    # Default opus; override from brief frontmatter **Model:** line.
+    local WORKER_MODEL="opus"
     local brief_file_path
     brief_file_path=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
     if [ -n "$brief_file_path" ] && [ -f "$WORKTREE_DIR/$brief_file_path" ]; then
-        model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-        if [ -n "$model" ] && [ "$model" != "opus" ]; then
-            MODEL_FLAG="--model $model"
-            daemon_log "WORKER: using model '$model' (from brief)"
+        local brief_model
+        brief_model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        if [ -n "$brief_model" ]; then
+            WORKER_MODEL="$brief_model"
+            if [ "$brief_model" != "opus" ]; then
+                daemon_log "WORKER: using model '$brief_model' (from brief)"
+            fi
         fi
     fi
 
@@ -335,9 +346,8 @@ with open('$PROGRESS_FILE', 'w') as f:
 
     cd "$WORKTREE_DIR"
 
-    claude --dangerously-skip-permissions \
+    claude --model "$WORKER_MODEL" --dangerously-skip-permissions \
         --output-format json \
-        $MODEL_FLAG \
         -p "$PROMPT_CONTENT" \
         > "$WORKER_JSON" 2>>"$WORKER_LOG"
 
@@ -347,7 +357,7 @@ with open('$PROGRESS_FILE', 'w') as f:
 
     cd "$PROJECT_DIR"
 
-    parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '${model:-default}', 'exit_code': $WORKER_EXIT}"
+    parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '$WORKER_MODEL', 'exit_code': $WORKER_EXIT}"
     rm -f "$WORKER_JSON"
 
     # Push results from worktree
