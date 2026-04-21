@@ -9,11 +9,12 @@
 #   Worker: does ONE task from the active brief, commits, exits.
 #   Both run as fresh Claude Code sessions. No long-lived processes.
 #
-# Model tier policy (2026-04-20, brief-003):
+# Model tier policy (2026-04-21, revised from brief-003 baseline):
 #   heartbeat = haiku  (reserved — no heartbeat Claude calls today; assess.py is pure Python)
-#   conductor = opus   (substantive state-transition reasoning)
-#   validator = opus   (substantive spec-fit review; added by brief-003 Thread 1)
-#   worker    = per-brief from **Model:** frontmatter, default opus
+#   conductor = opus   (substantive state-transition reasoning, taste calls)
+#   validator = sonnet (spec-fit review — Sonnet is sufficient; opt up per-brief if needed)
+#   worker    = per-brief from **Model:** frontmatter, default sonnet
+#                (set **Model:** opus in brief frontmatter for hard work)
 # Any new `claude` invocation in this file MUST name a --model flag explicitly.
 
 set -uo pipefail
@@ -339,8 +340,8 @@ with open('$PROGRESS_FILE', 'w') as f:
     fi
 
     # Tier: worker = per-brief (see top-of-file model tier policy).
-    # Default opus; override from brief frontmatter **Model:** line.
-    local WORKER_MODEL="opus"
+    # Default sonnet; override from brief frontmatter **Model:** line (e.g. "opus").
+    local WORKER_MODEL="sonnet"
     local brief_file_path
     brief_file_path=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
     if [ -n "$brief_file_path" ] && [ -f "$WORKTREE_DIR/$brief_file_path" ]; then
@@ -348,7 +349,7 @@ with open('$PROGRESS_FILE', 'w') as f:
         brief_model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
         if [ -n "$brief_model" ]; then
             WORKER_MODEL="$brief_model"
-            if [ "$brief_model" != "opus" ]; then
+            if [ "$brief_model" != "sonnet" ]; then
                 daemon_log "WORKER: using model '$brief_model' (from brief)"
             fi
         fi
@@ -568,8 +569,8 @@ Verdict guide:
 
     cd "$WORKTREE_DIR"
 
-    # Tier: validator = opus (see top-of-file model tier policy).
-    claude --model opus --dangerously-skip-permissions \
+    # Tier: validator = sonnet (see top-of-file model tier policy).
+    claude --model sonnet --dangerously-skip-permissions \
         --output-format json \
         -p "$VALIDATOR_PROMPT_BODY" \
         > "$VALIDATOR_JSON" 2>>"$VALIDATOR_LOG"
