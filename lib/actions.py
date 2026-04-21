@@ -80,9 +80,12 @@ def git(project_dir, *args, check=True):
 
 
 def load_running(paths):
-    """Load running.json."""
+    """Load running.json, backfilling v2 fields with defaults for backward compatibility."""
     with open(paths["running_file"]) as f:
-        return json.load(f)
+        rc = json.load(f)
+    rc.setdefault("pending_merges", [])
+    rc.setdefault("awaiting_review", [])
+    return rc
 
 
 def save_running(paths, data):
@@ -122,6 +125,167 @@ def move_to_eval(paths, brief_id):
 
     log_action(paths, "move-to-eval", {"brief": brief_id})
     print(f"Moved {brief_id} to completed_pending_eval")
+    return True
+
+
+# ─── Action: move-to-pending-merges ─────────────────────────────────
+
+def move_to_pending_merges(paths, brief_id):
+    """Move a brief from active[] to pending_merges[] (auto-merge path)."""
+    rc = load_running(paths)
+    active = rc.get("active", [])
+
+    moved = None
+    new_active = []
+    for entry in active:
+        if entry.get("brief") == brief_id:
+            moved = entry
+        else:
+            new_active.append(entry)
+
+    if not moved:
+        print(f"Warning: brief '{brief_id}' not found in active list", file=sys.stderr)
+        return False
+
+    moved["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    moved["auto_merge"] = True
+    rc["active"] = new_active
+    rc["pending_merges"].append(moved)
+    save_running(paths, rc)
+
+    log_action(paths, "move-to-pending-merges", {"brief": brief_id})
+    print(f"Moved {brief_id} to pending_merges")
+    return True
+
+
+# ─── Action: move-to-awaiting-review ────────────────────────────────
+
+def move_to_awaiting_review(paths, brief_id, reason=""):
+    """Move a brief from active[] to awaiting_review[] (human approval path)."""
+    rc = load_running(paths)
+    active = rc.get("active", [])
+
+    moved = None
+    new_active = []
+    for entry in active:
+        if entry.get("brief") == brief_id:
+            moved = entry
+        else:
+            new_active.append(entry)
+
+    if not moved:
+        print(f"Warning: brief '{brief_id}' not found in active list", file=sys.stderr)
+        return False
+
+    moved["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    moved["auto_merge"] = False
+    if reason:
+        moved["reason"] = reason
+    rc["active"] = new_active
+    rc["awaiting_review"].append(moved)
+    save_running(paths, rc)
+
+    log_action(paths, "move-to-awaiting-review", {"brief": brief_id, "reason": reason})
+    print(f"Moved {brief_id} to awaiting_review")
+    return True
+
+
+# ─── Action: process-pending-merges ─────────────────────────────────
+
+def process_pending_merges(paths):
+    """Pop one brief from pending_merges[], write pending-merge.json, execute merge."""
+    rc = load_running(paths)
+    queue = rc.get("pending_merges", [])
+
+    if not queue:
+        print("No pending_merges to process", file=sys.stderr)
+        return False
+
+    if os.path.exists(paths["pending_merge"]):
+        print("pending-merge.json already exists — merge already in progress", file=sys.stderr)
+        return False
+
+    entry = queue[0]
+    brief = entry.get("brief", "")
+    branch = entry.get("branch", "")
+
+    spec = {
+        "brief": brief,
+        "branch": branch,
+        "title": brief,
+        "evaluation": entry.get("evaluation", ""),
+    }
+    with open(paths["pending_merge"], "w") as f:
+        json.dump(spec, f, indent=2)
+        f.write("\n")
+
+    # Remove from queue before calling merge() (merge() will re-prune from pending_merges anyway)
+    rc["pending_merges"] = queue[1:]
+    save_running(paths, rc)
+
+    log_action(paths, "process-pending-merges", {"brief": brief})
+    print(f"Wrote pending-merge.json for {brief}, executing merge")
+
+    return merge(paths)
+
+
+# ─── Action: approve-brief ───────────────────────────────────────────
+
+def approve_brief(paths, brief_id):
+    """Move a brief from awaiting_review[] to pending_merges[]."""
+    rc = load_running(paths)
+    waiting = rc.get("awaiting_review", [])
+
+    moved = None
+    new_waiting = []
+    for entry in waiting:
+        if entry.get("brief") == brief_id:
+            moved = entry
+        else:
+            new_waiting.append(entry)
+
+    if not moved:
+        print(f"Warning: brief '{brief_id}' not found in awaiting_review", file=sys.stderr)
+        return False
+
+    moved["approved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    moved["auto_merge"] = True
+    rc["awaiting_review"] = new_waiting
+    rc["pending_merges"].append(moved)
+    save_running(paths, rc)
+
+    log_action(paths, "approve-brief", {"brief": brief_id})
+    print(f"Approved {brief_id}: moved to pending_merges")
+    return True
+
+
+# ─── Action: reject-brief ────────────────────────────────────────────
+
+def reject_brief(paths, brief_id, reason=""):
+    """Move a brief from awaiting_review[] to history[] with rejected marker."""
+    rc = load_running(paths)
+    waiting = rc.get("awaiting_review", [])
+
+    moved = None
+    new_waiting = []
+    for entry in waiting:
+        if entry.get("brief") == brief_id:
+            moved = entry
+        else:
+            new_waiting.append(entry)
+
+    if not moved:
+        print(f"Warning: brief '{brief_id}' not found in awaiting_review", file=sys.stderr)
+        return False
+
+    moved["rejected_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    moved["reject_reason"] = reason
+    rc["awaiting_review"] = new_waiting
+    rc.setdefault("history", []).append(moved)
+    save_running(paths, rc)
+
+    log_action(paths, "reject-brief", {"brief": brief_id, "reason": reason})
+    print(f"Rejected {brief_id}: moved to history")
     return True
 
 
@@ -297,6 +461,8 @@ def merge(paths):
     pending = rc.get("completed_pending_eval", [])
     new_pending = [e for e in pending if e.get("brief") != brief]
     rc["completed_pending_eval"] = new_pending
+    rc["pending_merges"] = [e for e in rc.get("pending_merges", []) if e.get("brief") != brief]
+    rc["awaiting_review"] = [e for e in rc.get("awaiting_review", []) if e.get("brief") != brief]
 
     rc.setdefault("history", []).append({
         "brief": brief,
@@ -329,12 +495,16 @@ def cleanup_worktrees(paths):
     # Prune stale git worktree entries
     git(project_dir, "worktree", "prune", check=False)
 
-    # Get active brief IDs
+    # Get active brief IDs (all queues that still have a live worktree)
     rc = load_running(paths)
     active_briefs = set()
     for entry in rc.get("active", []):
         active_briefs.add(entry.get("brief", ""))
     for entry in rc.get("completed_pending_eval", []):
+        active_briefs.add(entry.get("brief", ""))
+    for entry in rc.get("pending_merges", []):
+        active_briefs.add(entry.get("brief", ""))
+    for entry in rc.get("awaiting_review", []):
         active_briefs.add(entry.get("brief", ""))
 
     cleaned = 0
@@ -364,28 +534,54 @@ def cleanup_worktrees(paths):
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
+    BRIEF_ACTIONS = ("move-to-eval", "move-to-pending-merges", "move-to-awaiting-review",
+                     "approve-brief", "reject-brief")
+
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <action> <project_dir> [args]", file=sys.stderr)
-        print("Actions: move-to-eval <brief_id>, dispatch, merge, cleanup", file=sys.stderr)
+        print("Actions: move-to-eval <brief_id> <project_dir>", file=sys.stderr)
+        print("         move-to-pending-merges <brief_id> <project_dir>", file=sys.stderr)
+        print("         move-to-awaiting-review <brief_id> <project_dir> [reason]", file=sys.stderr)
+        print("         process-pending-merges <project_dir>", file=sys.stderr)
+        print("         approve-brief <brief_id> <project_dir>", file=sys.stderr)
+        print("         reject-brief <brief_id> <project_dir> [reason]", file=sys.stderr)
+        print("         dispatch <project_dir>", file=sys.stderr)
+        print("         merge <project_dir>", file=sys.stderr)
+        print("         cleanup <project_dir>", file=sys.stderr)
         sys.exit(1)
 
     action = sys.argv[1]
 
-    # project_dir is always the last positional arg before action-specific args
-    if action == "move-to-eval":
+    # Actions that take <brief_id> <project_dir> [extra...]
+    if action in BRIEF_ACTIONS:
         if len(sys.argv) < 4:
-            print("move-to-eval requires <brief_id> <project_dir>", file=sys.stderr)
+            print(f"{action} requires <brief_id> <project_dir>", file=sys.stderr)
             sys.exit(1)
         brief_id = sys.argv[2]
         project_dir = sys.argv[3]
+        extra = sys.argv[4:]
     else:
+        brief_id = ""
         project_dir = sys.argv[2]
+        extra = sys.argv[3:]
 
     paths = init_paths(project_dir)
 
     try:
         if action == "move-to-eval":
             success = move_to_eval(paths, brief_id)
+        elif action == "move-to-pending-merges":
+            success = move_to_pending_merges(paths, brief_id)
+        elif action == "move-to-awaiting-review":
+            reason = " ".join(extra) if extra else ""
+            success = move_to_awaiting_review(paths, brief_id, reason)
+        elif action == "process-pending-merges":
+            success = process_pending_merges(paths)
+        elif action == "approve-brief":
+            success = approve_brief(paths, brief_id)
+        elif action == "reject-brief":
+            reason = " ".join(extra) if extra else ""
+            success = reject_brief(paths, brief_id, reason)
         elif action == "dispatch":
             success = dispatch(paths)
         elif action == "merge":

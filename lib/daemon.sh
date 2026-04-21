@@ -55,7 +55,7 @@ DAEMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$STATE_DIR/signals" "$LOG_DIR"
 
 # Ensure state files exist
-[ -f "$RUNNING_FILE" ] || echo '{"active":[],"completed_pending_eval":[],"history":[]}' > "$RUNNING_FILE"
+[ -f "$RUNNING_FILE" ] || echo '{"active":[],"completed_pending_eval":[],"pending_merges":[],"awaiting_review":[],"history":[]}' > "$RUNNING_FILE"
 
 echo ""
 echo "╔══════════════════════════════════════╗"
