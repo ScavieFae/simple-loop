@@ -1005,6 +1005,120 @@ else:
     echo ""
 }
 
+# ── approve ──────────────────────────────────────────────────
+
+cmd_approve() {
+    require_loop_dir
+    local brief_id="${1:-}"
+    [ -z "$brief_id" ] && die "Usage: loop approve <brief-id> [--waive N --reason '...' --tracking-brief brief-MMM]"
+    shift
+
+    local waive_count="" waive_reason="" tracking_brief=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --waive)          waive_count="$2";    shift 2 ;;
+            --reason)         waive_reason="$2";   shift 2 ;;
+            --tracking-brief) tracking_brief="$2"; shift 2 ;;
+            *) die "Unknown flag: $1" ;;
+        esac
+    done
+
+    local actions_script="$LIB_DIR/actions.py"
+    if [ ! -f "$actions_script" ]; then
+        actions_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/actions.py"
+    fi
+    [ -f "$actions_script" ] || die "actions.py not found. Is Simple Loop installed?"
+
+    python3 "$actions_script" approve-brief "$brief_id" "$PROJECT_DIR" \
+        || die "approve-brief action failed"
+
+    # Remove escalate.json if it belongs to this brief (guards path-mismatch mistakes)
+    local escalate_path="$SIGNALS_DIR/escalate.json"
+    if [ -f "$escalate_path" ]; then
+        local esc_brief
+        esc_brief=$(python3 -c "import json; print(json.load(open('$escalate_path')).get('brief',''))" 2>/dev/null || echo "")
+        if [ "$esc_brief" = "$brief_id" ]; then
+            rm -f "$escalate_path"
+            echo "Removed escalate.json for $brief_id"
+        fi
+    fi
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local event_json="{\"event\":\"auto_merge_approved_by_human\",\"brief\":\"$brief_id\",\"timestamp\":\"$timestamp\""
+    if [ -n "$waive_count" ]; then
+        event_json="$event_json,\"waive_count\":$waive_count"
+        [ -n "$waive_reason" ]   && event_json="$event_json,\"waive_reason\":\"$waive_reason\""
+        [ -n "$tracking_brief" ] && event_json="$event_json,\"tracking_brief\":\"$tracking_brief\""
+    fi
+    event_json="$event_json}"
+    echo "$event_json" >> "$STATE_DIR/log.jsonl"
+
+    if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cd "$PROJECT_DIR"
+        git add ".loop/state/running.json" ".loop/state/log.jsonl" 2>/dev/null
+        git rm -q ".loop/state/signals/escalate.json" 2>/dev/null || true
+        git commit -m "loop: approve $brief_id" -q 2>/dev/null || true
+        git push "${GIT_REMOTE:-origin}" "${GIT_MAIN_BRANCH:-main}" -q 2>/dev/null || true
+    fi
+
+    echo "Approved: $brief_id"
+    echo "Queued for merge — daemon will process on next tick."
+    echo "(pending-merge.json written to: $STATE_DIR/pending-merge.json)"
+}
+
+# ── reject ───────────────────────────────────────────────────
+
+cmd_reject() {
+    require_loop_dir
+    local brief_id="${1:-}"
+    local reason="${2:-no reason given}"
+    [ -z "$brief_id" ] && die "Usage: loop reject <brief-id> [reason]"
+
+    local actions_script="$LIB_DIR/actions.py"
+    if [ ! -f "$actions_script" ]; then
+        actions_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/actions.py"
+    fi
+    [ -f "$actions_script" ] || die "actions.py not found. Is Simple Loop installed?"
+
+    python3 "$actions_script" reject-brief "$brief_id" "$PROJECT_DIR" "$reason" \
+        || die "reject-brief action failed"
+
+    local escalate_path="$SIGNALS_DIR/escalate.json"
+    if [ -f "$escalate_path" ]; then
+        local esc_brief
+        esc_brief=$(python3 -c "import json; print(json.load(open('$escalate_path')).get('brief',''))" 2>/dev/null || echo "")
+        if [ "$esc_brief" = "$brief_id" ]; then
+            rm -f "$escalate_path"
+        fi
+    fi
+
+    # Remove worktree; leave branch for forensics
+    local worktree_path="$LOOP_DIR/worktrees/$brief_id"
+    if [ -d "$worktree_path" ]; then
+        git -C "$PROJECT_DIR" worktree remove "$worktree_path" --force 2>/dev/null \
+            || rm -rf "$worktree_path"
+        echo "Removed worktree: $brief_id"
+    fi
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "{\"event\":\"brief_rejected_by_human\",\"brief\":\"$brief_id\",\"reason\":\"$reason\",\"timestamp\":\"$timestamp\"}" \
+        >> "$STATE_DIR/log.jsonl"
+
+    if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cd "$PROJECT_DIR"
+        git add ".loop/state/running.json" ".loop/state/log.jsonl" 2>/dev/null
+        git rm -q ".loop/state/signals/escalate.json" 2>/dev/null || true
+        git commit -m "loop: reject $brief_id — $reason" -q 2>/dev/null || true
+        git push "${GIT_REMOTE:-origin}" "${GIT_MAIN_BRANCH:-main}" -q 2>/dev/null || true
+    fi
+
+    echo "Rejected: $brief_id"
+    echo "Reason: $reason"
+    echo "Branch preserved for forensics. Worktree removed."
+}
+
 # ── cleanup ──────────────────────────────────────────────────
 
 cmd_cleanup() {
@@ -1054,6 +1168,10 @@ Monitor:
 Signals:
   pause [reason]           Pause daemon (commits + pushes signal)
   resume [instruction]     Resume daemon (commits + pushes signal)
+  approve <brief-id>       Approve a brief awaiting human review (queue for merge)
+                           --waive N --reason '...' --tracking-brief brief-MMM
+                           for partial-approval with waiver record
+  reject <brief-id> [why]  Reject a brief: mark in history, remove worktree
 
 Maintenance:
   cleanup                  Remove worktrees for completed/merged briefs
@@ -1084,6 +1202,8 @@ case "${1:-help}" in
     logs)    shift; cmd_logs "$@" ;;
     pause)   shift; cmd_pause "$@" ;;
     resume)  shift; cmd_resume "$@" ;;
+    approve) shift; cmd_approve "$@" ;;
+    reject)  shift; cmd_reject "$@" ;;
     metrics) shift; cmd_metrics "$@" ;;
     cleanup) cmd_cleanup ;;
     help|--help|-h) cmd_help ;;
