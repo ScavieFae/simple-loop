@@ -245,8 +245,7 @@ def main():
             break
 
         if status == "complete":
-            if conductor == "NONE":
-                conductor = f"CONDUCTOR:brief_complete:{brief_id}"
+            pass  # Phase 2.5 handles completion: moves to pending_merges or awaiting_review
         elif status == "blocked":
             if conductor == "NONE":
                 conductor = f"CONDUCTOR:brief_blocked:{brief_id}"

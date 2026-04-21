@@ -709,7 +709,10 @@ while true; do
     # └──────────────────────────────────────────────┘
     DAEMON_ACTIONS="$DAEMON_LIB_DIR/actions.py"
 
-    # Process completed briefs: move to eval
+    # Process completed briefs: free active slot immediately (v2 flow).
+    # Reads auto-merge flag from brief frontmatter; routes to pending_merges
+    # (auto) or awaiting_review (human). Active slot is freed on the same tick
+    # completion is detected, so dispatch can fire without waiting for merge.
     for active_entry in $(python3 -c "
 import json, subprocess
 try:
@@ -731,9 +734,46 @@ try:
 except: pass
 " 2>/dev/null); do
         if [ -n "$active_entry" ]; then
-            daemon_log "DAEMON ACTION: move-to-eval $active_entry"
-            python3 "$DAEMON_ACTIONS" move-to-eval "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
-            notify "$active_entry complete → awaiting evaluation"
+            # Read auto-merge flag from brief frontmatter on the brief branch
+            AM_FLAG=$(python3 -c "
+import json, subprocess, re, sys
+RE = re.compile(r'^\s*\*\*Auto-merge:\*\*\s*(\S+)', re.IGNORECASE)
+try:
+    with open('$RUNNING_FILE') as f:
+        rc = json.load(f)
+    for b in rc.get('active', []):
+        if b.get('brief') != '$active_entry':
+            continue
+        branch = b.get('branch', '')
+        brief_file = b.get('brief_file', '')
+        if not branch or not brief_file:
+            break
+        for ref in [branch, '$GIT_REMOTE/' + branch]:
+            r = subprocess.run(['git', '-C', '$PROJECT_DIR', 'show', f'{ref}:{brief_file}'],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    m = RE.match(line)
+                    if m:
+                        val = m.group(1).strip().lower().strip('\"').strip(\"'\")
+                        print('true' if val == 'true' else 'false')
+                        sys.exit(0)
+                print('false')
+                sys.exit(0)
+        break
+except: pass
+print('false')
+" 2>/dev/null)
+
+            if [ "$AM_FLAG" = "true" ]; then
+                daemon_log "DAEMON ACTION: move-to-pending-merges $active_entry (auto-merge)"
+                python3 "$DAEMON_ACTIONS" move-to-pending-merges "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
+                notify "$active_entry complete → queued for auto-merge"
+            else
+                daemon_log "DAEMON ACTION: move-to-awaiting-review $active_entry (human approval required)"
+                python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
+                notify "$active_entry complete → awaiting human review (run: loop approve $active_entry)"
+            fi
         fi
     done
 
@@ -752,9 +792,34 @@ except: pass
         VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
     fi
 
-    # Process pending merge queue
+    # Process pending_merges queue (peer to dispatch — runs same tick, does not block).
+    # Pops one entry from running.json pending_merges[], writes pending-merge.json,
+    # executes merge. Guard against double-processing if pending-merge.json already exists.
+    PENDING_MERGE_COUNT=$(python3 -c "
+import json
+try:
+    with open('$RUNNING_FILE') as f:
+        rc = json.load(f)
+    print(len(rc.get('pending_merges', [])))
+except: print(0)
+" 2>/dev/null || echo "0")
+    if [ "${PENDING_MERGE_COUNT:-0}" -gt 0 ] && [ ! -f "$STATE_DIR/pending-merge.json" ]; then
+        daemon_log "DAEMON ACTION: processing pending_merges queue ($PENDING_MERGE_COUNT entries)"
+        python3 "$DAEMON_ACTIONS" process-pending-merges "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"
+        if [ $? -eq 0 ]; then
+            notify "Brief merged to $GIT_MAIN_BRANCH"
+        fi
+        DID_WORK=true
+        ASSESS_OUTPUT=$(assess_state)
+        WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
+        VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
+    fi
+
+    # Legacy/manual merge path: pending-merge.json written directly (e.g. by loop approve).
+    # process-pending-merges above creates+deletes this atomically, so if it persists
+    # across ticks it means a manual stamp or a crash recovery case.
     if [ -f "$STATE_DIR/pending-merge.json" ]; then
-        daemon_log "DAEMON ACTION: processing pending merge"
+        daemon_log "DAEMON ACTION: processing pending merge (legacy/manual path)"
         python3 "$DAEMON_ACTIONS" merge "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"
         if [ $? -eq 0 ]; then
             notify "Brief merged to $GIT_MAIN_BRANCH"
