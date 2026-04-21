@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Assess daemon state — what should happen this tick?
 
-Prints TWO lines:
+Prints THREE lines:
   Line 1 (conductor): CONDUCTOR:<reason> or NONE
   Line 2 (worker):    WORKER:<brief>,<branch> or NONE
+  Line 3 (validator): VALIDATOR:<brief>,<branch>,<commit> or NONE
+
+Brief-003 Thread 1 added line 3: emits a VALIDATOR target when a builder
+cycle has committed and no corresponding review exists. Conductor trigger
+CONDUCTOR:validator_blocked:<brief> preempts brief_complete when the latest
+review's verdict is `block` (precedence 3 — ahead of brief_complete, behind
+pending_eval and active_signal).
 
 Usage:
     python3 lib/assess.py <project_dir>
@@ -11,9 +18,84 @@ Usage:
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+
+
+REVIEW_CYCLE_RE = re.compile(r"-cycle-(\d+)\.md$")
+
+
+def git_show(project_dir, ref, path):
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_dir, "show", f"{ref}:{path}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return r.stdout
+    except Exception:
+        pass
+    return None
+
+
+def git_rev_parse(project_dir, ref):
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_dir, "rev-parse", ref],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def max_review_cycle(project_dir, ref, brief_id):
+    """Find max cycle N of review files for brief_id visible on ref."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_dir, "ls-tree", "-r", "--name-only", ref,
+             ".loop/modules/validator/state/reviews/"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return 0
+    except Exception:
+        return 0
+    best = 0
+    for line in r.stdout.splitlines():
+        name = os.path.basename(line)
+        if not name.startswith(f"{brief_id}-cycle-"):
+            continue
+        m = REVIEW_CYCLE_RE.search(name)
+        if m:
+            best = max(best, int(m.group(1)))
+    return best
+
+
+def latest_review_verdict(project_dir, ref, brief_id, cycle):
+    """Read the most recent review's `verdict:` frontmatter field from ref."""
+    path = f".loop/modules/validator/state/reviews/{brief_id}-cycle-{cycle}.md"
+    content = git_show(project_dir, ref, path)
+    if not content:
+        return None
+    in_front = False
+    for line in content.splitlines():
+        s = line.strip()
+        if s == "---":
+            if not in_front:
+                in_front = True
+                continue
+            else:
+                break
+        if in_front and s.lower().startswith("verdict:"):
+            v = s.split(":", 1)[1].strip()
+            v = v.split("#", 1)[0].strip().strip('"').strip("'")
+            return v.lower() or None
+    return None
 
 
 def main():
@@ -25,9 +107,11 @@ def main():
 
     conductor = "NONE"
     worker = "NONE"
+    validator = "NONE"
 
     if not os.path.exists(running_file):
         print("CONDUCTOR:no_state")
+        print("NONE")
         print("NONE")
         return
 
@@ -37,6 +121,7 @@ def main():
         if os.path.exists(qpath):
             age_min = (time.time() - os.path.getmtime(qpath)) / 60
             if age_min < 30:
+                print("NONE")
                 print("NONE")
                 print("NONE")
                 return
@@ -73,12 +158,18 @@ def main():
             except (json.JSONDecodeError, KeyError):
                 pass
 
+    # High-priority conductor triggers (pending_eval, active_signal) cannot be
+    # preempted by validator_blocked. Track so the later block check knows.
+    high_priority = conductor in ("CONDUCTOR:pending_eval", "CONDUCTOR:active_signal")
+
     # No active briefs
     active = rc.get("active", [])
     if not active and conductor == "NONE":
         conductor = "CONDUCTOR:no_active"
 
-    # --- Check active briefs for both conductor triggers and worker targets ---
+    blocked_brief = ""  # populated below if any active brief has verdict: block
+
+    # --- Check active briefs for conductor triggers, worker targets, validator targets ---
     for brief_entry in active:
         brief_id = brief_entry.get("brief", "")
         branch = brief_entry.get("branch", "")
@@ -87,19 +178,21 @@ def main():
 
         status = "running"
         branch_exists = False
+        iteration = 0
+        used_ref = None
         for ref in [branch, f"{remote}/{branch}"]:
-            try:
-                result = subprocess.run(
-                    ["git", "-C", project_dir, "show", f"{ref}:.loop/state/progress.json"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if result.returncode == 0:
-                    prog = json.loads(result.stdout)
-                    status = prog.get("status", "running")
-                    branch_exists = True
-                    break
-            except Exception:
+            prog_raw = git_show(project_dir, ref, ".loop/state/progress.json")
+            if prog_raw is None:
                 continue
+            try:
+                prog = json.loads(prog_raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            status = prog.get("status", "running")
+            iteration = int(prog.get("iteration", 0) or 0)
+            branch_exists = True
+            used_ref = ref
+            break
 
         if status == "complete":
             if conductor == "NONE":
@@ -114,8 +207,32 @@ def main():
             if conductor == "NONE":
                 conductor = f"CONDUCTOR:stale_brief:{brief_id}"
 
+        # Validator logic — only meaningful if we actually found the branch.
+        if not branch_exists or not used_ref:
+            continue
+
+        max_cycle = max_review_cycle(project_dir, used_ref, brief_id)
+
+        # Review owed when builder has advanced past last reviewed cycle.
+        if iteration > max_cycle and validator == "NONE":
+            tip_sha = git_rev_parse(project_dir, used_ref)
+            if tip_sha:
+                validator = f"VALIDATOR:{brief_id},{branch},{tip_sha}"
+
+        # Block verdict on the most recent review preempts other conductor triggers.
+        if max_cycle > 0 and not blocked_brief:
+            verdict = latest_review_verdict(project_dir, used_ref, brief_id, max_cycle)
+            if verdict == "block":
+                blocked_brief = brief_id
+
+    # Precedence 3: validator_blocked preempts brief_complete / brief_blocked /
+    # stale_brief / no_active, but not pending_eval or active_signal.
+    if blocked_brief and not high_priority:
+        conductor = f"CONDUCTOR:validator_blocked:{blocked_brief}"
+
     print(conductor)
     print(worker)
+    print(validator)
 
 
 if __name__ == "__main__":

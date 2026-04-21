@@ -33,6 +33,8 @@ METRICS_FILE="$STATE_DIR/metrics.jsonl"
 RUNNING_FILE="$STATE_DIR/running.json"
 CONDUCTOR_PROMPT="$LOOP_DIR/prompts/conductor.md"
 WORKER_PROMPT="$LOOP_DIR/prompts/worker.md"
+# Validator default agent spec (per-brief **Validator:** override lands in task 5).
+VALIDATOR_AGENT_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/core/agents/reviewer.md"
 
 HEARTBEAT_INTERVAL="${2:-${HEARTBEAT_INTERVAL:-300}}"
 WORKER_COOLDOWN="${WORKER_COOLDOWN:-30}"
@@ -383,6 +385,181 @@ with open('$PROGRESS_FILE', 'w') as f:
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║  Validator Iteration                                            ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# Fires between Phase 2.5 and Phase 3 when assess.py emits a VALIDATOR target.
+# Reads the builder commit fresh-context, writes a review artifact to
+# .loop/modules/validator/state/reviews/<brief>-cycle-<N>.md on the brief
+# branch. The validator is read-only on source (anti-pattern: "Don't put the
+# validator in the commit path"); this function commits+pushes the review
+# artifact on the validator's behalf after its Claude subprocess exits.
+
+run_validator_iteration() {
+    local brief_id="$1"
+    local branch="$2"
+    local commit_sha="$3"
+
+    local WORKTREE_DIR="$PROJECT_DIR/.loop/worktrees/$brief_id"
+    if [ ! -d "$WORKTREE_DIR" ]; then
+        daemon_log "VALIDATOR: no worktree for $brief_id — skipping"
+        return 0
+    fi
+
+    # Pull latest into worktree
+    git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null || true
+
+    local PROGRESS_FILE="$WORKTREE_DIR/.loop/state/progress.json"
+    if [ ! -f "$PROGRESS_FILE" ]; then
+        daemon_log "VALIDATOR: no progress.json in worktree for $brief_id — skipping"
+        return 0
+    fi
+
+    local cycle
+    cycle=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('iteration', 0))" 2>/dev/null || echo "0")
+    if [ -z "$cycle" ] || [ "$cycle" = "0" ]; then
+        daemon_log "VALIDATOR: $brief_id cycle=0 — nothing to review yet"
+        return 0
+    fi
+
+    local brief_file
+    brief_file=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
+
+    daemon_log "VALIDATOR: reviewing $brief_id cycle $cycle (commit ${commit_sha:0:8})"
+
+    mkdir -p "$WORKTREE_DIR/.loop/modules/validator/state/reviews"
+
+    local REVIEW_REL=".loop/modules/validator/state/reviews/${brief_id}-cycle-${cycle}.md"
+
+    # Build prompt: agent spec + per-run context + required schema.
+    local AGENT_SPEC=""
+    if [ -f "$VALIDATOR_AGENT_DEFAULT" ]; then
+        AGENT_SPEC=$(cat "$VALIDATOR_AGENT_DEFAULT")
+    fi
+
+    local NOW_ISO
+    NOW_ISO=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    local VALIDATOR_PROMPT_BODY="$AGENT_SPEC
+
+---
+
+# This validation run
+
+You are reviewing ONE builder cycle, fresh-context. No previous conversation.
+
+- Brief ID: \`$brief_id\`
+- Branch: \`$branch\`
+- Cycle (iteration): $cycle
+- Commit under review: \`$commit_sha\`
+- Brief file: \`$brief_file\`
+
+## What to read
+
+1. Brief: \`cat $brief_file\`
+2. Progress so far: \`cat .loop/state/progress.json\`
+3. Diff under review: \`git show $commit_sha\`
+4. Recent history: \`git log --oneline -10\`
+
+## What to write
+
+ONE file, at path:
+
+\`\`\`
+$REVIEW_REL
+\`\`\`
+
+Use this exact shape (YAML frontmatter + four fixed body buckets):
+
+\`\`\`markdown
+---
+cycle: $cycle
+commit: $commit_sha
+brief: $brief_id
+branch: $branch
+verdict: pass   # one of: pass | issues | block
+summary: <one-line verdict, <=120 chars>
+validator: loop-reviewer
+reviewed_at: $NOW_ISO
+---
+
+## Bugs found
+- _none_ OR bullet list
+
+## Execution concerns
+- _none_ OR bullet list
+
+## Spec-fit notes
+- _none_ OR bullet list
+
+## Deferred items
+- _none_ OR bullet list
+\`\`\`
+
+Verdict guide:
+- \`pass\` — no issues, clean spec-fit. Conductor proceeds as today.
+- \`issues\` — non-blocking concerns surfaced. Do NOT block merge; conductor reads at merge-time.
+- \`block\` — show-stopper bug or spec violation. The daemon preempts conductor on the next tick with \`validator_blocked\`.
+
+## Rules
+
+- Read-only on source code. You may ONLY create/modify the review file above.
+- Do NOT run git commit, git push, or any git write operation. The daemon commits the review on your behalf after you exit.
+- Do NOT modify any file outside \`$REVIEW_REL\`.
+- All four body buckets must appear. Empty buckets use the literal \`_none_\`.
+- Keep \`summary\` tight — it's the at-a-glance line Mattie reads in the wiki."
+
+    local VALIDATOR_LOG="$LOG_DIR/validator_${brief_id}_$(date +%Y%m%d_%H%M%S).log"
+    local VALIDATOR_JSON=$(mktemp)
+    local V_START=$(date +%s)
+
+    cd "$WORKTREE_DIR"
+
+    # Tier: validator = opus (see top-of-file model tier policy).
+    claude --model opus --dangerously-skip-permissions \
+        --output-format json \
+        -p "$VALIDATOR_PROMPT_BODY" \
+        > "$VALIDATOR_JSON" 2>>"$VALIDATOR_LOG"
+
+    local V_EXIT=$?
+    local V_END=$(date +%s)
+    local V_DURATION=$((V_END - V_START))
+
+    cd "$PROJECT_DIR"
+
+    parse_metrics "$VALIDATOR_JSON" "$VALIDATOR_LOG" "validator" "{'brief': '$brief_id', 'cycle': $cycle, 'commit': '${commit_sha:0:12}', 'exit_code': $V_EXIT}"
+    rm -f "$VALIDATOR_JSON"
+
+    if [ "$V_EXIT" -ne 0 ]; then
+        daemon_log "VALIDATOR: FAILED (exit $V_EXIT, ${V_DURATION}s)"
+        notify "$brief_id: validator FAILED (exit $V_EXIT)"
+        if [ "$V_DURATION" -le 10 ] && grep -q "out of extra usage" "$VALIDATOR_LOG" 2>/dev/null; then
+            handle_rate_limit "$VALIDATOR_LOG"
+            return 1
+        fi
+        return $V_EXIT
+    fi
+
+    if [ ! -f "$WORKTREE_DIR/$REVIEW_REL" ]; then
+        daemon_log "VALIDATOR: expected review file not written at $REVIEW_REL — nothing to commit"
+        return 0
+    fi
+
+    # Daemon commits + pushes the review artifact (validator is read-only).
+    git -C "$WORKTREE_DIR" add "$REVIEW_REL"
+    if git -C "$WORKTREE_DIR" diff --cached --quiet; then
+        daemon_log "VALIDATOR: review file unchanged — skipping commit"
+    else
+        git -C "$WORKTREE_DIR" commit -m "[scav] validator: $brief_id cycle $cycle review" -q 2>/dev/null
+        git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "VALIDATOR: push failed (non-fatal)"
+        daemon_log "VALIDATOR: review committed for $brief_id cycle $cycle (${V_DURATION}s)"
+        notify "$brief_id: validator review cycle $cycle"
+    fi
+
+    return 0
+}
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║  Signal Handling                                                ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
@@ -444,9 +621,11 @@ while true; do
     # ┌─────────────────────────────────────┐
     # │  Phase 1: Assess state              │
     # └─────────────────────────────────────┘
+    # assess.py prints three lines: conductor trigger, worker target, validator target.
     ASSESS_OUTPUT=$(assess_state)
-    CONDUCTOR_TRIGGER=$(echo "$ASSESS_OUTPUT" | head -1)
-    WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | tail -1)
+    CONDUCTOR_TRIGGER=$(echo "$ASSESS_OUTPUT" | sed -n 1p)
+    WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
+    VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
 
     # ┌─────────────────────────────────────┐
     # │  Phase 2: Conductor (if triggered)  │
@@ -465,7 +644,8 @@ while true; do
 
                 # Re-assess after conductor
                 ASSESS_OUTPUT=$(assess_state)
-                WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | tail -1)
+                WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
+                VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
             fi
             ;;
     esac
@@ -514,7 +694,8 @@ except: pass
         fi
         DID_WORK=true
         ASSESS_OUTPUT=$(assess_state)
-        WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | tail -1)
+        WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
+        VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
     fi
 
     # Process pending merge queue
@@ -526,8 +707,29 @@ except: pass
         fi
         DID_WORK=true
         ASSESS_OUTPUT=$(assess_state)
-        WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | tail -1)
+        WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
+        VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
     fi
+
+    # ┌─────────────────────────────────────┐
+    # │  Phase 2.7: Validator (if pending)  │
+    # └─────────────────────────────────────┘
+    # Sits between 2.5 and 3: a builder commit lands on tick N (Phase 3),
+    # assess.py sees it on tick N+1 with no matching review → emits
+    # VALIDATOR:brief,branch,commit. Validator runs fresh-context; daemon
+    # commits the review artifact on its behalf after the subprocess exits.
+    case "$VALIDATOR_TARGET" in
+        VALIDATOR:*)
+            IFS=',' read -r V_BRIEF V_BRANCH V_COMMIT <<< "${VALIDATOR_TARGET#VALIDATOR:}"
+            if [ -n "$V_BRIEF" ] && [ -n "$V_BRANCH" ] && [ -n "$V_COMMIT" ]; then
+                run_validator_iteration "$V_BRIEF" "$V_BRANCH" "$V_COMMIT"
+                DID_WORK=true
+                LAST_CONDUCTOR_TRIGGER=""
+            else
+                daemon_log "VALIDATOR: malformed target '$VALIDATOR_TARGET' — skipping"
+            fi
+            ;;
+    esac
 
     # ┌─────────────────────────────────────┐
     # │  Phase 3: Worker (if active brief)  │
