@@ -638,9 +638,27 @@ notify "Daemon started (PID $$)"
 
 TURN=0
 LAST_CONDUCTOR_TRIGGER=""
+LAST_ESCALATE_PRESENT=false
 
 while true; do
     TURN=$((TURN + 1))
+
+    # --- Escalate-resolved detection (breaks dedup on stale triggers) ---
+    # When the conductor writes escalate.json, subsequent ticks with the same
+    # trigger de-dup and the daemon goes silent. If a human (or scav) clears
+    # the escalate, the daemon must re-run the conductor — otherwise it sits
+    # deduped on a decision that no longer applies.  Track escalate presence
+    # across ticks; on the tick where it disappears, reset the dedup marker.
+    if [ -f "$SIGNALS_DIR/escalate.json" ]; then
+        CURRENT_ESCALATE_PRESENT=true
+    else
+        CURRENT_ESCALATE_PRESENT=false
+    fi
+    if [ "$LAST_ESCALATE_PRESENT" = "true" ] && [ "$CURRENT_ESCALATE_PRESENT" = "false" ]; then
+        daemon_log "CONDUCTOR: escalate.json resolved — resetting dedup so next conductor re-evaluates"
+        LAST_CONDUCTOR_TRIGGER=""
+    fi
+    LAST_ESCALATE_PRESENT="$CURRENT_ESCALATE_PRESENT"
 
     # --- Pause check ---
     if [ -f "$SIGNALS_DIR/pause.json" ]; then
