@@ -26,6 +26,7 @@ import time
 
 REVIEW_CYCLE_RE = re.compile(r"-cycle-(\d+)\.md$")
 AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECASE)
+DEPENDS_ON_LINE_RE = re.compile(r"^\s*\*\*Depends-on:\*\*\s*(\S+)", re.IGNORECASE)
 
 
 def git_show(project_dir, ref, path):
@@ -84,6 +85,24 @@ def git_rev_parse(project_dir, ref):
     except Exception:
         pass
     return ""
+
+
+def read_depends_on(brief_file_path):
+    """Parse **Depends-on: brief-NNN** from a brief file on disk.
+
+    Returns the dependency brief-id string, or None if not specified.
+    Reads the file directly (not via git show) — caller should pass an
+    absolute or project-relative path to the brief file on disk.
+    """
+    try:
+        with open(brief_file_path) as f:
+            for line in f:
+                m = DEPENDS_ON_LINE_RE.match(line)
+                if m:
+                    return m.group(1).strip()
+    except (IOError, OSError):
+        pass
+    return None
 
 
 def read_auto_merge_flag(project_dir, ref, brief_file_rel):

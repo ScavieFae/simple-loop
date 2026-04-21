@@ -779,17 +779,57 @@ print('false')
 
     # Process pending dispatch queue
     if [ -f "$STATE_DIR/pending-dispatch.json" ]; then
-        daemon_log "DAEMON ACTION: processing pending dispatch"
-        if ! python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"; then
-            daemon_log "DAEMON ACTION: dispatch failed, retrying once"
-            sleep 5
-            python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" || \
-                daemon_log "DAEMON ACTION: dispatch retry failed"
+        # Check **Depends-on:** frontmatter before dispatching.
+        # If the brief's dependency hasn't merged yet, cancel this dispatch
+        # so the conductor retries next tick (potentially picking a different brief).
+        DEPS_CHECK=$(python3 -c "
+import json, re, os, sys
+RE_DEP = re.compile(r'^\s*\*\*Depends-on:\*\*\s*(\S+)', re.IGNORECASE)
+try:
+    with open('$STATE_DIR/pending-dispatch.json') as f:
+        spec = json.load(f)
+    brief_file = spec.get('brief_file', '')
+    bf_path = os.path.join('$PROJECT_DIR', brief_file) if brief_file else ''
+    depends_on = None
+    if bf_path and os.path.exists(bf_path):
+        with open(bf_path) as f:
+            for line in f:
+                m = RE_DEP.match(line)
+                if m:
+                    depends_on = m.group(1).strip()
+                    break
+    if not depends_on:
+        print('allowed')
+        sys.exit(0)
+    with open('$RUNNING_FILE') as f:
+        rc = json.load(f)
+    history_ids = [h.get('brief', '') for h in rc.get('history', [])]
+    if depends_on in history_ids:
+        print('allowed')
+    else:
+        print('blocked:' + depends_on)
+except Exception:
+    print('allowed')  # fail open — don't block dispatch on parse errors
+" 2>/dev/null)
+        if [[ "${DEPS_CHECK:-allowed}" == blocked:* ]]; then
+            DEP_ID="${DEPS_CHECK#blocked:}"
+            BLOCKED_BRIEF=$(python3 -c "import json; print(json.load(open('$STATE_DIR/pending-dispatch.json')).get('brief',''))" 2>/dev/null || echo "unknown")
+            daemon_log "DAEMON ACTION: dispatch blocked — $BLOCKED_BRIEF depends-on $DEP_ID (not yet merged)"
+            notify "$BLOCKED_BRIEF dispatch blocked: depends on $DEP_ID (not merged yet)"
+            rm -f "$STATE_DIR/pending-dispatch.json"
+        else
+            daemon_log "DAEMON ACTION: processing pending dispatch"
+            if ! python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log"; then
+                daemon_log "DAEMON ACTION: dispatch failed, retrying once"
+                sleep 5
+                python3 "$DAEMON_ACTIONS" dispatch "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" || \
+                    daemon_log "DAEMON ACTION: dispatch retry failed"
+            fi
+            DID_WORK=true
+            ASSESS_OUTPUT=$(assess_state)
+            WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
+            VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
         fi
-        DID_WORK=true
-        ASSESS_OUTPUT=$(assess_state)
-        WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
-        VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
     fi
 
     # Process pending_merges queue (peer to dispatch — runs same tick, does not block).
