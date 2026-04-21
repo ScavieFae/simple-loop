@@ -285,8 +285,15 @@ def merge(paths):
     # Push main
     git(project_dir, "push", remote, main_branch)
 
-    # Update running.json
+    # Update running.json — prune from both active and completed_pending_eval.
+    # A brief may reach merge via either path (direct pending-merge stamp from
+    # active, or the regular complete → eval → merge flow). If we don't prune
+    # active, the conductor keeps seeing the merged brief as active, can't find
+    # its branch (deleted above), and fires stale_brief every heartbeat forever.
     rc = load_running(paths)
+    active = rc.get("active", [])
+    new_active = [e for e in active if e.get("brief") != brief]
+    rc["active"] = new_active
     pending = rc.get("completed_pending_eval", [])
     new_pending = [e for e in pending if e.get("brief") != brief]
     rc["completed_pending_eval"] = new_pending
