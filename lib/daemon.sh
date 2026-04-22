@@ -489,14 +489,26 @@ run_validator_iteration() {
     # `block` review and skips the Claude invocation entirely. Deterministic
     # floor under the LLM rubric — brief-012 shipped 14 passing cycles without
     # plan.md or closeout.md because the rubric didn't enforce presence.
-    local MISSING_ARTIFACTS
-    MISSING_ARTIFACTS=$(python3 -c "
+    #
+    # 2026-04-22 follow-up: gate on worker_status == complete. Multi-cycle
+    # briefs declare end-of-brief artifacts; firing presence-check on every
+    # cycle blocks cycles 1..N-1 from ever producing those artifacts. Only
+    # enforce on the final cycle (status=complete).
+    local WORKER_STATUS
+    WORKER_STATUS=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('status', ''))" 2>/dev/null)
+
+    local MISSING_ARTIFACTS=""
+    if [ "$WORKER_STATUS" = "complete" ]; then
+        MISSING_ARTIFACTS=$(python3 -c "
 import sys
 sys.path.insert(0, '$DAEMON_LIB_DIR')
 from actions import validator_presence_check
 missing = validator_presence_check('$WORKTREE_DIR/$brief_file', '$WORKTREE_DIR')
 print(','.join(missing))
 " 2>/dev/null)
+    else
+        daemon_log "VALIDATOR: presence check skipped for $brief_id cycle $cycle (worker_status=$WORKER_STATUS, only runs on complete)"
+    fi
 
     if [ -n "$MISSING_ARTIFACTS" ]; then
         daemon_log "VALIDATOR: presence check FAILED for $brief_id cycle $cycle — missing: $MISSING_ARTIFACTS"
