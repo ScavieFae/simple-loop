@@ -221,11 +221,14 @@ assert_json "reject_reason preserved"                        "$RJ" "d['history']
 echo ""
 echo "=== Test 6: depends-on frontmatter parsing via assess.read_depends_on ==="
 
+# Brief-014: read_depends_on now returns a list (was scalar). Single-dep case
+# returns a one-element list; empty-dep case returns [].
 DEP=$(python3 -c "
 import sys
 sys.path.insert(0, '$LIB_DIR')
 from assess import read_depends_on
-print(read_depends_on('$SCRATCH/.loop/briefs/brief-004-depends.md') or 'None')
+deps = read_depends_on('$SCRATCH/.loop/briefs/brief-004-depends.md')
+print(','.join(deps) if deps else 'None')
 ")
 assert_eq "read_depends_on extracts dep id from frontmatter"  "$DEP"  "brief-999-prereq"
 
@@ -233,7 +236,8 @@ DEP_NONE=$(python3 -c "
 import sys
 sys.path.insert(0, '$LIB_DIR')
 from assess import read_depends_on
-print(read_depends_on('$SCRATCH/.loop/briefs/brief-001-auto.md') or 'None')
+deps = read_depends_on('$SCRATCH/.loop/briefs/brief-001-auto.md')
+print(','.join(deps) if deps else 'None')
 ")
 assert_eq "read_depends_on returns None when no dep present"  "$DEP_NONE"  "None"
 
@@ -265,6 +269,350 @@ assert rc['awaiting_review'] == [], 'awaiting_review not empty list'
 print('ok')
 " > /tmp/compat_result 2>&1 || echo "exception" > /tmp/compat_result
 assert_eq "old running.json backfills v2 fields on load"  "$(cat /tmp/compat_result)"  "ok"
+
+# ── Test 8: depends-on comma-separated list parse ─────────────────────────────
+
+echo ""
+echo "=== Test 8: depends-on comma-separated list parse (brief-014 fix 1) ==="
+
+# Direct parser unit tests — parse_depends_on_value covers the syntax table in
+# the brief (single, comma+space, comma-no-space, trailing comma, empty).
+SINGLE=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('brief-010-foo')))
+")
+assert_eq "parse_depends_on_value single id"                "$SINGLE"  "brief-010-foo"
+
+MULTI_SPACED=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('brief-010-foo, brief-011-bar')))
+")
+assert_eq "parse_depends_on_value comma+space"             "$MULTI_SPACED"  "brief-010-foo,brief-011-bar"
+
+MULTI_TIGHT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('brief-010-foo,brief-011-bar')))
+")
+assert_eq "parse_depends_on_value comma no space"          "$MULTI_TIGHT"  "brief-010-foo,brief-011-bar"
+
+TRAILING=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('brief-010-foo,')))
+")
+assert_eq "parse_depends_on_value trailing comma tolerated" "$TRAILING"  "brief-010-foo"
+
+# Full file read path — brief with comma-separated frontmatter should return 2 ids.
+cat > "$SCRATCH/.loop/briefs/brief-005-multidep.md" <<'EOF'
+# Brief: multi-dep test
+
+**ID:** brief-005-multidep
+**Auto-merge:** true
+**Depends-on:** brief-010-foo, brief-011-bar
+**Status:** queued
+EOF
+
+READ_MULTI=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import read_depends_on
+print(','.join(read_depends_on('$SCRATCH/.loop/briefs/brief-005-multidep.md')))
+")
+assert_eq "read_depends_on handles comma-separated list"   "$READ_MULTI"  "brief-010-foo,brief-011-bar"
+
+# ── Test 9: depends-on history-check post-restart false-negative ─────────────
+
+echo ""
+echo "=== Test 9: single-dep matches against running.json history post-restart ==="
+
+# Reproduces brief-012's 2026-04-22 failure: brief-010 was in history, daemon
+# reported "not yet merged." With fix 1's parser, history lookup now works;
+# test asserts the check-depends-on action returns "allowed" in that scenario.
+
+# Seed: brief-010 in history, pending-dispatch for a brief depends-on brief-010.
+cat > "$SCRATCH/.loop/briefs/brief-006-single-dep.md" <<'EOF'
+# Brief: single-dep test
+
+**ID:** brief-006-single-dep
+**Auto-merge:** true
+**Depends-on:** brief-010-api-v0-1
+**Status:** queued
+EOF
+
+write_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [{'brief': 'brief-010-api-v0-1', 'branch': 'brief-010-api-v0-1', 'merged_at': '2026-04-22T01:26:36Z'}],
+    'queue': []
+}"
+
+cat > "$SCRATCH/.loop/state/pending-dispatch.json" <<EOF
+{
+    "brief": "brief-006-single-dep",
+    "branch": "brief-006-single-dep",
+    "brief_file": ".loop/briefs/brief-006-single-dep.md"
+}
+EOF
+
+DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 1p)
+assert_eq "check-depends-on allows when single dep in history" "$DEPS_LINE1"  "allowed"
+
+# Blocked case: dep NOT in history
+write_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [],
+    'queue': []
+}"
+
+DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 1p)
+assert_eq "check-depends-on blocks when dep missing from history" "$DEPS_LINE1"  "blocked:brief-010-api-v0-1"
+
+# Diagnostic line always emits, even in the error-fallback path (grep-debuggable).
+DEPS_LINE2=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 2p)
+case "$DEPS_LINE2" in
+    brief=*"depends_on="*"history_ids="*"match="*) pass "check-depends-on emits diagnostic line" ;;
+    *) fail "check-depends-on diagnostic line — got '$DEPS_LINE2'" ;;
+esac
+
+# Multi-dep all-merged → allowed
+write_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [
+        {'brief': 'brief-010-foo', 'merged_at': '2026-04-22T00:00:00Z'},
+        {'brief': 'brief-011-bar', 'merged_at': '2026-04-22T01:00:00Z'}
+    ],
+    'queue': []
+}"
+
+cat > "$SCRATCH/.loop/state/pending-dispatch.json" <<EOF
+{
+    "brief": "brief-005-multidep",
+    "branch": "brief-005-multidep",
+    "brief_file": ".loop/briefs/brief-005-multidep.md"
+}
+EOF
+
+DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 1p)
+assert_eq "check-depends-on allows multi-dep when all merged" "$DEPS_LINE1"  "allowed"
+
+# Multi-dep one-missing → blocked on first unmet
+write_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [{'brief': 'brief-010-foo', 'merged_at': '2026-04-22T00:00:00Z'}],
+    'queue': []
+}"
+
+DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 1p)
+assert_eq "check-depends-on blocks multi-dep on first unmet" "$DEPS_LINE1"  "blocked:brief-011-bar"
+
+rm -f "$SCRATCH/.loop/state/pending-dispatch.json"
+
+# ── Test 10: push-fail escalate + token redaction ────────────────────────────
+
+echo ""
+echo "=== Test 10: push_with_escalate writes escalate.json with redacted stderr ==="
+
+# Redactor unit — GitHub token patterns → [REDACTED]
+REDACTED=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import redact_secrets
+print(redact_secrets('fatal: could not read Username for ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 check'))
+")
+case "$REDACTED" in
+    *"[REDACTED]"*) pass "redact_secrets replaces ghp_ classic token" ;;
+    *) fail "redact_secrets ghp_ token — got '$REDACTED'" ;;
+esac
+
+# No raw token leaks through
+python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import redact_secrets
+out = redact_secrets('header: Bearer github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789_abcdefghij')
+assert 'ABCDEFGH' not in out, 'raw pat body leaked'
+assert '[REDACTED]' in out
+" && pass "redact_secrets fine-grained PAT scrubbed" || fail "redact_secrets fine-grained PAT leak"
+
+# Escalate flow — simulate push_with_escalate call with a failing git command.
+# We don't run a real git push; the function is invoked with a deliberately
+# bad remote so git exits nonzero, and we assert the resulting escalate.json
+# contains the redacted stderr and structured reason.
+ESC_DIR="$SCRATCH/.loop/state/signals"
+rm -f "$ESC_DIR/escalate.json"
+
+# Inject a fake stderr containing a token — subprocess mock via env.
+python3 -c "
+import sys, os, json, subprocess
+sys.path.insert(0, '$LIB_DIR')
+from actions import push_with_escalate, init_paths
+paths = init_paths('$SCRATCH')
+# Simulate a push failure by calling the helper with a stderr-stub. The helper
+# must accept an injected stderr for testability (brief-014 requirement).
+# If push_with_escalate isn't yet injectable, fall back to running with a bad
+# remote and inspecting written file.
+push_with_escalate(paths, brief='brief-test', _test_stderr_override='remote: Support for password authentication was removed. Token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 redacted here.')
+" 2>/dev/null
+
+if [ -f "$ESC_DIR/escalate.json" ]; then
+    pass "push_with_escalate writes escalate.json on failure"
+    if grep -q '\[REDACTED\]' "$ESC_DIR/escalate.json" 2>/dev/null; then
+        pass "escalate.json stderr is token-redacted"
+    else
+        fail "escalate.json stderr not redacted"
+    fi
+    if grep -q 'push_failed_on_auth\|push_failed' "$ESC_DIR/escalate.json" 2>/dev/null; then
+        pass "escalate.json reason names push failure"
+    else
+        fail "escalate.json missing push_failed reason"
+    fi
+    # Negative: raw token must NOT appear in written file
+    if grep -q 'ghp_ABCDEFGH' "$ESC_DIR/escalate.json" 2>/dev/null; then
+        fail "escalate.json LEAKED raw token"
+    else
+        pass "escalate.json has no raw token"
+    fi
+    rm -f "$ESC_DIR/escalate.json"
+else
+    fail "push_with_escalate did not write escalate.json"
+fi
+
+# ── Test 11: heartbeat staleness detection ───────────────────────────────────
+
+echo ""
+echo "=== Test 11: heartbeat staleness (process-alive ≠ loop-healthy) ==="
+
+HB="$SCRATCH/.loop/state/heartbeat.json"
+
+# Fresh heartbeat (now) → NOT stale
+python3 -c "
+import json, datetime
+ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+json.dump({'ts': ts, 'pid': 12345, 'last_event': 'tick'}, open('$HB','w'))
+"
+STALE=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import heartbeat_is_stale
+print('STALE' if heartbeat_is_stale('$HB', interval_s=120) else 'FRESH')
+")
+assert_eq "fresh heartbeat is not stale"                    "$STALE"  "FRESH"
+
+# Stale heartbeat (10 min old, interval 120 → stale at >240s) → STALE
+python3 -c "
+import json, datetime
+ts_old = (datetime.datetime.utcnow() - datetime.timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+json.dump({'ts': ts_old, 'pid': 12345, 'last_event': 'tick'}, open('$HB','w'))
+"
+STALE=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import heartbeat_is_stale
+print('STALE' if heartbeat_is_stale('$HB', interval_s=120) else 'FRESH')
+")
+assert_eq "10-min-old heartbeat is stale (interval 120)"    "$STALE"  "STALE"
+
+# Missing heartbeat file → treated as stale (safer: assume hung)
+rm -f "$HB"
+STALE=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import heartbeat_is_stale
+print('STALE' if heartbeat_is_stale('$HB', interval_s=120) else 'FRESH')
+")
+assert_eq "missing heartbeat file treated as stale"         "$STALE"  "STALE"
+
+# write_heartbeat produces a readable JSON file with ts/pid/last_event
+python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import write_heartbeat
+write_heartbeat('$HB', pid=99, last_event='worker')
+"
+if [ -f "$HB" ] && python3 -c "
+import json
+d = json.load(open('$HB'))
+assert 'ts' in d and 'pid' in d and 'last_event' in d
+assert d['pid'] == 99
+assert d['last_event'] == 'worker'
+" 2>/dev/null; then
+    pass "write_heartbeat produces well-formed {ts,pid,last_event}"
+else
+    fail "write_heartbeat output malformed or missing"
+fi
+
+# ── Test 12: validator presence-check for process artifacts ──────────────────
+
+echo ""
+echo "=== Test 12: validator artifact-presence check fails cycle when missing ==="
+
+# Fabricate a brief that names plan.md + closeout.md in completion criteria.
+cat > "$SCRATCH/.loop/briefs/brief-007-artifacts.md" <<'EOF'
+# Brief: artifacts test
+
+**ID:** brief-007-artifacts
+**Branch:** brief-007-artifacts
+**Auto-merge:** true
+
+## Completion criteria
+
+- [ ] `plan.md` in the card dir
+- [ ] `closeout.md` in the card dir
+- [ ] All tests pass
+EOF
+
+# extract_artifact_paths should find plan.md and closeout.md
+PATHS=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import extract_artifact_paths
+paths = extract_artifact_paths('$SCRATCH/.loop/briefs/brief-007-artifacts.md')
+print(','.join(sorted(paths)))
+")
+assert_eq "extract_artifact_paths finds declared artifacts" "$PATHS"  "closeout.md,plan.md"
+
+# With neither file on disk, validator_presence_check returns a block verdict.
+# (The worktree dir is the brief's card parent — here, we use SCRATCH so the
+# relative paths resolve against it.)
+VERDICT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$SCRATCH/.loop/briefs/brief-007-artifacts.md', '$SCRATCH')
+print('BLOCK' if missing else 'PASS')
+")
+assert_eq "validator_presence_check blocks when artifacts missing" "$VERDICT"  "BLOCK"
+
+# Create the artifacts → check passes
+touch "$SCRATCH/plan.md" "$SCRATCH/closeout.md"
+VERDICT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$SCRATCH/.loop/briefs/brief-007-artifacts.md', '$SCRATCH')
+print('BLOCK' if missing else 'PASS')
+")
+assert_eq "validator_presence_check passes when all artifacts present" "$VERDICT"  "PASS"
+
+rm -f "$SCRATCH/plan.md" "$SCRATCH/closeout.md"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

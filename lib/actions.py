@@ -12,9 +12,35 @@ Usage:
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
+
+
+# Brief-014: token redactor. Applied to any text destined for escalate.json
+# or log files that could contain raw git stderr. Patterns match GitHub-issued
+# credentials in their canonical forms (classic personal tokens, OAuth user
+# tokens, server tokens, fine-grained PATs). Belt-and-suspenders — even if we
+# never write these normally, a push-fail path could hand us a header echo.
+_REDACT_PATTERNS = [
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"),
+    re.compile(r"ghs_[A-Za-z0-9]{30,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{40,}"),
+]
+
+
+def redact_secrets(text):
+    """Redact GitHub tokens from arbitrary text. Returns sanitized string.
+
+    Never raises. Input that isn't a str is returned as-is (caller's problem).
+    """
+    if not isinstance(text, str):
+        return text
+    out = text
+    for pat in _REDACT_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    return out
 
 
 def init_paths(project_dir):
@@ -531,6 +557,66 @@ def cleanup_worktrees(paths):
     return True
 
 
+# ─── Action: check-depends-on ────────────────────────────────────────
+#
+# Brief-014 fix 1 + 2: parse **Depends-on:** from pending-dispatch brief,
+# compare against running.json history[]. Prints two lines to stdout:
+#   line 1: verdict — "allowed" or "blocked:<first-unmet-dep>"
+#   line 2: diagnostic — "brief=<id> depends_on=<list> history_ids=<list> match=<allowed|blocked:…>"
+# Diagnostic always emits regardless of outcome so grep-debugging is cheap.
+
+def check_depends_on(paths):
+    """Verify pending-dispatch brief's Depends-on against merged history."""
+    # Inline import avoids circular dep at module load (assess.py imports from
+    # the same tree but isn't a package sibling).
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from assess import DEPENDS_ON_LINE_RE, parse_depends_on_value
+
+    brief_id = ""
+    depends_on = []
+    history_ids = []
+
+    try:
+        with open(paths["pending_dispatch"]) as f:
+            spec = json.load(f)
+        brief_id = spec.get("brief", "")
+        brief_file = spec.get("brief_file", "")
+        bf_path = os.path.join(paths["project_dir"], brief_file) if brief_file else ""
+
+        if bf_path and os.path.exists(bf_path):
+            with open(bf_path) as f:
+                for line in f:
+                    m = DEPENDS_ON_LINE_RE.match(line)
+                    if m:
+                        depends_on = parse_depends_on_value(m.group(1))
+                        break
+
+        if not depends_on:
+            print("allowed")
+            print(f"brief={brief_id} depends_on=[] history_ids=<skipped> match=allowed")
+            return True
+
+        with open(paths["running_file"]) as f:
+            rc = json.load(f)
+        history_ids = [h.get("brief", "") for h in rc.get("history", [])]
+
+        unmet = [d for d in depends_on if d not in history_ids]
+        if unmet:
+            verdict = f"blocked:{unmet[0]}"
+            print(verdict)
+            print(f"brief={brief_id} depends_on={depends_on} history_ids={history_ids} match={verdict}")
+            return True
+        print("allowed")
+        print(f"brief={brief_id} depends_on={depends_on} history_ids={history_ids} match=allowed")
+        return True
+    except Exception as e:
+        # Fail open: don't block dispatch on a parse error. Still emit
+        # diagnostic so the failure is visible.
+        print("allowed")
+        print(f"brief={brief_id} depends_on={depends_on} history_ids=<error:{e}> match=allowed_on_error")
+        return True
+
+
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -588,6 +674,8 @@ def main():
             success = merge(paths)
         elif action == "cleanup":
             success = cleanup_worktrees(paths)
+        elif action == "check-depends-on":
+            success = check_depends_on(paths)
         else:
             print(f"Unknown action: {action}", file=sys.stderr)
             sys.exit(1)

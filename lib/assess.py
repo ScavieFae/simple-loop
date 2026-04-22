@@ -26,7 +26,31 @@ import time
 
 REVIEW_CYCLE_RE = re.compile(r"-cycle-(\d+)\.md$")
 AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECASE)
-DEPENDS_ON_LINE_RE = re.compile(r"^\s*\*\*Depends-on:\*\*\s*(\S+)", re.IGNORECASE)
+# Brief-014: capture everything after **Depends-on:** so comma-separated lists
+# parse. `(.+)` (not `(\S+)`) picks up the full value; splitting happens below.
+DEPENDS_ON_LINE_RE = re.compile(r"^\s*\*\*Depends-on:\*\*\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def parse_depends_on_value(raw):
+    """Split a raw Depends-on value into a list of brief ids.
+
+    Accepts:
+        "brief-010-foo"                     → ["brief-010-foo"]
+        "brief-010-foo, brief-011-bar"      → ["brief-010-foo", "brief-011-bar"]
+        "brief-010-foo,brief-011-bar"       → ["brief-010-foo", "brief-011-bar"]
+        "brief-010-foo,"                    → ["brief-010-foo"]  (trailing comma tolerated)
+
+    Strips whitespace and trailing punctuation (commas, periods) from each id.
+    Empty tokens filtered. Returns [] if no valid ids survive.
+    """
+    if not raw:
+        return []
+    out = []
+    for tok in raw.split(","):
+        cleaned = tok.strip().strip(".,;")
+        if cleaned:
+            out.append(cleaned)
+    return out
 
 
 def git_show(project_dir, ref, path):
@@ -88,21 +112,23 @@ def git_rev_parse(project_dir, ref):
 
 
 def read_depends_on(brief_file_path):
-    """Parse **Depends-on: brief-NNN** from a brief file on disk.
+    """Parse **Depends-on:** from a brief file on disk.
 
-    Returns the dependency brief-id string, or None if not specified.
-    Reads the file directly (not via git show) — caller should pass an
-    absolute or project-relative path to the brief file on disk.
+    Brief-014: returns a LIST of dep ids (was scalar str or None). Callers:
+    the daemon's deps-check (now iterates), and scripts/test-flow-v2.sh.
+    Empty list when no line present or value unparseable. Reads the file
+    directly (not via git show) — caller should pass an absolute or
+    project-relative path to the brief file on disk.
     """
     try:
         with open(brief_file_path) as f:
             for line in f:
                 m = DEPENDS_ON_LINE_RE.match(line)
                 if m:
-                    return m.group(1).strip()
+                    return parse_depends_on_value(m.group(1))
     except (IOError, OSError):
         pass
-    return None
+    return []
 
 
 def read_auto_merge_flag(project_dir, ref, brief_file_rel):

@@ -798,39 +798,19 @@ print('false')
     # Process pending dispatch queue
     if [ -f "$STATE_DIR/pending-dispatch.json" ]; then
         # Check **Depends-on:** frontmatter before dispatching.
-        # If the brief's dependency hasn't merged yet, cancel this dispatch
-        # so the conductor retries next tick (potentially picking a different brief).
-        DEPS_CHECK=$(python3 -c "
-import json, re, os, sys
-RE_DEP = re.compile(r'^\s*\*\*Depends-on:\*\*\s*(\S+)', re.IGNORECASE)
-try:
-    with open('$STATE_DIR/pending-dispatch.json') as f:
-        spec = json.load(f)
-    brief_file = spec.get('brief_file', '')
-    bf_path = os.path.join('$PROJECT_DIR', brief_file) if brief_file else ''
-    depends_on = None
-    if bf_path and os.path.exists(bf_path):
-        with open(bf_path) as f:
-            for line in f:
-                m = RE_DEP.match(line)
-                if m:
-                    depends_on = m.group(1).strip()
-                    break
-    if not depends_on:
-        print('allowed')
-        sys.exit(0)
-    with open('$RUNNING_FILE') as f:
-        rc = json.load(f)
-    history_ids = [h.get('brief', '') for h in rc.get('history', [])]
-    if depends_on in history_ids:
-        print('allowed')
-    else:
-        print('blocked:' + depends_on)
-except Exception:
-    print('allowed')  # fail open — don't block dispatch on parse errors
-" 2>/dev/null)
-        if [[ "${DEPS_CHECK:-allowed}" == blocked:* ]]; then
-            DEP_ID="${DEPS_CHECK#blocked:}"
+        # Brief-014 fix: parser now handles comma-separated lists. Captures full
+        # line value, splits on commas, strips whitespace + trailing punctuation
+        # from each id. All deps must appear in history[] for dispatch to proceed.
+        # Emits a structured diagnostic line on every check (allowed or blocked)
+        # so future debugging has cheap receipts.
+        DEPS_OUTPUT=$(python3 "$DAEMON_LIB_DIR/actions.py" check-depends-on "$PROJECT_DIR" 2>/dev/null)
+        # Output protocol: first line is VERDICT ("allowed" or "blocked:<dep>"),
+        # second line is the diagnostic (brief=... depends_on=... history_ids=... match=...).
+        DEPS_VERDICT=$(echo "$DEPS_OUTPUT" | sed -n 1p)
+        DEPS_DIAG=$(echo "$DEPS_OUTPUT" | sed -n 2p)
+        [ -n "$DEPS_DIAG" ] && daemon_log "DEPS CHECK: $DEPS_DIAG"
+        if [[ "${DEPS_VERDICT:-allowed}" == blocked:* ]]; then
+            DEP_ID="${DEPS_VERDICT#blocked:}"
             BLOCKED_BRIEF=$(python3 -c "import json; print(json.load(open('$STATE_DIR/pending-dispatch.json')).get('brief',''))" 2>/dev/null || echo "unknown")
             daemon_log "DAEMON ACTION: dispatch blocked — $BLOCKED_BRIEF depends-on $DEP_ID (not yet merged)"
             notify "$BLOCKED_BRIEF dispatch blocked: depends on $DEP_ID (not merged yet)"
