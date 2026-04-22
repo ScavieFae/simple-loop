@@ -472,8 +472,16 @@ def merge(paths):
     git(project_dir, "push", remote, "--delete", branch, check=False)
     git(project_dir, "branch", "-d", branch, check=False)
 
-    # Push main
-    git(project_dir, "push", remote, main_branch)
+    # Push main — brief-014 fix 3: never silent. If this push fails (the
+    # 2026-04-22 keychain-lock scenario that left brief-013's merge unpushed
+    # for ~14h), the redactor-aware push_with_escalate writes escalate.json
+    # with reason=push_failed_on_auth and a token-redacted stderr. Raise
+    # after so the merge action is marked failed and the conductor escalates.
+    if not push_with_escalate(paths, remote=remote, branch=main_branch, brief=brief):
+        raise RuntimeError(
+            f"push_failed_on_auth: merge {brief} complete locally but push to "
+            f"{remote}/{main_branch} failed. See escalate.json."
+        )
 
     # Update running.json — prune from both active and completed_pending_eval.
     # A brief may reach merge via either path (direct pending-merge stamp from
@@ -555,6 +563,219 @@ def cleanup_worktrees(paths):
 
     log_action(paths, "cleanup", {"cleaned": cleaned})
     return True
+
+
+# ─── Push with escalate-on-failure (brief-014 fix 3) ────────────────
+#
+# Every git push that was previously `|| true` now goes through here. On
+# failure: redact stderr, write escalate.json, return False. Callers that
+# need fatal-push-fail propagation can raise from there.
+
+def push_with_escalate(paths, remote=None, branch=None, brief=None,
+                       cwd=None, _test_stderr_override=None):
+    """Push to remote with escalate-on-failure + token redaction.
+
+    Args:
+        paths: init_paths() dict.
+        remote: git remote name (default: read from config.sh).
+        branch: branch to push (default: main).
+        brief: brief id to tag the escalate with (optional).
+        cwd: directory to run git in (default: paths["project_dir"]).
+        _test_stderr_override: test hook — when set, skip the real push
+            and simulate a failure with this stderr. Production callers
+            should never pass this.
+
+    Returns:
+        True on push success. False on failure (escalate written).
+    """
+    config = read_config(paths["loop_dir"])
+    remote = remote or config.get("GIT_REMOTE", "origin")
+    branch = branch or config.get("GIT_MAIN_BRANCH", "main")
+    cwd = cwd or paths["project_dir"]
+
+    if _test_stderr_override is not None:
+        returncode = 1
+        stderr = _test_stderr_override
+    else:
+        try:
+            r = subprocess.run(
+                ["git", "-C", cwd, "push", remote, branch],
+                capture_output=True, text=True, timeout=60,
+            )
+            returncode = r.returncode
+            stderr = r.stderr or ""
+        except subprocess.TimeoutExpired as e:
+            returncode = 124
+            stderr = f"git push timed out: {e}"
+        except Exception as e:
+            returncode = 1
+            stderr = f"git push failed to invoke: {e}"
+
+    if returncode == 0:
+        return True
+
+    redacted = redact_secrets(stderr)
+    signals_dir = os.path.join(paths["state_dir"], "signals")
+    os.makedirs(signals_dir, exist_ok=True)
+    escalate_path = os.path.join(signals_dir, "escalate.json")
+
+    payload = {
+        "type": "push_failed",
+        "reason": "push_failed_on_auth",
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "remote": remote,
+        "branch": branch,
+        "returncode": returncode,
+        "stderr": redacted,
+    }
+    if brief:
+        payload["brief"] = brief
+
+    with open(escalate_path, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+    # Also log a structured line for grep-debugging.
+    try:
+        log_action(paths, "push_failed", {
+            "brief": brief or "",
+            "remote": remote,
+            "branch": branch,
+            "returncode": returncode,
+            "stderr": redacted,
+        })
+    except Exception:
+        pass  # don't let a logging failure compound a push failure
+
+    return False
+
+
+# ─── Heartbeat (brief-014 fix 4) ────────────────────────────────────
+
+def write_heartbeat(heartbeat_path, pid=None, last_event="tick"):
+    """Write .loop/state/heartbeat.json atomically on every daemon tick.
+
+    Format: {ts, pid, last_event} — readable with cat + jq. External watchers
+    (loop status, stewardship cron) parse this to distinguish process-alive
+    from loop-healthy. Stale heartbeat = hung daemon, even if PID is alive.
+    """
+    os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
+    payload = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pid": pid if pid is not None else os.getpid(),
+        "last_event": last_event,
+    }
+    tmp_path = heartbeat_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f)
+        f.write("\n")
+    os.replace(tmp_path, heartbeat_path)
+
+
+def heartbeat_is_stale(heartbeat_path, interval_s=300):
+    """Return True if the heartbeat is older than 2× interval (or missing).
+
+    Missing file treated as stale — safer default. "Daemon never started" and
+    "daemon wrote once then froze 11h ago" look the same to an external
+    watcher; both should alert.
+    """
+    threshold = 2 * interval_s
+    try:
+        with open(heartbeat_path) as f:
+            hb = json.load(f)
+        ts = hb.get("ts")
+        if not ts:
+            return True
+        # Parse ISO8601; tolerate trailing Z or offset.
+        if ts.endswith("Z"):
+            ts_parsed = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        else:
+            ts_parsed = datetime.fromisoformat(ts)
+            if ts_parsed.tzinfo is None:
+                ts_parsed = ts_parsed.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age_s = (now - ts_parsed).total_seconds()
+        return age_s > threshold
+    except (FileNotFoundError, IOError, OSError, json.JSONDecodeError, ValueError):
+        return True
+
+
+# ─── Validator artifact-presence check (brief-014 fix 5) ────────────
+
+# Matches checkbox lines that name a backticked path — the common form in
+# brief completion-criteria sections ("- [ ] `plan.md` in card dir").
+_ARTIFACT_CHECKBOX_RE = re.compile(r"^\s*-\s*\[[ xX]\]\s*.*?`([^`]+)`", re.MULTILINE)
+
+
+def extract_artifact_paths(brief_file_path):
+    """Grep completion-criteria / artifact sections for backticked file paths.
+
+    Returns a set of path strings. Matches any `foo.md`-style backticked
+    token on a checkbox line — filters to *.md / *.txt / *.json / *.yaml
+    extensions, plus bare filenames without slashes (plan.md, closeout.md).
+    Non-file tokens (\`verdict: pass\`, \`running.json\`-ish config refs)
+    slip in sometimes; callers check existence on the filesystem, so extra
+    tokens just cause cheap no-op stats.
+    """
+    if not brief_file_path or not os.path.exists(brief_file_path):
+        return set()
+    try:
+        with open(brief_file_path) as f:
+            text = f.read()
+    except (IOError, OSError):
+        return set()
+
+    # Only scan the completion-criteria / artifact sections to reduce noise.
+    # If a brief doesn't use a standard heading, fall back to full-file scan.
+    sections = re.split(r"\n##\s+", text)
+    scanned = []
+    for sec in sections:
+        head = sec.splitlines()[0].lower() if sec else ""
+        if "completion" in head or "artifact" in head:
+            scanned.append(sec)
+    if not scanned:
+        scanned = [text]
+
+    out = set()
+    for sec in scanned:
+        for m in _ARTIFACT_CHECKBOX_RE.finditer(sec):
+            tok = m.group(1).strip()
+            # File-shaped filter: must contain a dot (extension) OR end in .md
+            if "." in tok and "/" not in tok.strip("."):
+                # Drop things that clearly aren't project artifacts.
+                if tok.startswith("http") or tok.startswith("git@"):
+                    continue
+                out.add(tok)
+            elif tok.endswith(".md") or tok.endswith(".json"):
+                out.add(tok)
+    return out
+
+
+def validator_presence_check(brief_file_path, worktree_dir):
+    """Return a list of artifact paths declared in the brief but missing.
+
+    Resolution: paths are tried first relative to the brief's parent dir
+    (the card dir convention: plan.md and closeout.md live next to index.md),
+    then relative to the worktree root, then absolute if they start with /.
+    """
+    declared = extract_artifact_paths(brief_file_path)
+    if not declared:
+        return []
+
+    brief_parent = os.path.dirname(os.path.abspath(brief_file_path))
+    missing = []
+    for rel in declared:
+        if os.path.isabs(rel):
+            if not os.path.exists(rel):
+                missing.append(rel)
+            continue
+        candidates = [
+            os.path.join(brief_parent, rel),
+            os.path.join(worktree_dir, rel),
+        ]
+        if not any(os.path.exists(c) for c in candidates):
+            missing.append(rel)
+    return missing
 
 
 # ─── Action: check-depends-on ────────────────────────────────────────
