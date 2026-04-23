@@ -125,8 +125,8 @@ def save_running(paths, data):
 
 # ─── Human queue summary (brief-021) ────────────────────────────────
 
-_CREDENTIAL_GATE_RE = re.compile(r"\*\*Requires:\*\*|credential-gated", re.IGNORECASE)
-_REQUIRES_KEYWORD_RE = re.compile(r"Requires[:\s]+(.+?)(?:\s*$|\s{2,})", re.IGNORECASE)
+_CREDENTIAL_GATE_RE = re.compile(r"\*\*Requires\b", re.IGNORECASE)
+_REQUIRES_KEYWORD_RE = re.compile(r"Requires[^*\n]*:\**\s*(.+?)(?:\s*$|\s{2,})", re.IGNORECASE)
 
 
 def human_queue_summary(paths):
@@ -186,12 +186,26 @@ def human_queue_summary(paths):
         pass
 
     # Source C: credential-gated items in goals.md
+    # Two detection paths: section-based (## Credential-gated heading) and
+    # keyword-based (**Requires**) for bullets in any section.
+    # Only bullet items are considered — prose paragraphs are skipped to avoid
+    # false positives from mentions of "credential-gated" in description text.
     try:
         goals_file = os.path.join(paths["state_dir"], "goals.md")
         if os.path.exists(goals_file):
             with open(goals_file) as f:
+                in_credential_section = False
                 for line in f:
-                    if not _CREDENTIAL_GATE_RE.search(line):
+                    stripped = line.lstrip()
+                    if stripped.startswith('#'):
+                        in_credential_section = 'credential-gated' in line.lower()
+                        continue
+                    is_bullet = stripped.startswith('-') or stripped.startswith('*') or (
+                        stripped and stripped[0].isdigit() and '. ' in stripped[:4]
+                    )
+                    if not is_bullet:
+                        continue
+                    if not in_credential_section and not _CREDENTIAL_GATE_RE.search(line):
                         continue
                     m = re.search(r"brief-\d+-[\w-]+", line)
                     if not m:

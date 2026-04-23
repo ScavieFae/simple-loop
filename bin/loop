@@ -488,9 +488,34 @@ cmd_status() {
     echo "╚══════════════════════════════════════╝"
     echo ""
 
-    # Daemon
+    # Resolve actions.py once — used for heartbeat check and human_queue_summary.
+    local actions_script="$LIB_DIR/actions.py"
+    if [ ! -f "$actions_script" ]; then
+        actions_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/actions.py"
+    fi
+
+    # Daemon — brief-014 fix 4: check heartbeat, not just PID.
+    # process-alive ≠ loop-healthy. An 11h frozen daemon looks alive to ps
+    # but silent to the log. Heartbeat staleness catches that.
+    local hb_file="$STATE_DIR/heartbeat.json"
     if pid_alive; then
-        echo "  Daemon:   RUNNING (PID $(cat "$PID_FILE"))"
+        local hb_stale="unknown"
+        if [ -f "$actions_script" ]; then
+            hb_stale=$(python3 -c "
+import sys
+sys.path.insert(0, '$(dirname "$actions_script")')
+from actions import heartbeat_is_stale
+print('STALE' if heartbeat_is_stale('$hb_file', interval_s=${HEARTBEAT_INTERVAL:-300}) else 'FRESH')
+" 2>/dev/null || echo "unknown")
+        fi
+        if [ "$hb_stale" = "STALE" ]; then
+            local hb_ts="unknown"
+            [ -f "$hb_file" ] && hb_ts=$(python3 -c "import json; print(json.load(open('$hb_file')).get('ts','?'))" 2>/dev/null || echo "unknown")
+            echo "  Daemon:   HUNG — PID $(cat "$PID_FILE") alive, heartbeat stale (last ts: $hb_ts)"
+            echo "            process-alive ≠ loop-healthy. Recommend: loop stop && loop start"
+        else
+            echo "  Daemon:   RUNNING (PID $(cat "$PID_FILE"))"
+        fi
     else
         echo "  Daemon:   STOPPED"
     fi
@@ -531,6 +556,32 @@ else:
 " 2>/dev/null || echo "  Briefs:   no state"
     else
         echo "  Briefs:   no state file"
+    fi
+
+    # Awaiting you — brief-021: human-gated items from three sources.
+    # Suppressed entirely when empty; no empty-state noise.
+    if [ -f "$actions_script" ] && [ -f "$STATE_DIR/running.json" ]; then
+        python3 -c "
+import sys, os
+sys.path.insert(0, '$(dirname "$actions_script")')
+from actions import human_queue_summary
+paths = {
+    'running_file': '$STATE_DIR/running.json',
+    'state_dir': '$STATE_DIR',
+    'project_dir': '$PROJECT_DIR',
+}
+items = human_queue_summary(paths)
+if items:
+    print(f'  Awaiting you ({len(items)}):')
+    for item in items:
+        src = item['source'].ljust(16)
+        bid = item['brief_id']
+        summary = item['summary']
+        print(f'    {src}  {bid}   {summary}')
+        hint = item.get('action_hint')
+        if hint:
+            print(f'                       → {hint}')
+" 2>/dev/null
     fi
 
     echo ""
