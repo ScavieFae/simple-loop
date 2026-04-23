@@ -483,6 +483,74 @@ run_validator_iteration() {
 
     local REVIEW_REL=".loop/modules/validator/state/reviews/${brief_id}-cycle-${cycle}.md"
 
+    # Brief-014 fix 5: presence check for process artifacts named in brief
+    # completion criteria. If any declared artifact (plan.md, closeout.md,
+    # etc.) is missing from the worktree, the daemon writes a synthetic
+    # `block` review and skips the Claude invocation entirely. Deterministic
+    # floor under the LLM rubric — brief-012 shipped 14 passing cycles without
+    # plan.md or closeout.md because the rubric didn't enforce presence.
+    #
+    # 2026-04-22 follow-up: gate on worker_status == complete. Multi-cycle
+    # briefs declare end-of-brief artifacts; firing presence-check on every
+    # cycle blocks cycles 1..N-1 from ever producing those artifacts. Only
+    # enforce on the final cycle (status=complete).
+    local WORKER_STATUS
+    WORKER_STATUS=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('status', ''))" 2>/dev/null)
+
+    local MISSING_ARTIFACTS=""
+    if [ "$WORKER_STATUS" = "complete" ]; then
+        MISSING_ARTIFACTS=$(python3 -c "
+import sys
+sys.path.insert(0, '$DAEMON_LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$WORKTREE_DIR/$brief_file', '$WORKTREE_DIR')
+print(','.join(missing))
+" 2>/dev/null)
+    else
+        daemon_log "VALIDATOR: presence check skipped for $brief_id cycle $cycle (worker_status=$WORKER_STATUS, only runs on complete)"
+    fi
+
+    if [ -n "$MISSING_ARTIFACTS" ]; then
+        daemon_log "VALIDATOR: presence check FAILED for $brief_id cycle $cycle — missing: $MISSING_ARTIFACTS"
+        notify "$brief_id cycle $cycle: validator BLOCK — missing artifacts ($MISSING_ARTIFACTS)"
+
+        local NOW_ISO_PRE
+        NOW_ISO_PRE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+        # Synthetic review file — same shape as a Claude-written review.
+        cat > "$WORKTREE_DIR/$REVIEW_REL" <<EOF
+---
+cycle: $cycle
+commit: $commit_sha
+brief: $brief_id
+branch: $branch
+verdict: block
+summary: presence check failed — missing declared artifacts: $MISSING_ARTIFACTS
+validator: presence-check (pre-LLM, brief-014)
+reviewed_at: $NOW_ISO_PRE
+---
+
+## Bugs found
+- Missing declared artifact(s): $MISSING_ARTIFACTS. Completion criteria named these paths; neither the card dir nor the worktree root contains them. Worker must write these files before the validator can pass.
+
+## Execution concerns
+- _none_
+
+## Spec-fit notes
+- _none_
+
+## Deferred items
+- _none_
+EOF
+
+        git -C "$WORKTREE_DIR" add "$REVIEW_REL"
+        if ! git -C "$WORKTREE_DIR" diff --cached --quiet; then
+            git -C "$WORKTREE_DIR" commit -m "[scav] validator: $brief_id cycle $cycle block (missing artifacts)" -q 2>/dev/null
+            git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "VALIDATOR: push failed on synthetic review (non-fatal)"
+        fi
+        return 0
+    fi
+
     # Build prompt: agent spec + per-run context + required schema.
     # Strip any leading YAML frontmatter — the claude CLI parses a prompt
     # starting with `---` as a flag and aborts with "unknown option '---".
@@ -658,9 +726,24 @@ notify "Daemon started (PID $$)"
 TURN=0
 LAST_CONDUCTOR_TRIGGER=""
 LAST_ESCALATE_PRESENT=false
+HEARTBEAT_FILE="$STATE_DIR/heartbeat.json"
+
+# Brief-014 fix 4: heartbeat helper. Fires at top of each tick, plus after each
+# phase to narrate "what the loop was last doing." Mattie or any external
+# watcher can `jq .last_event` to distinguish a healthy idle from a hang.
+write_heartbeat() {
+    local event="${1:-tick}"
+    python3 -c "
+import sys
+sys.path.insert(0, '$DAEMON_LIB_DIR')
+from actions import write_heartbeat
+write_heartbeat('$HEARTBEAT_FILE', pid=$$, last_event='$event')
+" 2>/dev/null || true
+}
 
 while true; do
     TURN=$((TURN + 1))
+    write_heartbeat "tick_start"
 
     # --- Escalate-resolved detection (breaks dedup on stale triggers) ---
     # When the conductor writes escalate.json, subsequent ticks with the same
@@ -713,6 +796,7 @@ while true; do
     # │  Phase 1: Assess state              │
     # └─────────────────────────────────────┘
     # assess.py prints three lines: conductor trigger, worker target, validator target.
+    write_heartbeat "phase1_assess"
     ASSESS_OUTPUT=$(assess_state)
     CONDUCTOR_TRIGGER=$(echo "$ASSESS_OUTPUT" | sed -n 1p)
     WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
@@ -729,6 +813,7 @@ while true; do
             if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ]; then
                 daemon_log "CONDUCTOR: dedup — same trigger ($REASON), skipping"
             else
+                write_heartbeat "phase2_conductor:$REASON"
                 invoke_conductor "$REASON"
                 LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
                 DID_WORK=true
@@ -817,39 +902,19 @@ print('false')
     # Process pending dispatch queue
     if [ -f "$STATE_DIR/pending-dispatch.json" ]; then
         # Check **Depends-on:** frontmatter before dispatching.
-        # If the brief's dependency hasn't merged yet, cancel this dispatch
-        # so the conductor retries next tick (potentially picking a different brief).
-        DEPS_CHECK=$(python3 -c "
-import json, re, os, sys
-RE_DEP = re.compile(r'^\s*\*\*Depends-on:\*\*\s*(\S+)', re.IGNORECASE)
-try:
-    with open('$STATE_DIR/pending-dispatch.json') as f:
-        spec = json.load(f)
-    brief_file = spec.get('brief_file', '')
-    bf_path = os.path.join('$PROJECT_DIR', brief_file) if brief_file else ''
-    depends_on = None
-    if bf_path and os.path.exists(bf_path):
-        with open(bf_path) as f:
-            for line in f:
-                m = RE_DEP.match(line)
-                if m:
-                    depends_on = m.group(1).strip()
-                    break
-    if not depends_on:
-        print('allowed')
-        sys.exit(0)
-    with open('$RUNNING_FILE') as f:
-        rc = json.load(f)
-    history_ids = [h.get('brief', '') for h in rc.get('history', [])]
-    if depends_on in history_ids:
-        print('allowed')
-    else:
-        print('blocked:' + depends_on)
-except Exception:
-    print('allowed')  # fail open — don't block dispatch on parse errors
-" 2>/dev/null)
-        if [[ "${DEPS_CHECK:-allowed}" == blocked:* ]]; then
-            DEP_ID="${DEPS_CHECK#blocked:}"
+        # Brief-014 fix: parser now handles comma-separated lists. Captures full
+        # line value, splits on commas, strips whitespace + trailing punctuation
+        # from each id. All deps must appear in history[] for dispatch to proceed.
+        # Emits a structured diagnostic line on every check (allowed or blocked)
+        # so future debugging has cheap receipts.
+        DEPS_OUTPUT=$(python3 "$DAEMON_LIB_DIR/actions.py" check-depends-on "$PROJECT_DIR" 2>/dev/null)
+        # Output protocol: first line is VERDICT ("allowed" or "blocked:<dep>"),
+        # second line is the diagnostic (brief=... depends_on=... history_ids=... match=...).
+        DEPS_VERDICT=$(echo "$DEPS_OUTPUT" | sed -n 1p)
+        DEPS_DIAG=$(echo "$DEPS_OUTPUT" | sed -n 2p)
+        [ -n "$DEPS_DIAG" ] && daemon_log "DEPS CHECK: $DEPS_DIAG"
+        if [[ "${DEPS_VERDICT:-allowed}" == blocked:* ]]; then
+            DEP_ID="${DEPS_VERDICT#blocked:}"
             BLOCKED_BRIEF=$(python3 -c "import json; print(json.load(open('$STATE_DIR/pending-dispatch.json')).get('brief',''))" 2>/dev/null || echo "unknown")
             daemon_log "DAEMON ACTION: dispatch blocked — $BLOCKED_BRIEF depends-on $DEP_ID (not yet merged)"
             notify "$BLOCKED_BRIEF dispatch blocked: depends on $DEP_ID (not merged yet)"
@@ -918,6 +983,7 @@ except: print(0)
         VALIDATOR:*)
             IFS=',' read -r V_BRIEF V_BRANCH V_COMMIT <<< "${VALIDATOR_TARGET#VALIDATOR:}"
             if [ -n "$V_BRIEF" ] && [ -n "$V_BRANCH" ] && [ -n "$V_COMMIT" ]; then
+                write_heartbeat "phase2_7_validator:$V_BRIEF"
                 run_validator_iteration "$V_BRIEF" "$V_BRANCH" "$V_COMMIT"
                 DID_WORK=true
                 LAST_CONDUCTOR_TRIGGER=""
@@ -937,9 +1003,11 @@ except: print(0)
             if [ "$CONSECUTIVE_WORKER_FAILURES" -ge 3 ]; then
                 daemon_log "WORKER: 3 consecutive failures — escalating to conductor"
                 notify "3 worker failures on $BRIEF_ID — escalating"
+                write_heartbeat "phase3_conductor_escalate:$BRIEF_ID"
                 invoke_conductor "worker_failures_${BRIEF_ID}"
                 CONSECUTIVE_WORKER_FAILURES=0
             else
+                write_heartbeat "phase3_worker:$BRIEF_ID"
                 run_worker_iteration "$BRIEF_ID" "$BRIEF_BRANCH"
                 DID_WORK=true
                 LAST_CONDUCTOR_TRIGGER=""
@@ -967,9 +1035,11 @@ except: print(0)
     if [ "$DID_WORK" = true ]; then
         CONSECUTIVE_SKIPS=0
         daemon_log "Sleeping ${WORKER_COOLDOWN}s before next tick"
+        write_heartbeat "phase5_sleep_worked"
         sleep "$WORKER_COOLDOWN"
     else
         CONSECUTIVE_SKIPS=$((CONSECUTIVE_SKIPS + 1))
+        write_heartbeat "phase5_sleep_idle"
         if [ "$CONSECUTIVE_SKIPS" -ge 6 ]; then
             SKIP_SLEEP=900   # 15 min
         elif [ "$CONSECUTIVE_SKIPS" -ge 3 ]; then
