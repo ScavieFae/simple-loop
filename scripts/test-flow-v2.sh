@@ -947,6 +947,321 @@ assert_eq "log.jsonl has startup_repair_disabled event" "$LOG_HAS_DISABLED" "YES
 
 fi  # startup_repair.py exists (test 17)
 
+# ── Test 18 (brief-019): Model-field parser — correct extraction ──────────────
+
+echo ""
+echo "=== Test 18: Model-field parser — correct extraction from **Model:** frontmatter ==="
+
+# Helper mirrors daemon.sh line 349's CURRENT pipeline (tr -d '[:space:]').
+# Cases (c) and (d) will FAIL until task-7 updates daemon.sh to use
+# awk '{print $1}' | cut -d'(' -f1 | cut -d',' -f1 instead.
+_parse_model() {
+    local file="$1"
+    local result
+    result=$(grep -m1 '^\*\*Model:\*\*' "$file" 2>/dev/null \
+        | sed 's/.*\*\*Model:\*\*[[:space:]]*//' \
+        | tr -d '[:space:]' \
+        | tr '[:upper:]' '[:lower:]')
+    echo "${result:-sonnet}"
+}
+
+# (a) simple opus
+printf '**Model:** opus\n' > "$SCRATCH/brief-model-a.md"
+assert_eq "model-field (a): opus → opus" "$(_parse_model "$SCRATCH/brief-model-a.md")" "opus"
+
+# (b) simple sonnet
+printf '**Model:** sonnet\n' > "$SCRATCH/brief-model-b.md"
+assert_eq "model-field (b): sonnet → sonnet" "$(_parse_model "$SCRATCH/brief-model-b.md")" "sonnet"
+
+# (c) opus with parenthetical — FAILS until task-7 parser fix
+printf '**Model:** opus (research + adapter-design cycle)\n' > "$SCRATCH/brief-model-c.md"
+assert_eq "model-field (c): 'opus (comment)' → opus [fails until task-7]" \
+    "$(_parse_model "$SCRATCH/brief-model-c.md")" "opus"
+
+# (d) comma-separated multi-model — first wins — FAILS until task-7 parser fix
+printf '**Model:** opus, sonnet\n' > "$SCRATCH/brief-model-d.md"
+assert_eq "model-field (d): 'opus, sonnet' → opus [fails until task-7]" \
+    "$(_parse_model "$SCRATCH/brief-model-d.md")" "opus"
+
+# (e) haiku
+printf '**Model:** haiku\n' > "$SCRATCH/brief-model-e.md"
+assert_eq "model-field (e): haiku → haiku" "$(_parse_model "$SCRATCH/brief-model-e.md")" "haiku"
+
+# (f) missing **Model:** line → default sonnet
+printf '# Brief: no model field\n' > "$SCRATCH/brief-model-f.md"
+assert_eq "model-field (f): missing field → sonnet (default)" \
+    "$(_parse_model "$SCRATCH/brief-model-f.md")" "sonnet"
+
+rm -f "$SCRATCH/brief-model-"*.md
+
+# ── Test 19 (brief-019): Auto-merge symlink routing — git_read_follow ────────
+
+echo ""
+echo "=== Test 19: Auto-merge symlink routing — git_read_follow reads through git symlinks ==="
+
+# Mirrors the portal pattern: .loop/briefs/brief-NNN.md → wiki/briefs/cards/NNN/index.md
+mkdir -p "$SCRATCH/wiki/briefs/cards/brief-LINK-test"
+cat > "$SCRATCH/wiki/briefs/cards/brief-LINK-test/index.md" <<'BRIEFEOF'
+# Brief: symlink test
+
+**ID:** brief-LINK-test
+**Auto-merge:** true
+**Model:** sonnet
+**Status:** queued
+BRIEFEOF
+
+# Create a relative symlink from .loop/briefs/ into the card dir
+ln -sf "../../wiki/briefs/cards/brief-LINK-test/index.md" \
+    "$SCRATCH/.loop/briefs/brief-LINK-test.md"
+git -C "$SCRATCH" add -A
+git -C "$SCRATCH" commit -q -m "test: add symlinked brief" 2>/dev/null || true
+
+# git show on a symlink returns the target path, not the file body
+GIT_SHOW_RESULT=$(git -C "$SCRATCH" show "HEAD:.loop/briefs/brief-LINK-test.md" 2>/dev/null)
+assert_eq "git show on symlink returns target path (documents the bug)" \
+    "$GIT_SHOW_RESULT" "../../wiki/briefs/cards/brief-LINK-test/index.md"
+
+# git_read_follow should resolve the symlink and return the actual file content
+GRF_AUTO=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import git_read_follow, AUTO_MERGE_LINE_RE
+content = git_read_follow('$SCRATCH', 'HEAD', '.loop/briefs/brief-LINK-test.md')
+if content is None:
+    print('NONE')
+else:
+    for line in content.splitlines():
+        m = AUTO_MERGE_LINE_RE.match(line)
+        if m:
+            val = m.group(1).strip().lower()
+            print('true' if val == 'true' else 'false')
+            break
+    else:
+        print('not_found')
+" 2>/dev/null)
+assert_eq "git_read_follow reads Auto-merge flag through symlink" "$GRF_AUTO" "true"
+
+# Bare git show would miss the flag (returns symlink target, regex no match)
+# — documents why task-7 must switch daemon.sh to use git_read_follow
+GIT_SHOW_AM=$(python3 -c "
+import sys, subprocess, re
+RE = re.compile(r'^\s*\*\*Auto-merge:\*\*\s*(\S+)', re.IGNORECASE)
+r = subprocess.run(['git', '-C', '$SCRATCH', 'show', 'HEAD:.loop/briefs/brief-LINK-test.md'],
+    capture_output=True, text=True, timeout=10)
+for line in r.stdout.splitlines():
+    m = RE.match(line)
+    if m:
+        print(m.group(1).strip().lower())
+        break
+else:
+    print('false')
+" 2>/dev/null)
+assert_eq "bare git show misses Auto-merge flag on symlinked brief (the bug)" "$GIT_SHOW_AM" "false"
+
+# Cleanup symlink test artifacts from the SCRATCH repo
+rm -f "$SCRATCH/.loop/briefs/brief-LINK-test.md"
+rm -rf "$SCRATCH/wiki/briefs/cards/brief-LINK-test"
+git -C "$SCRATCH" add -A
+git -C "$SCRATCH" commit -q -m "test: cleanup symlink artifacts" 2>/dev/null || true
+
+# ── Tests 20-21 (brief-019): Presence-check gate — running vs complete ────────
+
+echo ""
+echo "=== Tests 20-21: Presence-check gate — runs on complete, skipped on running ==="
+
+if ! python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+" 2>/dev/null; then
+    fail "presence-check gate (running): validator_presence_check not in source repo (sync pending task-9)"
+    fail "presence-check gate (complete): validator_presence_check not in source repo (sync pending task-9)"
+else
+
+cat > "$SCRATCH/.loop/briefs/brief-GATE-test.md" <<'GATEEOF'
+# Brief: presence-gate test
+
+**ID:** brief-GATE-test
+**Status:** running
+
+## Completion criteria
+
+- [ ] `plan.md` present in card dir
+- [ ] `closeout.md` present in card dir
+GATEEOF
+
+# Test 20: direct call to validator_presence_check with missing artifacts → returns missing list
+# The daemon gates calling this on status=complete; the function itself always reports missing.
+GATE_BLOCKED=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$SCRATCH/.loop/briefs/brief-GATE-test.md', '$SCRATCH')
+print('blocked' if missing else 'clear')
+" 2>/dev/null)
+assert_eq "presence-check: returns blocked when artifacts missing (function contract)" \
+    "$GATE_BLOCKED" "blocked"
+
+# Test 21: with artifacts present → returns clear (not blocking)
+touch "$SCRATCH/plan.md" "$SCRATCH/closeout.md"
+GATE_CLEAR=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$SCRATCH/.loop/briefs/brief-GATE-test.md', '$SCRATCH')
+print('blocked' if missing else 'clear')
+" 2>/dev/null)
+assert_eq "presence-check: returns clear when all artifacts present" "$GATE_CLEAR" "clear"
+
+rm -f "$SCRATCH/plan.md" "$SCRATCH/closeout.md"
+rm -f "$SCRATCH/.loop/briefs/brief-GATE-test.md"
+
+fi  # validator_presence_check available
+
+# ── Tests 22-24 (brief-019): Merge abort-on-conflict ──────────────────────────
+
+echo ""
+echo "=== Tests 22-24: Merge abort-on-conflict — conflict triggers abort + awaiting_review ==="
+
+MERGE_SCRATCH=$(mktemp -d)
+
+git -C "$MERGE_SCRATCH" init -q -b main
+git -C "$MERGE_SCRATCH" config user.email "test@test"
+git -C "$MERGE_SCRATCH" config user.name "Test"
+
+mkdir -p "$MERGE_SCRATCH/.loop/state/signals"
+mkdir -p "$MERGE_SCRATCH/.loop/worktrees"
+
+cat > "$MERGE_SCRATCH/.loop/config.sh" <<'EOF'
+PROJECT_NAME="test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+EOF
+
+touch "$MERGE_SCRATCH/.loop/state/log.jsonl"
+
+# Seed initial commit on main
+echo "base content" > "$MERGE_SCRATCH/shared.txt"
+git -C "$MERGE_SCRATCH" add -A
+git -C "$MERGE_SCRATCH" commit -q -m "init"
+
+# Set up local bare repo as 'origin' so git push succeeds
+git init --bare -q "$MERGE_SCRATCH/origin.git"
+git -C "$MERGE_SCRATCH" remote add origin "$MERGE_SCRATCH/origin.git"
+git -C "$MERGE_SCRATCH" push -q origin main
+
+# Create non-conflicting branch (test 22)
+git -C "$MERGE_SCRATCH" checkout -q -b brief-CLEAN-test
+echo "clean addition" > "$MERGE_SCRATCH/newfile.txt"
+git -C "$MERGE_SCRATCH" add newfile.txt
+git -C "$MERGE_SCRATCH" commit -q -m "brief-CLEAN-test: add newfile"
+git -C "$MERGE_SCRATCH" checkout -q main
+
+# Create conflicting branch (tests 23-24): both branches modify shared.txt
+git -C "$MERGE_SCRATCH" checkout -q -b brief-CONFLICT-test
+echo "branch version" > "$MERGE_SCRATCH/shared.txt"
+git -C "$MERGE_SCRATCH" add shared.txt
+git -C "$MERGE_SCRATCH" commit -q -m "brief-CONFLICT-test: change shared.txt"
+git -C "$MERGE_SCRATCH" checkout -q main
+echo "main version" > "$MERGE_SCRATCH/shared.txt"
+git -C "$MERGE_SCRATCH" add shared.txt
+git -C "$MERGE_SCRATCH" commit -q -m "main: change shared.txt — conflicts with branch"
+git -C "$MERGE_SCRATCH" push -q origin main
+
+write_running_ms() {
+    python3 -c "import json; json.dump($1, open('$MERGE_SCRATCH/.loop/state/running.json','w'), indent=2)"
+}
+
+# ── Test 22: clean merge succeeds ───────────────────────────────────────────
+
+write_running_ms "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [{'brief': 'brief-CLEAN-test', 'branch': 'brief-CLEAN-test'}],
+    'awaiting_review': [],
+    'history': []
+}"
+
+cat > "$MERGE_SCRATCH/.loop/state/pending-merge.json" <<'PMEOF'
+{"brief": "brief-CLEAN-test", "branch": "brief-CLEAN-test", "title": "clean test", "evaluation": ""}
+PMEOF
+
+CLEAN_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, load_running, merge
+paths = init_paths('$MERGE_SCRATCH')
+try:
+    result = merge(paths)
+    rc = load_running(paths)
+    in_hist = any(e.get('brief') == 'brief-CLEAN-test' for e in rc.get('history', []))
+    print(f'ok,in_history={in_hist}')
+except Exception as e:
+    # Push may fail if branch cleanup fails — just check it's not a conflict error
+    msg = str(e).lower()
+    if 'conflict' in msg or 'unmerged' in msg:
+        print(f'conflict_error: {e}')
+    else:
+        print('ok,push_or_cleanup_error')
+" 2>/dev/null)
+CLEAN_OK=$(echo "$CLEAN_RESULT" | grep -c "^ok" || true)
+assert_eq "clean merge: no conflict error raised" "$CLEAN_OK" "1"
+
+# ── Test 23: conflict triggers abort + awaiting_review ──────────────────────
+
+write_running_ms "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [{'brief': 'brief-CONFLICT-test', 'branch': 'brief-CONFLICT-test'}],
+    'awaiting_review': [],
+    'history': []
+}"
+
+cat > "$MERGE_SCRATCH/.loop/state/pending-merge.json" <<'PMEOF'
+{"brief": "brief-CONFLICT-test", "branch": "brief-CONFLICT-test", "title": "conflict test", "evaluation": ""}
+PMEOF
+
+CONFLICT_RESULT=$(python3 -c "
+import sys, subprocess
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, load_running, merge
+paths = init_paths('$MERGE_SCRATCH')
+try:
+    result = merge(paths)
+    rc = load_running(paths)
+    in_ar = any(e.get('brief') == 'brief-CONFLICT-test' for e in rc.get('awaiting_review', []))
+    print(f'result={result},in_awaiting_review={in_ar}')
+except subprocess.CalledProcessError:
+    print('exception:no_abort_implemented')
+" 2>/dev/null)
+assert_eq "conflict: merge() returns False + brief in awaiting_review [fails until task-8]" \
+    "$CONFLICT_RESULT" "result=False,in_awaiting_review=True"
+
+# Working tree must be clean after abort (no half-merged state)
+GIT_STATUS_AFTER=$(git -C "$MERGE_SCRATCH" status --porcelain 2>/dev/null)
+assert_eq "conflict: git working tree clean after abort [fails until task-8]" \
+    "$GIT_STATUS_AFTER" ""
+
+# ── Test 24: repeated tick does not retry after conflict ────────────────────
+
+PM_AFTER=$( [ -f "$MERGE_SCRATCH/.loop/state/pending-merge.json" ] && echo "exists" || echo "gone" )
+assert_eq "conflict: pending-merge.json removed, no retry loop [fails until task-8]" \
+    "$PM_AFTER" "gone"
+
+# Running merge() again with no pending-merge.json → cleanly returns False (not an error)
+NO_PM_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, merge
+paths = init_paths('$MERGE_SCRATCH')
+result = merge(paths)
+print('false' if result is False else str(result))
+" 2>/dev/null)
+assert_eq "repeated tick after conflict: merge() returns False cleanly (no retry)" \
+    "$NO_PM_RESULT" "false"
+
+rm -rf "$MERGE_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
