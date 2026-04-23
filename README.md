@@ -31,6 +31,19 @@ If you used `--link`, your installed copy *is* your repo checkout — `git pull`
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI, authenticated
 - Python 3.8+, Git, Bash
 
+## Install into a new project
+
+After running `install.sh`, use `loop init` to scaffold the bundle into any project:
+
+```bash
+cd your-project
+loop init --wiki-full    # full scaffold: .loop/ + wiki/ skeleton
+# or
+loop init --minimal      # .loop/ only, no wiki/
+```
+
+Then author a brief, symlink it into `.loop/briefs/`, and `loop start`. Full step-by-step walkthrough in [docs/bundle-install.md](docs/bundle-install.md).
+
 ## Workstation skills
 
 | Skill | Triggers | What it does |
