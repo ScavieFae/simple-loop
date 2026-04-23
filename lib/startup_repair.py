@@ -194,9 +194,18 @@ def run_startup_repair(paths: dict, project_dir: str) -> list:
     """Orchestrator: run all repair steps, save if any changes, log all actions.
 
     Returns the list of repair action dicts (empty if nothing was repaired).
-    Callers can check the length to decide whether to log/print.
+    Set NT_DAEMON_STARTUP_REPAIR=false to skip all repair (escape hatch).
     """
     from actions import load_running, save_running, log_action, read_config
+
+    if os.environ.get("NT_DAEMON_STARTUP_REPAIR", "true").lower() == "false":
+        with open(paths["log_file"], "a") as f:
+            f.write(json.dumps({
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "action": "daemon:startup_repair_disabled",
+                "reason": "NT_DAEMON_STARTUP_REPAIR=false",
+            }) + "\n")
+        return []
 
     t_start = datetime.now(timezone.utc)
     running = load_running(paths)

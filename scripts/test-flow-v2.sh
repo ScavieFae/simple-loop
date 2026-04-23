@@ -886,6 +886,67 @@ rm -f "$SCRATCH/.loop/state/pending-merge.json"
 
 fi  # startup_repair.py exists (test 16)
 
+# ── Test 17 (brief-019 test 53): NT_DAEMON_STARTUP_REPAIR=false disables repair ─
+
+echo ""
+echo "=== Test 17: NT_DAEMON_STARTUP_REPAIR=false — repair skipped, corruption persists ==="
+
+STARTUP_REPAIR="$LIB_DIR/startup_repair.py"
+if [ ! -f "$STARTUP_REPAIR" ]; then
+    fail "startup_repair.py not found — skipping test 17"
+else
+
+# Seed running.json with a duplicate active entry (corruption)
+write_running "{
+    'active': [
+        {'brief': 'brief-ENV-test', 'branch': 'brief-ENV-test'},
+        {'brief': 'brief-ENV-test', 'branch': 'brief-ENV-test'}
+    ],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': []
+}"
+
+> "$SCRATCH/.loop/state/log.jsonl"
+
+# Run with repair disabled via env var
+ACTION_COUNT=$(NT_DAEMON_STARTUP_REPAIR=false python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from startup_repair import run_startup_repair
+from actions import init_paths
+paths = init_paths('$SCRATCH')
+actions = run_startup_repair(paths, '$SCRATCH')
+print(len(actions))
+" 2>/dev/null)
+assert_eq "run_startup_repair returns 0 actions when disabled" "$ACTION_COUNT" "0"
+
+# Corruption must still be present (active[] still has 2 entries)
+ACTIVE_LEN=$(python3 -c "
+import json
+d = json.load(open('$SCRATCH/.loop/state/running.json'))
+print(len(d.get('active', [])))
+" 2>/dev/null)
+assert_eq "active[] still has 2 entries (corruption persists when disabled)" "$ACTIVE_LEN" "2"
+
+# log.jsonl must have startup_repair_disabled event
+LOG_HAS_DISABLED=$(python3 -c "
+import json
+with open('$SCRATCH/.loop/state/log.jsonl') as f:
+    lines = f.readlines()
+for line in reversed(lines):
+    d = json.loads(line)
+    if d.get('action') == 'daemon:startup_repair_disabled':
+        print('YES')
+        break
+else:
+    print('NO')
+" 2>/dev/null)
+assert_eq "log.jsonl has startup_repair_disabled event" "$LOG_HAS_DISABLED" "YES"
+
+fi  # startup_repair.py exists (test 17)
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

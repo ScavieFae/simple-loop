@@ -630,6 +630,25 @@ cleanup() {
 }
 trap 'cleanup' SIGINT SIGTERM SIGHUP EXIT
 
+# ── Startup repair ──────────────────────────────────────────────────────────
+# Reconcile running.json against ground truth (git log + filesystem) before
+# the tick loop begins. Catches state drift across restarts and hand-merges.
+# Disable with NT_DAEMON_STARTUP_REPAIR=false.
+if [ "${NT_DAEMON_STARTUP_REPAIR:-true}" = "false" ]; then
+    daemon_log "STARTUP REPAIR: disabled via NT_DAEMON_STARTUP_REPAIR=false"
+else
+    REPAIR_COUNT=$(python3 -c "
+import sys
+sys.path.insert(0, '$DAEMON_LIB_DIR')
+from startup_repair import run_startup_repair
+from actions import init_paths
+paths = init_paths('$PROJECT_DIR')
+actions = run_startup_repair(paths, '$PROJECT_DIR')
+print(len(actions))
+" 2>/dev/null || echo "0")
+    daemon_log "STARTUP REPAIR: complete (${REPAIR_COUNT:-0} action(s))"
+fi
+
 notify "Daemon started (PID $$)"
 
 # ╔══════════════════════════════════════════════════════════════════╗
