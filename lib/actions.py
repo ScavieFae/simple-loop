@@ -123,6 +123,96 @@ def save_running(paths, data):
     git(paths["project_dir"], "commit", "-m", "loop: update running.json", check=False)
 
 
+# ─── Human queue summary (brief-021) ────────────────────────────────
+
+_CREDENTIAL_GATE_RE = re.compile(r"\*\*Requires:\*\*|credential-gated", re.IGNORECASE)
+_REQUIRES_KEYWORD_RE = re.compile(r"Requires[:\s]+(.+?)(?:\s*$|\s{2,})", re.IGNORECASE)
+
+
+def human_queue_summary(paths):
+    """Return human-gated items from three sources.
+
+    Each item: {source, brief_id, summary, action_hint}. Three sources:
+    awaiting_review[] from running.json, live signal files, and
+    credential-gated entries in goals.md. Returns empty list when nothing
+    is waiting — callers suppress the section entirely in that case.
+    """
+    items = []
+
+    # Source A: awaiting_review[] from running.json
+    try:
+        rc = load_running(paths)
+        for entry in rc.get("awaiting_review", []):
+            brief_id = entry.get("brief", "")
+            if not brief_id:
+                continue
+            reason = entry.get("reason", "human approval needed")
+            items.append({
+                "source": "awaiting_review",
+                "brief_id": brief_id,
+                "summary": reason[:60],
+                "action_hint": f"loop approve {brief_id}",
+            })
+    except Exception:
+        pass
+
+    # Source B: live signal files in signals/ — skip archived-suffix and pause.json
+    try:
+        signals_dir = os.path.join(paths["state_dir"], "signals")
+        if os.path.isdir(signals_dir):
+            for fname in sorted(os.listdir(signals_dir)):
+                if not fname.endswith(".json"):
+                    continue
+                if ".resolved-" in fname or ".archived-" in fname:
+                    continue
+                if fname == "pause.json":
+                    continue
+                sig_path = os.path.join(signals_dir, fname)
+                try:
+                    with open(sig_path) as f:
+                        sig = json.load(f)
+                except Exception:
+                    continue
+                brief_id = sig.get("brief", os.path.splitext(fname)[0])
+                category = sig.get("category", sig.get("type", fname.replace(".json", "")))
+                raw_summary = sig.get("summary", sig.get("reason", category))
+                items.append({
+                    "source": "escalate",
+                    "brief_id": brief_id,
+                    "summary": str(raw_summary)[:60],
+                    "action_hint": f"resolve signals/{fname}",
+                })
+    except Exception:
+        pass
+
+    # Source C: credential-gated items in goals.md
+    try:
+        goals_file = os.path.join(paths["state_dir"], "goals.md")
+        if os.path.exists(goals_file):
+            with open(goals_file) as f:
+                for line in f:
+                    if not _CREDENTIAL_GATE_RE.search(line):
+                        continue
+                    m = re.search(r"brief-\d+-[\w-]+", line)
+                    if not m:
+                        m = re.search(r"brief-\d+", line)
+                    brief_id = m.group(0) if m else ""
+                    if not brief_id:
+                        continue
+                    kw_m = _REQUIRES_KEYWORD_RE.search(line)
+                    keyword = kw_m.group(1).strip()[:60] if kw_m else "credentials required"
+                    items.append({
+                        "source": "credential-gated",
+                        "brief_id": brief_id,
+                        "summary": keyword,
+                        "action_hint": None,
+                    })
+    except Exception:
+        pass
+
+    return items
+
+
 # ─── Action: move-to-eval ────────────────────────────────────────────
 
 def move_to_eval(paths, brief_id):
