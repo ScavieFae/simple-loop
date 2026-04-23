@@ -1,0 +1,1660 @@
+mod state;
+
+use anyhow::Result;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use notify::{RecursiveMode, Watcher};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    Terminal,
+};
+use std::{
+    io,
+    panic,
+    path::Path,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+fn setup_panic_hook() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+}
+
+// ── panel identity ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Panel {
+    Hive,
+    Signals,
+    Cells,
+    DanceFloor,
+}
+
+impl Panel {
+    fn next(self) -> Panel {
+        match self {
+            Panel::Hive => Panel::Signals,
+            Panel::Signals => Panel::Cells,
+            Panel::Cells => Panel::DanceFloor,
+            Panel::DanceFloor => Panel::Hive,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Panel::Hive => " Hive Status ",
+            Panel::Signals => " Signals ",
+            Panel::Cells => " Cells ",
+            Panel::DanceFloor => " Dance Floor ",
+        }
+    }
+}
+
+// ── colors ────────────────────────────────────────────────────────────────────
+
+const AMBER: Color = Color::from_u32(0x00F5A623);
+const GOLD: Color = Color::from_u32(0x00FFCE5C);
+const STAMP_GREEN: Color = Color::from_u32(0x005EC488);
+const CORAL: Color = Color::from_u32(0x00FF6B6B);
+const MUTED: Color = Color::from_u32(0x006A6A6A);
+const DIM_BORDER: Color = Color::from_u32(0x004A4A4A);
+const INDIGO: Color = Color::from_u32(0x007B8FD4);
+const LAVENDER: Color = Color::from_u32(0x00B894E6);
+const BLUE: Color = Color::from_u32(0x005B9BD5);
+// Worker = pop-green (bees collecting nectar); Validator = orange (quality gate)
+const POP_GREEN: Color = Color::from_u32(0x0039FF80);
+const ORANGE: Color = Color::from_u32(0x00FF8C00);
+
+// ── app state ─────────────────────────────────────────────────────────────────
+
+struct App {
+    focused: Panel,
+    scroll: [u16; 4],
+    spinner_frame: usize,
+    hive: state::HiveState,
+    cells: state::CellsState,
+    dance_floor: state::DanceFloorState,
+    signals: state::SignalsState,
+    learnings: state::LearningsState,
+    dance_floor_auto_scroll: bool,
+    show_help: bool,
+    /// Row index of the selected signal in the Signals panel (clamped to
+    /// `0..signals.len()`). Visible when the Signals panel has focus.
+    signal_cursor: usize,
+    /// True when the signal-detail modal is open.
+    show_signal_detail: bool,
+    /// Vertical scroll offset inside the signal-detail modal.
+    signal_modal_scroll: u16,
+    /// Index into learnings, cycled every LEARNING_ROTATION_SECS while
+    /// the Signals panel is in "From the Hive" (no-signals) mode.
+    learning_index: usize,
+    last_learning_rotation: Instant,
+}
+
+const LEARNING_ROTATION_SECS: u64 = 60;
+
+impl App {
+    fn new() -> Self {
+        App {
+            focused: Panel::DanceFloor,
+            scroll: [0; 4],
+            spinner_frame: 0,
+            hive: state::HiveState::load(),
+            cells: state::CellsState::load(),
+            dance_floor: state::DanceFloorState::load(),
+            signals: state::SignalsState::load(),
+            learnings: state::LearningsState::load(),
+            dance_floor_auto_scroll: true,
+            show_help: false,
+            signal_cursor: 0,
+            show_signal_detail: false,
+            signal_modal_scroll: 0,
+            learning_index: 0,
+            last_learning_rotation: Instant::now(),
+        }
+    }
+
+    fn refresh_state(&mut self) {
+        self.hive = state::HiveState::load();
+        self.cells = state::CellsState::load();
+        self.dance_floor = state::DanceFloorState::load();
+        self.signals = state::SignalsState::load();
+        self.learnings = state::LearningsState::load();
+        // Clamp cursor to current signals count — signals come and go as the
+        // conductor files / clears them.
+        let max = self.signals.signals.len().saturating_sub(1);
+        if self.signal_cursor > max {
+            self.signal_cursor = max;
+        }
+    }
+
+    /// Advance the learning quote if it's been long enough since the last
+    /// rotation. Cheap — called every render tick, no-ops until the interval
+    /// elapses.
+    fn maybe_rotate_learning(&mut self) {
+        if self.last_learning_rotation.elapsed().as_secs() >= LEARNING_ROTATION_SECS {
+            self.learning_index = self.learning_index.wrapping_add(1);
+            self.last_learning_rotation = Instant::now();
+        }
+    }
+
+    fn signal_cursor_down(&mut self) {
+        let max = self.signals.signals.len().saturating_sub(1);
+        if self.signal_cursor < max {
+            self.signal_cursor += 1;
+        }
+    }
+
+    fn signal_cursor_up(&mut self) {
+        self.signal_cursor = self.signal_cursor.saturating_sub(1);
+    }
+
+    fn open_signal_detail(&mut self) {
+        if !self.signals.signals.is_empty() {
+            self.show_signal_detail = true;
+            self.signal_modal_scroll = 0;
+        }
+    }
+
+    fn close_signal_detail(&mut self) {
+        self.show_signal_detail = false;
+    }
+
+    #[cfg(test)]
+    fn selected_signal(&self) -> Option<&state::Signal> {
+        self.signals.signals.get(self.signal_cursor)
+    }
+
+    fn tick_spinner(&mut self) {
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+    }
+
+    fn focus_next(&mut self) {
+        self.focused = self.focused.next();
+    }
+
+    fn scroll_down(&mut self) {
+        let idx = self.focused as usize;
+        self.scroll[idx] = self.scroll[idx].saturating_add(1);
+    }
+
+    fn scroll_up(&mut self) {
+        let idx = self.focused as usize;
+        self.scroll[idx] = self.scroll[idx].saturating_sub(1);
+    }
+
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    fn panel_block<'a>(&self, panel: Panel) -> Block<'a> {
+        self.panel_block_titled(panel, panel.label())
+    }
+
+    /// Like `panel_block` but with a caller-provided title. Used by the
+    /// Signals slot when it flips to "From the Hive" mode and needs to
+    /// relabel without gaining a second title segment.
+    fn panel_block_titled<'a>(&self, panel: Panel, title: &'static str) -> Block<'a> {
+        let focused = self.focused == panel;
+        let border_type = if focused {
+            BorderType::Double
+        } else {
+            BorderType::Rounded
+        };
+        let title_style = if focused {
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        let border_style = if focused {
+            Style::default().fg(AMBER)
+        } else {
+            Style::default().fg(DIM_BORDER)
+        };
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(border_type)
+            .border_style(border_style)
+            .title(Span::styled(title, title_style))
+    }
+}
+
+// ── panel renderers ───────────────────────────────────────────────────────────
+
+fn render_hive<'a>(app: &App) -> Text<'a> {
+    let h = &app.hive;
+    let mut lines = Vec::new();
+
+    // Line 1: PID + alive status + uptime (so `loop stop && loop start` is
+    // visible in the panel immediately, before the new daemon's first
+    // heartbeat lands).
+    let uptime_suffix = if h.pid_alive {
+        h.daemon_started_at
+            .map(|start| format!(" · up {}", state::relative_time(start).trim_end_matches(" ago")))
+    } else {
+        None
+    };
+    let pid_line = if let Some(pid) = h.pid {
+        if h.pid_alive {
+            let mut spans = vec![
+                Span::styled("PID: ", Style::default().fg(MUTED)),
+                Span::styled(pid.to_string(), Style::default().fg(GOLD)),
+                Span::styled("  ●  alive", Style::default().fg(STAMP_GREEN)),
+            ];
+            if let Some(up) = uptime_suffix {
+                spans.push(Span::styled(up, Style::default().fg(MUTED)));
+            }
+            Line::from(spans)
+        } else {
+            Line::from(vec![
+                Span::styled("PID: ", Style::default().fg(MUTED)),
+                Span::styled(format!("{} (dead)", pid), Style::default().fg(CORAL)),
+            ])
+        }
+    } else {
+        Line::from(Span::styled("PID: — stopped", Style::default().fg(CORAL)))
+    };
+    lines.push(pid_line);
+
+    // Line 2: spinner + heartbeat number + age
+    let spinner = if h.pid_alive {
+        SPINNER_FRAMES[app.spinner_frame]
+    } else {
+        "·"
+    };
+    let beat_line = if h.heartbeat_number > 0 {
+        let age = h
+            .last_heartbeat_ts
+            .map(state::relative_time)
+            .unwrap_or_else(|| "unknown".to_string());
+        let countdown = h.heartbeat_countdown();
+        // Color tiers: "overdue" means the daemon might be stuck (coral
+        // alarm); "busy cycling" means the daemon is working on non-
+        // heartbeat events and heartbeats are contended (amber "alive");
+        // anything else is the quiet-count-to-next-beat case (muted).
+        let countdown_color = match countdown.as_deref() {
+            Some(s) if s.starts_with("overdue") => CORAL,
+            Some(s) if s.starts_with("busy") => AMBER,
+            Some(_) => MUTED,
+            None => MUTED,
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{} Heartbeat ", spinner),
+                Style::default().fg(if h.pid_alive { AMBER } else { MUTED }),
+            ),
+            Span::styled(
+                format!("#{}", h.heartbeat_number),
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · {}", age), Style::default().fg(MUTED)),
+        ];
+        if let Some(c) = countdown {
+            spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+            spans.push(Span::styled(c, Style::default().fg(countdown_color)));
+        }
+        Line::from(spans)
+    } else {
+        Line::from(vec![
+            Span::styled(format!("{} ", spinner), Style::default().fg(MUTED)),
+            Span::styled("no heartbeats yet", Style::default().fg(MUTED)),
+        ])
+    };
+    lines.push(beat_line);
+
+    // Line 3: interval mode
+    let mode_line = Line::from(vec![
+        Span::styled("Mode: ", Style::default().fg(MUTED)),
+        Span::styled(
+            h.interval_mode.label(),
+            Style::default().fg(match h.interval_mode {
+                state::IntervalMode::Active => STAMP_GREEN,
+                state::IntervalMode::Idle => MUTED,
+                state::IntervalMode::Unknown => MUTED,
+            }),
+        ),
+    ]);
+    lines.push(mode_line);
+
+    Text::from(lines)
+}
+
+/// Build a unicode progress bar with partial-block resolution.
+/// `ratio` is clamped to 0.0..=1.0 for the fill; `width` is the bar length
+/// in cells. Returns the bar string (not bracketed) — bracket at the call site.
+fn progress_bar_str(ratio: f32, width: usize) -> String {
+    // 8 subdivisions per cell using the partial-block set.
+    // ordering: empty → full = ' ' ▏ ▎ ▍ ▌ ▋ ▊ ▉ █
+    let partials = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let clamped = ratio.clamp(0.0, 1.0);
+    let total = (clamped * (width as f32) * 8.0).round() as usize;
+    let full_cells = (total / 8).min(width);
+    let partial_idx = total % 8;
+    let mut s = String::with_capacity(width);
+    for _ in 0..full_cells {
+        s.push('█');
+    }
+    if full_cells < width {
+        s.push(partials[partial_idx]);
+        for _ in (full_cells + 1)..width {
+            s.push(' ');
+        }
+    }
+    s
+}
+
+fn budget_color(current: usize, budget: usize) -> Color {
+    if budget == 0 {
+        return MUTED;
+    }
+    let ratio = current as f32 / budget as f32;
+    if ratio > 1.0 {
+        CORAL
+    } else if ratio >= 0.75 {
+        AMBER
+    } else {
+        STAMP_GREEN
+    }
+}
+
+fn render_cells<'a>(cells: &state::CellsState) -> Text<'a> {
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    let section_header = |label: &'static str, color: Color| {
+        Line::from(vec![
+            Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+    let empty_row = |msg: &'static str| {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(msg, Style::default().fg(MUTED)),
+        ])
+    };
+
+    // ── Active ────────────────────────────────────────────────────────────────
+    lines.push(section_header("Active", AMBER));
+    if cells.active.is_empty() {
+        lines.push(empty_row("— hive idle"));
+    } else {
+        for brief in &cells.active {
+            lines.push(Line::from(vec![
+                Span::styled("  ⬢ ", Style::default().fg(AMBER)),
+                Span::styled(
+                    brief.brief.clone(),
+                    Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let age = brief
+                .dispatched_at
+                .map(state::relative_time)
+                .unwrap_or_else(|| "unknown".to_string());
+
+            // Row 2: branch + cycle progress + age.
+            // Cycle number is the latest validator cycle if one has landed,
+            // else 0 (brief dispatched but no review yet). Budget may be None
+            // for briefs without a parseable `## Budget` section.
+            let current_cycle = brief.latest_validator_cycle.unwrap_or(0);
+            let cycle_label = match brief.cycle_budget {
+                Some(budget) => {
+                    format!("cycle {}/{}", current_cycle, budget)
+                }
+                None => {
+                    // Fall back to the existing event-count display when we
+                    // can't read a budget — honest about its imprecision.
+                    format!("~{} events", brief.cycle_count)
+                }
+            };
+            // Branch name is almost always identical to the brief id in
+            // simple-loop (both follow `brief-NNN-slug`), so it's duplicate
+            // text eating the column. Only show it when it actually differs
+            // — rare, but useful (manual rename, hotfix branch, etc).
+            let mut row_spans = vec![Span::styled("    ", Style::default())];
+            if brief.branch != brief.brief {
+                row_spans.push(Span::styled(
+                    brief.branch.clone(),
+                    Style::default().fg(MUTED),
+                ));
+                row_spans.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
+            }
+            row_spans.push(Span::styled(
+                cycle_label,
+                Style::default().fg(match brief.cycle_budget {
+                    Some(b) => budget_color(current_cycle, b),
+                    None => MUTED,
+                }),
+            ));
+            row_spans.push(Span::styled(
+                format!("  ·  {}", age),
+                Style::default().fg(MUTED),
+            ));
+            lines.push(Line::from(row_spans));
+
+            // Row 3: progress bar — only when a budget is known.
+            if let Some(budget) = brief.cycle_budget {
+                let ratio = if budget == 0 {
+                    0.0
+                } else {
+                    current_cycle as f32 / budget as f32
+                };
+                let color = budget_color(current_cycle, budget);
+                let bar = progress_bar_str(ratio, 12);
+                let pct = (ratio * 100.0).round() as i32;
+                // When past budget, prefix with ⚠ instead of the leading bracket.
+                let (lead, tail) = if ratio > 1.0 {
+                    ("    ⚠ [", "]")
+                } else {
+                    ("    [", "]")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(lead, Style::default().fg(MUTED)),
+                    Span::styled(bar, Style::default().fg(color)),
+                    Span::styled(tail, Style::default().fg(MUTED)),
+                    Span::styled(format!("  {}%", pct), Style::default().fg(color)),
+                ]));
+            }
+
+            if let Some(path) = &brief.worktree_path {
+                let display = if path.len() > 40 {
+                    format!("…{}", &path[path.len() - 39..])
+                } else {
+                    path.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(display, Style::default().fg(MUTED)),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    // ── Pending ───────────────────────────────────────────────────────────────
+    // Partitioned into "Decide" (needs Mattie) and "In flight" (daemon
+    // is working; zero action on her). Glance-level triage: if Decide is
+    // empty, she's not the bottleneck.
+    lines.push(section_header("Pending", CORAL));
+    if cells.pending.is_empty() {
+        lines.push(empty_row("— no briefs awaiting you"));
+    } else {
+        let (decide, in_flight): (Vec<_>, Vec<_>) = cells
+            .pending
+            .iter()
+            .partition(|pb| pb.reason.needs_human());
+
+        let render_pending_row = |lines: &mut Vec<Line<'a>>, pb: &state::PendingBrief| {
+            let (glyph, color) = match pb.reason {
+                state::PendingReason::Escalate => ("!", CORAL),
+                state::PendingReason::PendingMerge => ("✓", STAMP_GREEN),
+                state::PendingReason::PendingDispatch => ("→", BLUE),
+                state::PendingReason::AwaitingEval => ("…", LAVENDER),
+                state::PendingReason::AwaitingReview => ("~", AMBER),
+                state::PendingReason::Unknown => ("?", MUTED),
+            };
+            let age = pb
+                .age
+                .map(state::relative_time)
+                .unwrap_or_else(|| "?".to_string());
+            let mut row = vec![
+                Span::styled(format!("    {} ", glyph), Style::default().fg(color)),
+                Span::styled(
+                    pb.brief.clone(),
+                    Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ·  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    pb.reason.label().to_string(),
+                    Style::default().fg(color),
+                ),
+            ];
+            if let Some(eta) = &pb.estimated_time {
+                row.push(Span::styled("  ·  ", Style::default().fg(MUTED)));
+                row.push(Span::styled(
+                    eta.clone(),
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                ));
+            }
+            row.push(Span::styled(
+                format!("  ·  {}", age),
+                Style::default().fg(MUTED),
+            ));
+            lines.push(Line::from(row));
+
+            if let Some(budget) = pb.cycle_budget {
+                let current = pb.latest_validator_cycle.unwrap_or(0);
+                let ratio = if budget == 0 {
+                    0.0
+                } else {
+                    current as f32 / budget as f32
+                };
+                let bar_color = budget_color(current, budget);
+                let bar = progress_bar_str(ratio, 12);
+                let pct = (ratio * 100.0).round() as i32;
+                let (lead, tail) = if ratio > 1.0 {
+                    ("      ⚠ [", "]")
+                } else {
+                    ("      [", "]")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(lead, Style::default().fg(MUTED)),
+                    Span::styled(bar, Style::default().fg(bar_color)),
+                    Span::styled(tail, Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("  cycle {}/{}  ·  {}%", current, budget, pct),
+                        Style::default().fg(bar_color),
+                    ),
+                ]));
+            }
+        };
+
+        // Decide — show subheader only when non-empty; muted "(clear)"
+        // placeholder when empty so the section still reads as deliberate.
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Decide",
+                Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if decide.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    — clear",
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            for pb in &decide {
+                render_pending_row(&mut lines, pb);
+            }
+        }
+
+        // In flight — only render the subheader when there's content,
+        // since an empty flight-deck isn't actionable signal either way.
+        if !in_flight.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  In flight",
+                    Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            for pb in &in_flight {
+                render_pending_row(&mut lines, pb);
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    // ── Queued ────────────────────────────────────────────────────────────────
+    // Ranked briefs (from goals.md `## Queued next`) lead in priority order
+    // with a muted `N.` indicator. Unranked briefs trail in numeric order,
+    // rendered as before. See `state::discover_queued_briefs`.
+    lines.push(section_header("Queued", BLUE));
+    if cells.queued.is_empty() {
+        lines.push(empty_row("— nothing queued"));
+    } else {
+        // When any brief is ranked, reserve a two-column slot in every row
+        // so ranked/unranked ids stay aligned in a single column. Single
+        // digits get "N." (2 chars); blank for unranked. If every brief is
+        // unranked, skip the slot entirely — panel looks exactly as before.
+        let any_ranked = cells.queued.iter().any(|q| q.priority_rank.is_some());
+        for qb in &cells.queued {
+            let mut spans: Vec<Span> = Vec::with_capacity(4);
+            spans.push(Span::styled("  · ", Style::default().fg(MUTED)));
+            if any_ranked {
+                let tag = match qb.priority_rank {
+                    Some(r) => format!("{:>2}. ", r + 1),
+                    None => "    ".to_string(),
+                };
+                spans.push(Span::styled(tag, Style::default().fg(MUTED)));
+            }
+            spans.push(Span::styled(
+                qb.brief.clone(),
+                Style::default().fg(Color::White),
+            ));
+            if !qb.depends_on_secrets.is_empty() {
+                let missing: Vec<&str> = qb.depends_on_secrets.iter().map(|s| s.as_str()).collect();
+                spans.push(Span::styled(
+                    format!("  [key: {}]", missing.join(",")),
+                    Style::default().fg(AMBER),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    // ── Drafts ────────────────────────────────────────────────────────────────
+    // Only surface the section when there's something to show — Drafts should
+    // be background signal, not visual noise in the common case.
+    if !cells.drafts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Drafts", MUTED));
+        for db in &cells.drafts {
+            let (glyph, tail) = if db.has_index {
+                ("∘", "no symlink")
+            } else {
+                ("∅", "no index.md")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", glyph), Style::default().fg(MUTED)),
+                Span::styled(
+                    db.brief.clone(),
+                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("  ·  {}", tail),
+                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
+    // ── Recent ────────────────────────────────────────────────────────────────
+    // Last N merged briefs, dimmed. Historical context — "wait, did brief-013
+    // actually land?" without opening git log. Count-based (no time filter)
+    // so you always see the most recent merges even on quiet days.
+    if !cells.recently_finished.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Recent", MUTED));
+        for rf in &cells.recently_finished {
+            let age = rf
+                .finished_at
+                .map(state::relative_time)
+                .unwrap_or_else(|| "?".to_string());
+            lines.push(Line::from(vec![
+                Span::styled("  ⬡ ", Style::default().fg(MUTED)),
+                Span::styled(
+                    rf.brief.clone(),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(
+                    format!("  ·  merged {}", age),
+                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
+    Text::from(lines)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut chars = s.chars();
+    let out: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{}…", out)
+    } else {
+        out
+    }
+}
+
+fn actor_color(actor: Option<&str>) -> Color {
+    match actor {
+        Some("conductor") => LAVENDER,
+        Some("daemon") => AMBER,
+        Some("worker") => POP_GREEN,
+        Some("validator") => ORANGE,
+        Some("reviewer") => INDIGO,
+        Some("builder") | Some("coder") | Some("researcher") => GOLD,
+        _ => MUTED,
+    }
+}
+
+fn event_color(event: Option<&str>) -> Color {
+    match event {
+        Some(e) if e.contains("error") || e.contains("escalate") || e.contains("fail") => CORAL,
+        Some(e) if e.contains("merge") || e.contains("approve") || e.contains("stamp") => STAMP_GREEN,
+        Some(e) if e.contains("dispatch") || e.contains("evaluate") => LAVENDER,
+        Some(e) if e.starts_with("heartbeat") || e.contains("noop") => MUTED,
+        _ => Color::White,
+    }
+}
+
+fn signal_glyph_color(signal_type: &state::SignalType) -> (&'static str, Color) {
+    match signal_type {
+        state::SignalType::Escalate => ("◆", CORAL),
+        state::SignalType::PendingMerge => ("◆", STAMP_GREEN),
+        state::SignalType::PendingDispatch => ("◆", BLUE),
+        state::SignalType::Unknown(_) => ("◆", MUTED),
+    }
+}
+
+fn render_dance_floor<'a>(df: &'a state::DanceFloorState) -> (Text<'a>, u16) {
+    if df.events.is_empty() {
+        let t = Text::from(Line::from(Span::styled(
+            "Waiting for the first dance…",
+            Style::default().fg(MUTED),
+        )));
+        return (t, 1);
+    }
+
+    let mut lines: Vec<Line<'a>> = Vec::with_capacity(df.events.len());
+    for ev in &df.events {
+        if ev.malformed {
+            lines.push(Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(MUTED)),
+                Span::styled(
+                    ev.event.as_deref().unwrap_or("[malformed]").to_string(),
+                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                ),
+            ]));
+            continue;
+        }
+
+        let time_str = ev
+            .ts
+            .map(state::relative_time)
+            .unwrap_or_else(|| "?".to_string());
+        let actor_str = ev.actor.as_deref().unwrap_or("?");
+        let ac = actor_color(ev.actor.as_deref());
+        let msg_str = ev.event.as_deref().unwrap_or("?");
+        let msg = truncate_chars(msg_str, 55);
+        let ec = event_color(ev.event.as_deref());
+
+        let mut spans: Vec<Span<'a>> = vec![
+            Span::styled(format!("{:>7}", time_str), Style::default().fg(MUTED)),
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("{:<11}", actor_str), Style::default().fg(ac)),
+            Span::styled("  ", Style::default()),
+        ];
+
+        if let Some(brief) = &ev.brief {
+            let brief_short = truncate_chars(brief, 20);
+            spans.push(Span::styled(
+                format!("{:<21}", brief_short),
+                Style::default().fg(MUTED),
+            ));
+            spans.push(Span::styled("  ", Style::default()));
+        }
+
+        spans.push(Span::styled(msg, Style::default().fg(ec)));
+        lines.push(Line::from(spans));
+    }
+
+    let count = lines.len() as u16;
+    (Text::from(lines), count)
+}
+
+fn render_hive_learning<'a>(learning: Option<&'a str>) -> Text<'a> {
+    match learning {
+        Some(text) => Text::from(vec![
+            Line::from(Span::styled(
+                text.to_string(),
+                Style::default().fg(Color::White),
+            )),
+        ]),
+        None => Text::from(Line::from(Span::styled(
+            "The hive is quiet. No learnings yet — run a brief.",
+            Style::default().fg(MUTED),
+        ))),
+    }
+}
+
+fn render_signals<'a>(
+    sig: &'a state::SignalsState,
+    cursor: usize,
+    show_cursor: bool,
+) -> Text<'a> {
+    if sig.signals.is_empty() {
+        return Text::from(Line::from(Span::styled(
+            "All calm · no distress signals",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    for (i, signal) in sig.signals.iter().enumerate() {
+        let (glyph, color) = signal_glyph_color(&signal.signal_type);
+        let age = signal
+            .ts
+            .map(state::relative_time)
+            .unwrap_or_else(|| "?".to_string());
+        // Prefer brief id; fall back to trigger-based label for brief-less
+        // decision escalates so the row isn't "— —".
+        let brief_str = signal.display_label();
+        let reason_raw = signal.display_reason().unwrap_or("—");
+        let reason_str = truncate_chars(reason_raw, 45);
+
+        let is_cursor = show_cursor && i == cursor;
+        let cursor_prefix: Span<'a> = if is_cursor {
+            Span::styled("› ", Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled("  ", Style::default())
+        };
+        let brief_style = if is_cursor {
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(GOLD)
+        };
+
+        lines.push(Line::from(vec![
+            cursor_prefix,
+            Span::styled(format!("{} ", glyph), Style::default().fg(color)),
+            Span::styled(
+                signal.signal_type.label().to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(brief_str, brief_style),
+            Span::styled("  ·  ", Style::default().fg(MUTED)),
+            Span::styled(reason_str, Style::default().fg(MUTED)),
+            Span::styled(format!("  ({})", age), Style::default().fg(MUTED)),
+        ]));
+    }
+    Text::from(lines)
+}
+
+fn render_signal_modal<'a>(signal: &'a state::Signal) -> Text<'a> {
+    let p = &signal.payload;
+    let (glyph, glyph_color) = signal_glyph_color(&signal.signal_type);
+
+    let section = |s: &'static str| {
+        Line::from(Span::styled(
+            s,
+            Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let blank = || Line::from("");
+    let body_span = |s: String| Span::styled(s, Style::default().fg(Color::White));
+
+    let mut lines: Vec<Line<'a>> = Vec::new();
+
+    // Header — use display_label() so brief-less decisions get their
+    // trigger-based label instead of a bare "—".
+    let age = signal
+        .ts
+        .map(state::relative_time)
+        .unwrap_or_else(|| "?".to_string());
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} ", glyph), Style::default().fg(glyph_color)),
+        Span::styled(
+            signal.signal_type.label().to_string(),
+            Style::default()
+                .fg(glyph_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  ", Style::default().fg(MUTED)),
+        Span::styled(
+            signal.display_label(),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  ", Style::default().fg(MUTED)),
+        Span::styled(age, Style::default().fg(MUTED)),
+    ]));
+    blank();
+
+    // Action required — put this up top for decision escalates so the ask
+    // is the first thing you see.
+    if let Some(ask) = &p.action_required_from_mattie {
+        lines.push(blank());
+        lines.push(section("Action required"));
+        lines.push(Line::from(vec![
+            Span::styled("  → ", Style::default().fg(AMBER)),
+            Span::styled(
+                ask.clone(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    // Summary / trigger
+    if let Some(summary) = &p.summary {
+        lines.push(blank());
+        lines.push(section("Summary"));
+        lines.push(Line::from(body_span(summary.clone())));
+    }
+    if let Some(trigger) = &p.trigger {
+        lines.push(blank());
+        lines.push(section("Trigger"));
+        lines.push(Line::from(body_span(trigger.clone())));
+    }
+
+    // Key facts
+    if !p.key_facts.is_empty() {
+        lines.push(blank());
+        lines.push(section("Key facts"));
+        for fact in &p.key_facts {
+            lines.push(Line::from(vec![
+                Span::styled("  · ", Style::default().fg(MUTED)),
+                body_span(fact.clone()),
+            ]));
+        }
+    }
+
+    // Options
+    if !p.options.is_empty() {
+        lines.push(blank());
+        lines.push(section("Options"));
+        for opt in &p.options {
+            let is_rec = match (&opt.id, &p.scav_recommendation) {
+                (Some(id), Some(rec)) => rec.contains(id.as_str()),
+                _ => false,
+            };
+            let id_str = opt.id.clone().unwrap_or_else(|| "—".to_string());
+            let id_style = if is_rec {
+                Style::default()
+                    .fg(STAMP_GREEN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            };
+            let marker = if is_rec { "  ★ " } else { "  ◇ " };
+
+            // Headline row: id + label (prefer `label`, fall back to `action`)
+            let mut headline_spans = vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if is_rec { STAMP_GREEN } else { MUTED }),
+                ),
+                Span::styled(id_str, id_style),
+            ];
+            if let Some(headline) = opt.headline() {
+                headline_spans.push(Span::styled("  ", Style::default()));
+                headline_spans.push(Span::styled(
+                    headline.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            lines.push(Line::from(headline_spans));
+
+            // brief-008 schema: separate action line already covered by headline fallback.
+            // when_right / cost_if_wrong (brief-008 shape)
+            if let Some(w) = &opt.when_right {
+                lines.push(Line::from(vec![
+                    Span::styled("      when right:     ", Style::default().fg(MUTED)),
+                    Span::styled(w.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+            if let Some(c) = &opt.cost_if_wrong {
+                lines.push(Line::from(vec![
+                    Span::styled("      cost if wrong: ", Style::default().fg(MUTED)),
+                    Span::styled(c.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+
+            // cost / pros / cons (brief-009-followup shape)
+            if let Some(cost) = &opt.cost {
+                lines.push(Line::from(vec![
+                    Span::styled("      cost: ", Style::default().fg(MUTED)),
+                    Span::styled(cost.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+            if let Some(eta) = &opt.estimated_time {
+                lines.push(Line::from(vec![
+                    Span::styled("      time: ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        eta.clone(),
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            if let Some(outcome) = &opt.outcome {
+                lines.push(Line::from(vec![
+                    Span::styled("      outcome: ", Style::default().fg(MUTED)),
+                    Span::styled(outcome.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+            if let Some(wtp) = &opt.when_to_pick {
+                lines.push(Line::from(vec![
+                    Span::styled("      when to pick: ", Style::default().fg(MUTED)),
+                    Span::styled(wtp.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+            if !opt.pros.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "      pros:",
+                    Style::default().fg(STAMP_GREEN),
+                )));
+                for p_item in &opt.pros {
+                    lines.push(Line::from(vec![
+                        Span::styled("        + ", Style::default().fg(STAMP_GREEN)),
+                        body_span(p_item.clone()),
+                    ]));
+                }
+            }
+            if !opt.cons.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "      cons:",
+                    Style::default().fg(CORAL),
+                )));
+                for c_item in &opt.cons {
+                    lines.push(Line::from(vec![
+                        Span::styled("        − ", Style::default().fg(CORAL)),
+                        body_span(c_item.clone()),
+                    ]));
+                }
+            }
+        }
+    }
+
+    // Recommendation
+    if let Some(rec) = &p.scav_recommendation {
+        lines.push(blank());
+        lines.push(section("Recommendation"));
+        lines.push(Line::from(vec![
+            Span::styled("  ★ ", Style::default().fg(STAMP_GREEN)),
+            Span::styled(
+                rec.clone(),
+                Style::default()
+                    .fg(STAMP_GREEN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if let Some(reasoning) = &p.scav_reasoning {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                body_span(reasoning.clone()),
+            ]));
+        }
+    }
+
+    if let Some(guard) = &p.anti_pattern_guardrail {
+        lines.push(blank());
+        lines.push(section("Guardrail"));
+        lines.push(Line::from(vec![
+            Span::styled("  ⚠ ", Style::default().fg(CORAL)),
+            Span::styled(guard.clone(), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    if let Some(feel) = &p.what_you_should_feel {
+        lines.push(blank());
+        lines.push(section("What you should feel"));
+        lines.push(Line::from(body_span(feel.clone())));
+    }
+
+    // Artifacts
+    let has_artifacts = p.evaluation.is_some() || p.screenshot_to_review.is_some();
+    if has_artifacts {
+        lines.push(blank());
+        lines.push(section("Artifacts"));
+        if let Some(e) = &p.evaluation {
+            lines.push(Line::from(vec![
+                Span::styled("  eval:  ", Style::default().fg(MUTED)),
+                Span::styled(e.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+        if let Some(s) = &p.screenshot_to_review {
+            lines.push(Line::from(vec![
+                Span::styled("  shot:  ", Style::default().fg(MUTED)),
+                Span::styled(s.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    // Fallback: if payload is empty, surface the bare reason/note so the modal
+    // isn't just a blank box (pending-merge / pending-dispatch signals land
+    // here).
+    if !p.has_content() {
+        if let Some(reason) = &signal.reason {
+            lines.push(blank());
+            lines.push(section("Reason"));
+            lines.push(Line::from(body_span(reason.clone())));
+        } else {
+            lines.push(blank());
+            lines.push(Line::from(Span::styled(
+                "  (no payload detail — signal file is minimal)",
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
+    lines.push(blank());
+    lines.push(Line::from(Span::styled(
+        "  j/k scroll  ·  esc / enter close",
+        Style::default().fg(MUTED),
+    )));
+
+    Text::from(lines)
+}
+
+// ── help modal ────────────────────────────────────────────────────────────────
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
+fn render_help_modal<'a>() -> Text<'a> {
+    let key = |k: &'static str| Span::styled(k, Style::default().fg(GOLD).add_modifier(Modifier::BOLD));
+    let desc = |d: &'static str| Span::styled(d, Style::default().fg(Color::White));
+    let sep = || Span::styled("  ", Style::default());
+    let section = |s: &'static str| {
+        Line::from(Span::styled(s, Style::default().fg(LAVENDER).add_modifier(Modifier::BOLD)))
+    };
+    let blank = || Line::from("");
+
+    let color_chip = |label: &'static str, color: Color| {
+        Line::from(vec![
+            Span::styled("  ◆ ", Style::default().fg(color)),
+            Span::styled(label, Style::default().fg(MUTED)),
+        ])
+    };
+
+    Text::from(vec![
+        section("  Key Bindings"),
+        blank(),
+        Line::from(vec![key("  q"), sep(), desc("quit")]),
+        Line::from(vec![key("  ctrl-c"), sep(), desc("quit")]),
+        Line::from(vec![key("  tab"), sep(), desc("cycle focus between panels")]),
+        Line::from(vec![key("  j / k"), sep(), desc("scroll panel, or move cursor in Signals")]),
+        Line::from(vec![key("  enter"), sep(), desc("open signal detail (when Signals focused)")]),
+        Line::from(vec![key("  esc"), sep(), desc("close modal")]),
+        Line::from(vec![key("  r"), sep(), desc("force refresh + re-enable dance floor auto-scroll")]),
+        Line::from(vec![key("  ?"), sep(), desc("toggle this help modal")]),
+        blank(),
+        section("  Color Legend"),
+        blank(),
+        color_chip("conductor (dispatch/evaluate)", LAVENDER),
+        color_chip("daemon (heartbeat)", AMBER),
+        color_chip("worker (nectar collector)", POP_GREEN),
+        color_chip("validator (quality gate)", ORANGE),
+        color_chip("builder / coder / researcher", GOLD),
+        color_chip("reviewer", INDIGO),
+        color_chip("errors / escalate", CORAL),
+        color_chip("approve / merge / stamp", STAMP_GREEN),
+        color_chip("pending-dispatch signal", BLUE),
+        color_chip("noop / idle / heartbeat", MUTED),
+        blank(),
+        Line::from(Span::styled("  press ? or esc to close", Style::default().fg(MUTED))),
+    ])
+}
+
+// ── entry point ───────────────────────────────────────────────────────────────
+
+pub fn detect_loop_root() -> bool {
+    Path::new(".loop").exists()
+}
+
+fn main() -> Result<()> {
+    if !Path::new(".loop").exists() {
+        eprintln!("No .loop/ directory found — hive must be run from a project root (run 'loop init' first).");
+        std::process::exit(1);
+    }
+
+    setup_panic_hook();
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let result = run_app(&mut terminal, &cwd);
+
+    restore_terminal();
+    result
+}
+
+// ── render loop ───────────────────────────────────────────────────────────────
+
+fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) -> Result<()> {
+    let mut app = App::new();
+
+    // File-change notifications from .loop/state/
+    let (watch_tx, watch_rx) = mpsc::channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            let _ = watch_tx.send(());
+        }
+    })?;
+    if Path::new(".loop/state").exists() {
+        watcher.watch(Path::new(".loop/state"), RecursiveMode::Recursive)?;
+    }
+    if Path::new(".loop/logs").exists() {
+        watcher.watch(Path::new(".loop/logs"), RecursiveMode::Recursive)?;
+    }
+
+    let mut last_state_refresh = Instant::now();
+
+    loop {
+        app.maybe_rotate_learning();
+
+        let hive_text = render_hive(&app);
+        let cells_text = render_cells(&app.cells);
+        let (dance_floor_text, dance_floor_line_count) = render_dance_floor(&app.dance_floor);
+        // Mode switch: Signals-slot shows actual signals when something
+        // needs attention, cycles "From the Hive" learnings when calm.
+        let signals_slot_calm = app.signals.signals.is_empty();
+        let signals_text = if signals_slot_calm {
+            render_hive_learning(app.learnings.pick(app.learning_index))
+        } else {
+            render_signals(
+                &app.signals,
+                app.signal_cursor,
+                app.focused == Panel::Signals,
+            )
+        };
+        let signals_title = if signals_slot_calm {
+            " From the Hive "
+        } else {
+            Panel::Signals.label()
+        };
+        let df_auto = app.dance_floor_auto_scroll;
+        let df_manual_scroll = app.scroll[Panel::DanceFloor as usize];
+        let show_help = app.show_help;
+        let show_signal_detail = app.show_signal_detail;
+        let signal_modal_scroll = app.signal_modal_scroll;
+        let selected_signal_idx = if show_signal_detail {
+            Some(app.signal_cursor)
+        } else {
+            None
+        };
+
+        terminal.draw(|f| {
+            let area = f.area();
+
+            let outer = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // header
+                    Constraint::Length(7), // top row: hive + signals
+                    Constraint::Min(0),    // main row: cells + dance floor
+                    Constraint::Length(1), // footer
+                ])
+                .split(area);
+
+            // ── header ────────────────────────────────────────────────────────
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "🐝 Beehive",
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  ·  ", Style::default().fg(MUTED)),
+                    Span::styled(cwd, Style::default().fg(MUTED)),
+                ])),
+                outer[0],
+            );
+
+            // ── top row ───────────────────────────────────────────────────────
+            let top_row = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(outer[1]);
+
+            f.render_widget(
+                Paragraph::new(hive_text).block(app.panel_block(Panel::Hive)),
+                top_row[0],
+            );
+
+            f.render_widget(
+                Paragraph::new(signals_text)
+                    .scroll((app.scroll[Panel::Signals as usize], 0))
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .block(app.panel_block_titled(Panel::Signals, signals_title)),
+                top_row[1],
+            );
+
+            // ── main row ──────────────────────────────────────────────────────
+            let main_row = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+                .split(outer[2]);
+
+            f.render_widget(
+                Paragraph::new(cells_text)
+                    .scroll((app.scroll[Panel::Cells as usize], 0))
+                    .block(app.panel_block(Panel::Cells)),
+                main_row[0],
+            );
+
+            // Auto-scroll: pin dance floor to bottom unless user manually scrolled up
+            let df_inner_h = main_row[1].height.saturating_sub(2);
+            let df_scroll = if df_auto {
+                dance_floor_line_count.saturating_sub(df_inner_h)
+            } else {
+                df_manual_scroll
+            };
+
+            f.render_widget(
+                Paragraph::new(dance_floor_text)
+                    .scroll((df_scroll, 0))
+                    .block(app.panel_block(Panel::DanceFloor)),
+                main_row[1],
+            );
+
+            // ── footer ────────────────────────────────────────────────────────
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  q ", Style::default().fg(GOLD)),
+                    Span::styled("quit  ", Style::default().fg(MUTED)),
+                    Span::styled("·  j/k ", Style::default().fg(GOLD)),
+                    Span::styled("scroll/cursor  ", Style::default().fg(MUTED)),
+                    Span::styled("·  tab ", Style::default().fg(GOLD)),
+                    Span::styled("cycle panel  ", Style::default().fg(MUTED)),
+                    Span::styled("·  enter ", Style::default().fg(GOLD)),
+                    Span::styled("open signal  ", Style::default().fg(MUTED)),
+                    Span::styled("·  r ", Style::default().fg(GOLD)),
+                    Span::styled("refresh  ", Style::default().fg(MUTED)),
+                    Span::styled("·  ? ", Style::default().fg(GOLD)),
+                    Span::styled("help", Style::default().fg(MUTED)),
+                ])),
+                outer[3],
+            );
+
+            // ── help modal overlay ────────────────────────────────────────────
+            if show_help {
+                let modal_rect = centered_rect(62, 28, area);
+                f.render_widget(Clear, modal_rect);
+                f.render_widget(
+                    Paragraph::new(render_help_modal())
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Double)
+                                .border_style(Style::default().fg(LAVENDER))
+                                .title(Span::styled(
+                                    " Beehive — Help ",
+                                    Style::default()
+                                        .fg(LAVENDER)
+                                        .add_modifier(Modifier::BOLD),
+                                )),
+                        ),
+                    modal_rect,
+                );
+            }
+
+            // ── signal detail modal overlay ───────────────────────────────────
+            if let Some(idx) = selected_signal_idx {
+                if let Some(signal) = app.signals.signals.get(idx) {
+                    // Consume most of the screen — payloads are verbose.
+                    let w = area.width.saturating_sub(6).min(110);
+                    let h = area.height.saturating_sub(4);
+                    let modal_rect = centered_rect(w, h, area);
+                    f.render_widget(Clear, modal_rect);
+                    let border_color = match signal.signal_type {
+                        state::SignalType::Escalate => CORAL,
+                        state::SignalType::PendingMerge => STAMP_GREEN,
+                        state::SignalType::PendingDispatch => BLUE,
+                        state::SignalType::Unknown(_) => MUTED,
+                    };
+                    f.render_widget(
+                        Paragraph::new(render_signal_modal(signal))
+                            .scroll((signal_modal_scroll, 0))
+                            .wrap(ratatui::widgets::Wrap { trim: false })
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_type(BorderType::Double)
+                                    .border_style(Style::default().fg(border_color))
+                                    .title(Span::styled(
+                                        " Signal detail ",
+                                        Style::default()
+                                            .fg(border_color)
+                                            .add_modifier(Modifier::BOLD),
+                                    )),
+                            ),
+                        modal_rect,
+                    );
+                }
+            }
+        })?;
+
+        // Drain file-change events; flag if any came in
+        let file_changed = watch_rx.try_recv().is_ok();
+        while watch_rx.try_recv().is_ok() {}
+
+        // Refresh state on file change or every 1s (for age strings)
+        if file_changed || last_state_refresh.elapsed() >= Duration::from_secs(1) {
+            app.refresh_state();
+            last_state_refresh = Instant::now();
+        }
+
+        // Advance spinner every poll cycle (~200ms)
+        app.tick_spinner();
+
+        if event::poll(Duration::from_millis(200))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // ── signal detail modal has highest priority ───────────────
+                    if app.show_signal_detail {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Enter => app.close_signal_detail(),
+                            KeyCode::Char('q') => break,
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                break
+                            }
+                            KeyCode::Char('j') => {
+                                app.signal_modal_scroll =
+                                    app.signal_modal_scroll.saturating_add(1);
+                            }
+                            KeyCode::Char('k') => {
+                                app.signal_modal_scroll =
+                                    app.signal_modal_scroll.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
+                    } else if app.show_help {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                break
+                            }
+                            KeyCode::Char('?') | KeyCode::Esc => app.toggle_help(),
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                break
+                            }
+                            KeyCode::Char('?') => app.toggle_help(),
+                            KeyCode::Tab => app.focus_next(),
+                            KeyCode::Enter => {
+                                if app.focused == Panel::Signals {
+                                    app.open_signal_detail();
+                                }
+                            }
+                            KeyCode::Char('j') => {
+                                if app.focused == Panel::Signals {
+                                    app.signal_cursor_down();
+                                } else {
+                                    app.scroll_down();
+                                }
+                            }
+                            KeyCode::Char('k') => {
+                                if app.focused == Panel::Signals {
+                                    app.signal_cursor_up();
+                                } else {
+                                    if app.focused == Panel::DanceFloor {
+                                        app.dance_floor_auto_scroll = false;
+                                    }
+                                    app.scroll_up();
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                app.dance_floor_auto_scroll = true;
+                                app.refresh_state();
+                                last_state_refresh = Instant::now();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_loop_root_in_tmpdir_no_panic() {
+        let original = std::env::current_dir().unwrap();
+        let tmp = std::env::temp_dir();
+        std::env::set_current_dir(&tmp).unwrap();
+        let _ = detect_loop_root();
+        std::env::set_current_dir(&original).unwrap();
+    }
+
+    #[test]
+    fn panel_tab_cycles_all_four() {
+        let mut app = App::new();
+        app.focused = Panel::Hive;
+        app.focus_next();
+        assert_eq!(app.focused, Panel::Signals);
+        app.focus_next();
+        assert_eq!(app.focused, Panel::Cells);
+        app.focus_next();
+        assert_eq!(app.focused, Panel::DanceFloor);
+        app.focus_next();
+        assert_eq!(app.focused, Panel::Hive);
+    }
+
+    #[test]
+    fn scroll_is_per_panel_and_saturates_at_zero() {
+        let mut app = App::new();
+        app.focused = Panel::Cells;
+        app.scroll_down();
+        app.scroll_down();
+        assert_eq!(app.scroll[Panel::Cells as usize], 2);
+        assert_eq!(app.scroll[Panel::DanceFloor as usize], 0);
+        app.focused = Panel::DanceFloor;
+        app.scroll_up();
+        assert_eq!(app.scroll[Panel::DanceFloor as usize], 0);
+    }
+
+    #[test]
+    fn spinner_cycles_through_all_frames() {
+        let mut app = App::new();
+        for _ in 0..SPINNER_FRAMES.len() {
+            app.tick_spinner();
+        }
+        // Back to frame 0 after full cycle
+        assert_eq!(app.spinner_frame, 0);
+    }
+
+    /// Build an App with a synthetic signals list for cursor-behavior tests.
+    fn app_with_signals(n: usize) -> App {
+        let mut app = App::new();
+        // Replace signals with n dummies.
+        let signals: Vec<state::Signal> = (0..n)
+            .map(|i| state::Signal {
+                signal_type: state::SignalType::Escalate,
+                brief: Some(format!("brief-{:03}", i)),
+                reason: None,
+                ts: None,
+                filename: format!("escalate-{}.json", i),
+                payload: state::SignalPayload::default(),
+            })
+            .collect();
+        app.signals = state::SignalsState { signals };
+        app
+    }
+
+    #[test]
+    fn signal_cursor_clamps_at_zero_going_up() {
+        let mut app = app_with_signals(3);
+        app.signal_cursor_up();
+        assert_eq!(app.signal_cursor, 0);
+    }
+
+    #[test]
+    fn signal_cursor_clamps_at_end_going_down() {
+        let mut app = app_with_signals(3);
+        for _ in 0..10 {
+            app.signal_cursor_down();
+        }
+        assert_eq!(app.signal_cursor, 2);
+    }
+
+    #[test]
+    fn open_signal_detail_noop_when_no_signals() {
+        let mut app = app_with_signals(0);
+        app.open_signal_detail();
+        assert!(!app.show_signal_detail);
+    }
+
+    #[test]
+    fn open_signal_detail_opens_when_signals_present() {
+        let mut app = app_with_signals(2);
+        app.open_signal_detail();
+        assert!(app.show_signal_detail);
+        assert_eq!(app.signal_modal_scroll, 0);
+        app.close_signal_detail();
+        assert!(!app.show_signal_detail);
+    }
+
+    #[test]
+    fn progress_bar_boundary_cases() {
+        // Empty bar
+        assert_eq!(progress_bar_str(0.0, 10), "          ");
+        // Full bar
+        assert_eq!(progress_bar_str(1.0, 10), "██████████");
+        // Overflow clamps to full
+        assert_eq!(progress_bar_str(1.5, 10), "██████████");
+        // 50% of 10 cells = 5 full, 5 empty
+        assert_eq!(progress_bar_str(0.5, 10), "█████     ");
+        // Partial block rendered for fractional fill (25% of 8 = 2 full + one ▎)
+        let bar = progress_bar_str(0.25, 8);
+        assert!(bar.starts_with("██"), "got: {:?}", bar);
+        assert_eq!(bar.chars().count(), 8, "width should be preserved");
+    }
+
+    #[test]
+    fn budget_color_matches_thresholds() {
+        // 0% → green
+        assert_eq!(budget_color(0, 10), STAMP_GREEN);
+        // 50% → green
+        assert_eq!(budget_color(5, 10), STAMP_GREEN);
+        // 75% → amber
+        assert_eq!(budget_color(8, 10), AMBER);
+        // 100% → amber (still at cap)
+        assert_eq!(budget_color(10, 10), AMBER);
+        // Over budget → coral
+        assert_eq!(budget_color(11, 10), CORAL);
+    }
+
+    #[test]
+    fn selected_signal_follows_cursor() {
+        let mut app = app_with_signals(3);
+        app.signal_cursor_down();
+        let sel = app.selected_signal().unwrap();
+        assert_eq!(sel.brief.as_deref(), Some("brief-001"));
+    }
+}

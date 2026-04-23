@@ -170,6 +170,22 @@ chmod +x "$INSTALL_DIR/bin-loop"
 # Symlink to PATH
 ln -sf "$INSTALL_DIR/bin-loop" "$BIN_DIR/loop"
 
+# ── Build and install hive TUI (requires Rust/cargo) ──
+if [ -d "$SCRIPT_DIR/crates/hive" ]; then
+    CARGO="${CARGO_HOME:-$HOME/.cargo}/bin/cargo"
+    if [ -x "$CARGO" ] || command -v cargo >/dev/null 2>&1; then
+        CARGO="${CARGO:-cargo}"
+        echo "  Building hive TUI..."
+        "$CARGO" build --release --manifest-path "$SCRIPT_DIR/crates/hive/Cargo.toml" --quiet
+        cp "$SCRIPT_DIR/target/release/hive" "$BIN_DIR/hive"
+        chmod +x "$BIN_DIR/hive"
+        echo "  Binary: $BIN_DIR/hive"
+    else
+        echo "  Warning: cargo not found — hive TUI not installed."
+        echo "  Install Rust (https://rustup.rs/) then re-run install.sh."
+    fi
+fi
+
 echo ""
 echo "Installed."
 echo ""
