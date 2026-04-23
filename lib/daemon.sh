@@ -346,7 +346,7 @@ with open('$PROGRESS_FILE', 'w') as f:
     brief_file_path=$(python3 -c "import json; print(json.load(open('$PROGRESS_FILE')).get('brief_file', ''))" 2>/dev/null)
     if [ -n "$brief_file_path" ] && [ -f "$WORKTREE_DIR/$brief_file_path" ]; then
         local brief_model
-        brief_model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        brief_model=$(grep -m1 '^\*\*Model:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null | sed 's/.*\*\*Model:\*\*[[:space:]]*//' | awk '{print $1}' | cut -d'(' -f1 | cut -d',' -f1 | tr '[:upper:]' '[:lower:]')
         if [ -n "$brief_model" ]; then
             WORKER_MODEL="$brief_model"
             if [ "$brief_model" != "sonnet" ]; then
@@ -773,8 +773,9 @@ except: pass
         if [ -n "$active_entry" ]; then
             # Read auto-merge flag from brief frontmatter on the brief branch
             AM_FLAG=$(python3 -c "
-import json, subprocess, re, sys
-RE = re.compile(r'^\s*\*\*Auto-merge:\*\*\s*(\S+)', re.IGNORECASE)
+import json, sys
+sys.path.insert(0, '$DAEMON_LIB_DIR')
+from assess import git_read_follow, AUTO_MERGE_LINE_RE
 try:
     with open('$RUNNING_FILE') as f:
         rc = json.load(f)
@@ -786,11 +787,10 @@ try:
         if not branch or not brief_file:
             break
         for ref in [branch, '$GIT_REMOTE/' + branch]:
-            r = subprocess.run(['git', '-C', '$PROJECT_DIR', 'show', f'{ref}:{brief_file}'],
-                capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                for line in r.stdout.splitlines():
-                    m = RE.match(line)
+            content = git_read_follow('$PROJECT_DIR', ref, brief_file)
+            if content is not None:
+                for line in content.splitlines():
+                    m = AUTO_MERGE_LINE_RE.match(line)
                     if m:
                         val = m.group(1).strip().lower().strip('\"').strip(\"'\")
                         print('true' if val == 'true' else 'false')

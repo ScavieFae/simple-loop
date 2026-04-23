@@ -952,15 +952,16 @@ fi  # startup_repair.py exists (test 17)
 echo ""
 echo "=== Test 18: Model-field parser — correct extraction from **Model:** frontmatter ==="
 
-# Helper mirrors daemon.sh line 349's CURRENT pipeline (tr -d '[:space:]').
-# Cases (c) and (d) will FAIL until task-7 updates daemon.sh to use
-# awk '{print $1}' | cut -d'(' -f1 | cut -d',' -f1 instead.
+# Helper mirrors daemon.sh line 349's fixed pipeline (task-7).
+# Takes first whitespace-separated token, strips any trailing ( or , suffix.
 _parse_model() {
     local file="$1"
     local result
     result=$(grep -m1 '^\*\*Model:\*\*' "$file" 2>/dev/null \
         | sed 's/.*\*\*Model:\*\*[[:space:]]*//' \
-        | tr -d '[:space:]' \
+        | awk '{print $1}' \
+        | cut -d'(' -f1 \
+        | cut -d',' -f1 \
         | tr '[:upper:]' '[:lower:]')
     echo "${result:-sonnet}"
 }
@@ -973,14 +974,14 @@ assert_eq "model-field (a): opus → opus" "$(_parse_model "$SCRATCH/brief-model
 printf '**Model:** sonnet\n' > "$SCRATCH/brief-model-b.md"
 assert_eq "model-field (b): sonnet → sonnet" "$(_parse_model "$SCRATCH/brief-model-b.md")" "sonnet"
 
-# (c) opus with parenthetical — FAILS until task-7 parser fix
+# (c) opus with parenthetical
 printf '**Model:** opus (research + adapter-design cycle)\n' > "$SCRATCH/brief-model-c.md"
-assert_eq "model-field (c): 'opus (comment)' → opus [fails until task-7]" \
+assert_eq "model-field (c): 'opus (comment)' → opus" \
     "$(_parse_model "$SCRATCH/brief-model-c.md")" "opus"
 
-# (d) comma-separated multi-model — first wins — FAILS until task-7 parser fix
+# (d) comma-separated multi-model — first wins
 printf '**Model:** opus, sonnet\n' > "$SCRATCH/brief-model-d.md"
-assert_eq "model-field (d): 'opus, sonnet' → opus [fails until task-7]" \
+assert_eq "model-field (d): 'opus, sonnet' → opus" \
     "$(_parse_model "$SCRATCH/brief-model-d.md")" "opus"
 
 # (e) haiku
