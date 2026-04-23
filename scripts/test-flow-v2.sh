@@ -1267,6 +1267,151 @@ assert_eq "repeated tick after conflict: merge() returns False cleanly (no retry
 
 rm -rf "$MERGE_SCRATCH"
 
+# ── Tests 25-28 (brief-021): human_queue_summary — three-source merge ────────
+
+echo ""
+echo "=== Tests 25-28: human_queue_summary — 'Awaiting you' section sources ==="
+
+HQS_SCRATCH=$(mktemp -d)
+mkdir -p "$HQS_SCRATCH/.loop/state/signals"
+
+init_hqs_running() {
+    python3 -c "import json; json.dump($1, open('$HQS_SCRATCH/.loop/state/running.json','w'), indent=2)"
+}
+
+# ── Test 25: empty state → empty list (section suppressed) ───────────────────
+
+echo ""
+echo "=== Test 25: human_queue_summary — empty state returns empty list ==="
+
+init_hqs_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': []
+}"
+
+HQS_LEN=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, human_queue_summary
+paths = init_paths('$HQS_SCRATCH')
+items = human_queue_summary(paths)
+print(len(items))
+" 2>/dev/null)
+assert_eq "human_queue_summary: empty state returns empty list (section suppressed)" \
+    "$HQS_LEN" "0"
+
+# ── Test 26: one awaiting_review entry → reason + approve hint ───────────────
+
+echo ""
+echo "=== Test 26: human_queue_summary — one awaiting_review entry ==="
+
+init_hqs_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [{'brief': 'brief-026-ar', 'branch': 'brief-026-ar', 'reason': 'Held for live smoke test on M5'}],
+    'history': []
+}"
+
+HQS_AR=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, human_queue_summary
+paths = init_paths('$HQS_SCRATCH')
+items = human_queue_summary(paths)
+if items:
+    i = items[0]
+    print(f\"{i['source']}|{i['brief_id']}|{i['action_hint']}\")
+else:
+    print('empty')
+" 2>/dev/null)
+assert_eq "human_queue_summary: awaiting_review source field" \
+    "$(echo "$HQS_AR" | cut -d'|' -f1)" "awaiting_review"
+assert_eq "human_queue_summary: awaiting_review brief_id" \
+    "$(echo "$HQS_AR" | cut -d'|' -f2)" "brief-026-ar"
+assert_eq "human_queue_summary: awaiting_review action_hint is loop approve" \
+    "$(echo "$HQS_AR" | cut -d'|' -f3)" "loop approve brief-026-ar"
+
+# Reset awaiting_review for test 27
+init_hqs_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': []
+}"
+
+# ── Test 27: one live escalate.json → category + summary; archived excluded ──
+
+echo ""
+echo "=== Test 27: human_queue_summary — one live escalate.json (archived suffix excluded) ==="
+
+python3 -c "
+import json
+json.dump({'brief': 'brief-027-esc', 'category': 'human-in-the-loop-dependency', 'summary': 'Auth token missing for CF deploy step'}, open('$HQS_SCRATCH/.loop/state/signals/escalate.json','w'))
+json.dump({'brief': 'brief-OLD', 'category': 'push_failed', 'summary': 'Old archived escalation'}, open('$HQS_SCRATCH/.loop/state/signals/escalate.json.resolved-by-hold-2026-04-23','w'))
+"
+
+HQS_ESC=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, human_queue_summary
+paths = init_paths('$HQS_SCRATCH')
+items = human_queue_summary(paths)
+if items:
+    i = items[0]
+    print(f\"{i['source']}|{i['brief_id']}|{len(items)}\")
+else:
+    print('empty')
+" 2>/dev/null)
+assert_eq "human_queue_summary: escalate source field" \
+    "$(echo "$HQS_ESC" | cut -d'|' -f1)" "escalate"
+assert_eq "human_queue_summary: escalate brief_id from signal file" \
+    "$(echo "$HQS_ESC" | cut -d'|' -f2)" "brief-027-esc"
+assert_eq "human_queue_summary: archived-suffix file excluded (count=1 not 2)" \
+    "$(echo "$HQS_ESC" | cut -d'|' -f3)" "1"
+
+rm -f "$HQS_SCRATCH/.loop/state/signals/escalate.json"
+rm -f "$HQS_SCRATCH/.loop/state/signals/escalate.json.resolved-by-hold-2026-04-23"
+
+# ── Test 28: credential-gated brief in goals.md → gating keyword ─────────────
+
+echo ""
+echo "=== Test 28: human_queue_summary — credential-gated brief in goals.md ==="
+
+cat > "$HQS_SCRATCH/.loop/state/goals.md" <<'GOALSEOF'
+## Credential-gated
+
+- brief-028-cg-test: Wiki deploy. **Requires:** CF API token + allowlist emails
+GOALSEOF
+
+HQS_CG=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, human_queue_summary
+paths = init_paths('$HQS_SCRATCH')
+items = human_queue_summary(paths)
+if items:
+    i = items[0]
+    print(f\"{i['source']}|{i['brief_id']}|{i['summary']}\")
+else:
+    print('empty')
+" 2>/dev/null)
+assert_eq "human_queue_summary: credential-gated source field" \
+    "$(echo "$HQS_CG" | cut -d'|' -f1)" "credential-gated"
+assert_eq "human_queue_summary: credential-gated brief_id" \
+    "$(echo "$HQS_CG" | cut -d'|' -f2)" "brief-028-cg-test"
+HQS_CG_KW="$(echo "$HQS_CG" | cut -d'|' -f3)"
+case "$HQS_CG_KW" in
+    CF*|cf*) pass "human_queue_summary: credential-gated keyword extracted (starts with CF)" ;;
+    *) fail "human_queue_summary: credential-gated keyword — got '$HQS_CG_KW'" ;;
+esac
+
+rm -rf "$HQS_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
