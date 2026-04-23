@@ -435,9 +435,38 @@ def merge(paths):
 
     if git(project_dir, "show-ref", "--verify", "--quiet",
            f"refs/heads/{branch}", check=False).returncode == 0:
-        git(project_dir, "merge", branch, "--no-ff", "-m", merge_msg)
+        merge_result = git(project_dir, "merge", branch, "--no-ff", "-m", merge_msg, check=False)
     else:
-        git(project_dir, "merge", f"{remote}/{branch}", "--no-ff", "-m", merge_msg)
+        merge_result = git(project_dir, "merge", f"{remote}/{branch}", "--no-ff", "-m", merge_msg, check=False)
+
+    if merge_result.returncode != 0:
+        combined = merge_result.stdout + merge_result.stderr
+        is_conflict = merge_result.returncode in (1, 128) and (
+            "CONFLICT" in combined or "Automatic merge failed" in combined
+            or "unmerged" in combined.lower()
+        )
+        if is_conflict:
+            git(project_dir, "merge", "--abort", check=False)
+            rc = load_running(paths)
+            entry = next(
+                (e for e in rc.get("pending_merges", []) if e.get("brief") == brief),
+                {"brief": brief, "branch": branch},
+            )
+            entry["conflict_note"] = "merge conflict — human resolution required"
+            rc["pending_merges"] = [e for e in rc.get("pending_merges", []) if e.get("brief") != brief]
+            rc.setdefault("awaiting_review", []).append(entry)
+            save_running(paths, rc)
+            os.remove(paths["pending_merge"])
+            log_action(paths, "merge_conflict_abort", {
+                "brief": brief, "branch": branch,
+                "reason": "merge_conflict_routed_to_awaiting_review",
+            })
+            print(f"Merge conflict on {brief}: aborted, routed to awaiting_review", file=sys.stderr)
+            return False
+        raise subprocess.CalledProcessError(
+            merge_result.returncode, f"git merge {branch}",
+            output=merge_result.stdout, stderr=merge_result.stderr,
+        )
 
     # Remove worktree before deleting branch
     remove_worktree(paths, brief)

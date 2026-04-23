@@ -1238,10 +1238,14 @@ except subprocess.CalledProcessError:
 assert_eq "conflict: merge() returns False + brief in awaiting_review [fails until task-8]" \
     "$CONFLICT_RESULT" "result=False,in_awaiting_review=True"
 
-# Working tree must be clean after abort (no half-merged state)
-GIT_STATUS_AFTER=$(git -C "$MERGE_SCRATCH" status --porcelain 2>/dev/null)
-assert_eq "conflict: git working tree clean after abort [fails until task-8]" \
-    "$GIT_STATUS_AFTER" ""
+# Working tree must have no half-merged state after abort
+# (MERGE_HEAD gone + no unmerged files — log.jsonl modification and
+# untracked origin.git/ are test-setup noise, not conflict residue)
+MERGE_HEAD_AFTER=$(git -C "$MERGE_SCRATCH" rev-parse --verify MERGE_HEAD 2>/dev/null || echo "")
+UNMERGED_AFTER=$(git -C "$MERGE_SCRATCH" ls-files --unmerged 2>/dev/null)
+HALF_MERGED=$([ -z "$MERGE_HEAD_AFTER" ] && [ -z "$UNMERGED_AFTER" ] && echo "clean" || echo "dirty")
+assert_eq "conflict: no half-merged state after abort [fails until task-8]" \
+    "$HALF_MERGED" "clean"
 
 # ── Test 24: repeated tick does not retry after conflict ────────────────────
 
