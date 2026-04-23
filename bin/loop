@@ -90,9 +90,93 @@ pid_alive() {
 # ── init ─────────────────────────────────────────────────────
 
 cmd_init() {
+    # Flag parsing
+    local _init_mode="interactive"
+    local _dry_run=false
+
+    for _arg in "$@"; do
+        case "$_arg" in
+            --minimal)   _init_mode="minimal" ;;
+            --wiki-full) _init_mode="wiki-full" ;;
+            --dry-run)   _dry_run=true ;;
+            *) die "Unknown flag: $_arg" ;;
+        esac
+    done
+
     if [ -d ".loop" ]; then
-        die ".loop/ already exists in this directory."
+        die "Simple-loop already initialized here. Use 'loop init --force' to overwrite."
     fi
+
+    # ── Non-interactive modes (--minimal, --wiki-full) ────────
+    if [ "$_init_mode" = "minimal" ] || [ "$_init_mode" = "wiki-full" ]; then
+        local _project_name
+        _project_name="$(basename "$PWD")"
+
+        if [ "$_dry_run" = true ]; then
+            echo "Would create (dry-run — no files written):"
+            echo "  .loop/state/running.json"
+            echo "  .loop/state/goals.md"
+            echo "  .loop/state/stewardship-log.md"
+            echo "  .loop/briefs/README.md"
+            echo "  .loop/signals/"
+            echo "  .loop/config.json"
+            return 0
+        fi
+
+        mkdir -p .loop/state .loop/briefs .loop/signals
+
+        cat > .loop/state/running.json <<'JSON'
+{"active": [], "completed_pending_eval": [], "pending_merges": [], "awaiting_review": [], "history": []}
+JSON
+
+        cat > .loop/state/goals.md <<'MD'
+# Goals
+
+## Awaiting Mattie (not queued)
+
+## Credential-gated — NOT dispatchable
+
+## Queued next
+MD
+
+        cat > .loop/state/stewardship-log.md <<'MD'
+# Stewardship Log
+MD
+
+        cat > .loop/briefs/README.md <<'MD'
+# Briefs
+
+Brief files here are symlinks into `wiki/briefs/cards/<brief-id>/index.md`.
+
+To add a brief:
+```
+ln -s ../../wiki/briefs/cards/<brief-id>/index.md .loop/briefs/<brief-id>.md
+```
+MD
+
+        cat > .loop/config.json <<CJSON
+{
+  "project_name": "$_project_name",
+  "version": "0.2.0",
+  "heartbeat_interval": 300,
+  "worker_cooldown": 30,
+  "max_iterations": 20,
+  "git": {
+    "remote": "origin",
+    "main_branch": "main"
+  },
+  "modules": [],
+  "beehive": {}
+}
+CJSON
+
+        echo ""
+        echo "Simple-loop scaffolded in \`$PWD\`. Next: create your first brief in \`wiki/briefs/cards/\` (or wherever your cards live)."
+        echo ""
+        return 0
+    fi
+
+    # ── Interactive mode (default, no flags) ──────────────────
 
     echo ""
     echo "╔══════════════════════════════════════╗"
