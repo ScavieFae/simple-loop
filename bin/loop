@@ -535,6 +535,53 @@ TOML
 
     # ── Interactive mode (default, no flags) ──────────────────
 
+    # Brief-014 fix 3: require gh CLI + `gh auth setup-git` before the daemon
+    # ever starts. Daemon pushes survive macOS keychain locks only when gh is
+    # the credential helper. Silent auth failures were the root cause of the
+    # brief-013 merge sitting unpushed for ~14h on 2026-04-22.
+    if ! command -v gh >/dev/null 2>&1; then
+        cat >&2 <<'GHMSG'
+Error: GitHub CLI (gh) is required but not installed.
+
+Simple Loop uses `gh auth setup-git` as its git credential helper so the
+daemon can push without losing auth when the machine sleeps.
+
+Install:  https://cli.github.com/
+Then:     gh auth login
+          gh auth setup-git
+          loop init
+GHMSG
+        exit 1
+    fi
+
+    if ! gh auth status >/dev/null 2>&1; then
+        cat >&2 <<'GHMSG'
+Error: gh CLI is installed but not authenticated.
+
+Run:
+  gh auth login
+  gh auth setup-git
+
+Then re-run `loop init`.
+
+Why: daemon pushes run outside your terminal session. macOS keychain
+unlock does not propagate. gh's stored token survives sleep + keychain
+lock. Without it, merge commits sit unpushed until you intervene.
+GHMSG
+        exit 1
+    fi
+
+    # Soft warning on excess token scopes — not fatal. `workflow` and
+    # `admin:*` are not needed for daemon operation. User can shrink with:
+    #   gh auth refresh --hostname github.com --remove-scopes workflow
+    local gh_scopes
+    gh_scopes=$(gh auth status 2>&1 | grep -o 'Token scopes:.*' || echo "")
+    if echo "$gh_scopes" | grep -qE '\bworkflow\b|\badmin:'; then
+        echo "  Warning: gh token has extra scopes (workflow / admin:*) not needed by the daemon."
+        echo "           Shrink with:  gh auth refresh --hostname github.com --remove-scopes workflow"
+        echo ""
+    fi
+
     echo ""
     echo "╔══════════════════════════════════════╗"
     echo "║       Simple Loop — Setup            ║"
@@ -711,17 +758,20 @@ CJSON
     done
 
     # Add logs and worktrees to gitignore
+    # Brief-014: heartbeat.json is machine-local ephemeral — never commit.
     if [ -f ".gitignore" ]; then
         if ! grep -q '\.loop/logs' .gitignore 2>/dev/null; then
             echo "" >> .gitignore
             echo "# Simple Loop" >> .gitignore
             echo ".loop/logs/" >> .gitignore
             echo ".loop/worktrees/" >> .gitignore
-        elif ! grep -q '\.loop/worktrees' .gitignore 2>/dev/null; then
-            echo ".loop/worktrees/" >> .gitignore
+            echo ".loop/state/heartbeat.json" >> .gitignore
+        else
+            grep -q '\.loop/worktrees' .gitignore || echo ".loop/worktrees/" >> .gitignore
+            grep -q '\.loop/state/heartbeat.json' .gitignore || echo ".loop/state/heartbeat.json" >> .gitignore
         fi
     elif [ "$is_git" = true ]; then
-        printf ".loop/logs/\n.loop/worktrees/\n" > .gitignore
+        printf ".loop/logs/\n.loop/worktrees/\n.loop/state/heartbeat.json\n" > .gitignore
     fi
 
     # Check Agent Teams

@@ -30,6 +30,45 @@ If you used `--link`, your installed copy *is* your repo checkout — `git pull`
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI, authenticated
 - Python 3.8+, Git, Bash
+- [GitHub CLI (`gh`)](https://cli.github.com/), authenticated, configured as git credential helper:
+  ```bash
+  gh auth login
+  gh auth setup-git
+  ```
+  Why: the daemon pushes commits from outside your terminal session. macOS
+  keychain unlock doesn't propagate to background processes. `gh`'s stored
+  token survives machine sleep and keychain lock. `loop init` refuses to
+  proceed until `gh auth status` reports authenticated. Without this,
+  daemon merge commits silently fail to push — observed on 2026-04-22 when
+  a merge sat unpushed for ~14h until a manual push.
+
+  Minimal token scopes for daemon operation: `repo` (required) + `read:org`
+  (required for private-org repos). `workflow` and `admin:*` scopes are
+  unnecessary — shrink with:
+  ```bash
+  gh auth refresh --hostname github.com --remove-scopes workflow
+  ```
+  (browser OAuth prompt; one-time). `loop init` emits a soft warning when
+  extra scopes are detected.
+
+### Daemon health: heartbeat
+
+Every daemon tick writes `.loop/state/heartbeat.json` with `{ts, pid,
+last_event}`. `loop status` reports **HUNG** when the heartbeat is older
+than 2× `HEARTBEAT_INTERVAL` (default ~10 min stale-threshold at the 300s
+tick interval, configurable in `.loop/config.sh`). Process-alive ≠
+loop-healthy: a frozen main loop inside a live process is exactly the
+failure mode heartbeat detects. External watchers can `jq .ts
+.loop/state/heartbeat.json` for the same signal.
+
+If `loop status` reports HUNG:
+```bash
+loop stop && loop start
+```
+Restart is cheap; the daemon picks up from disk state (`running.json`,
+`pending-*.json`). Brief-014 2026-04-21→22 postmortem: an 11h frozen
+daemon looked alive to `ps` but silent in the log; heartbeat closes
+that gap.
 
 ## Install into a new project
 

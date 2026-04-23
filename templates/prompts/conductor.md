@@ -33,14 +33,24 @@ What's the situation?
 
 ## Step 4: Dispatch (if no active brief)
 
-If there's a brief file in `.loop/briefs/` ready to go:
-1. Write `.loop/state/pending-dispatch.json` with:
-   ```json
-   {"brief": "brief-NNN-slug", "branch": "brief-NNN-slug",
-    "brief_file": ".loop/briefs/brief-NNN-slug.md",
-    "notes": "Brief description"}
-   ```
-   The daemon handles branch creation, progress init, and state updates.
+**Any file in `.loop/briefs/` is a dispatchable brief, regardless of naming pattern.** The queue order in `goals.md` determines priority. Supported naming conventions include but are not limited to:
+
+- `brief-NNN-slug` — feature/scaffolding/plumbing briefs (most common)
+- `audit-YYYY-MM-DD-NNN` — post-session audit briefs (scan commit range for drift)
+- `capture-YYYY-MM-DD-NNN` — post-session capture briefs (route observations to persistent homes)
+- any other convention documented in `goals.md` or the repo's brief template
+
+**The filter is state, not name:** enumerate `.loop/briefs/*.md`, exclude any brief already in `running.json` under `active` / `completed_pending_eval` / `pending_merges` / `awaiting_review` / `history`. The remainder are candidates. Pick the one that matches the `goals.md` queue head. If the queue lists a brief you don't find a file for, log and move on — don't stall.
+
+Write `.loop/state/pending-dispatch.json` using the brief's actual ID (file basename without `.md`) as both `brief` and `branch`:
+
+```json
+{"brief": "audit-2026-04-22-01", "branch": "audit-2026-04-22-01",
+ "brief_file": ".loop/briefs/audit-2026-04-22-01.md",
+ "notes": "Brief description"}
+```
+
+The daemon handles branch creation, progress init, and state updates.
 
 **Do NOT create branches or modify running.json directly.** The daemon processes queue files.
 
