@@ -130,6 +130,66 @@ def backfill_history(running: dict, project_dir: str, card_dirs: list,
     return result_running, actions
 
 
+def clean_stale_queues(running: dict, state_dir: str, project_dir: str,
+                       main_branch: str = "main") -> tuple:
+    """Remove pending-merge.json / pending-dispatch.json if their brief is already merged.
+
+    Reads each queue file, looks up the brief ID in git log --merges. If a merge
+    commit exists for that brief, the queue file is stale — remove it and log with
+    reason: queue_file_stale_post_merge. Does NOT touch signals/*.json.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log", "--merges", "--format=%s", main_branch],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        raw = result.stdout.strip()
+        merge_subjects = raw.split("\n") if raw else []
+    except subprocess.CalledProcessError:
+        return running, []
+
+    merged_ids: set = set()
+    for subject in merge_subjects:
+        match = _BRIEF_ID_RE.search(subject)
+        if match:
+            merged_ids.add(match.group(1))
+
+    if not merged_ids:
+        return running, []
+
+    queue_files = [
+        os.path.join(state_dir, "pending-merge.json"),
+        os.path.join(state_dir, "pending-dispatch.json"),
+    ]
+
+    actions = []
+    for qf in queue_files:
+        if not os.path.exists(qf):
+            continue
+        try:
+            with open(qf) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        brief_id = data.get("brief")
+        if brief_id and brief_id in merged_ids:
+            try:
+                os.remove(qf)
+                actions.append({
+                    "reason": "queue_file_stale_post_merge",
+                    "brief": brief_id,
+                    "file": os.path.basename(qf),
+                })
+            except OSError:
+                pass
+
+    return running, actions
+
+
 def run_startup_repair(paths: dict, project_dir: str) -> list:
     """Orchestrator: run all repair steps, save if any changes, log all actions.
 
@@ -158,7 +218,9 @@ def run_startup_repair(paths: dict, project_dir: str) -> list:
     running, actions = backfill_history(running, project_dir, card_dirs, main_branch)
     all_actions.extend(actions)
 
-    # C. Clean stale queue files (added in task 4)
+    # C. Clean stale queue files
+    running, actions = clean_stale_queues(running, paths["state_dir"], project_dir, main_branch)
+    all_actions.extend(actions)
 
     for action in all_actions:
         log_action(paths, "startup_repair", action)

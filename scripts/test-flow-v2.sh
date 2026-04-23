@@ -799,6 +799,93 @@ assert_eq "history[0].brief is brief-BF-test (moved from active)" "$HIST_BRIEF" 
 
 fi  # startup_repair.py exists (test 15)
 
+# ── Test 16: clean_stale_queues removes stale pending-merge.json ─────────────
+
+echo ""
+echo "=== Test 16: clean_stale_queues — stale pending-merge.json for merged brief is cleared ==="
+
+if [ ! -f "$STARTUP_REPAIR" ]; then
+    fail "startup_repair.py not found — skipping test 16"
+else
+
+# brief-BF-test was merged in test 14 — reuse that commit.
+# Seed running.json clean so backfill_history doesn't fire on it again.
+write_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [{'brief': 'brief-BF-test', 'branch': 'brief-BF-test', 'merged_at': '2026-04-22T00:00:00Z', 'merge_sha': 'abc123', 'reason': 'backfilled_from_git'}]
+}"
+
+> "$SCRATCH/.loop/state/log.jsonl"
+
+# Write a stale pending-merge.json referencing brief-BF-test (already merged)
+python3 -c "
+import json
+json.dump({'brief': 'brief-BF-test', 'branch': 'brief-BF-test', 'auto_merge': True}, open('$SCRATCH/.loop/state/pending-merge.json','w'))
+"
+
+ACTION_COUNT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from startup_repair import run_startup_repair
+from actions import init_paths
+paths = init_paths('$SCRATCH')
+actions = run_startup_repair(paths, '$SCRATCH')
+print(len(actions))
+" 2>/dev/null)
+assert_eq "clean_stale_queues returns 1 action for stale pending-merge.json" "$ACTION_COUNT" "1"
+
+# File must be removed
+if [ ! -f "$SCRATCH/.loop/state/pending-merge.json" ]; then
+    pass "pending-merge.json was removed for merged brief"
+else
+    fail "pending-merge.json still present after cleanup"
+fi
+
+# log.jsonl must have queue_file_stale_post_merge event
+LOG_HAS_STALE=$(python3 -c "
+with open('$SCRATCH/.loop/state/log.jsonl') as f:
+    lines = f.readlines()
+import json
+for line in reversed(lines):
+    d = json.loads(line)
+    if d.get('reason') == 'queue_file_stale_post_merge':
+        print('YES')
+        break
+else:
+    print('NO')
+" 2>/dev/null)
+assert_eq "log.jsonl has queue_file_stale_post_merge event" "$LOG_HAS_STALE" "YES"
+
+# Non-stale case: pending-merge.json for an UNmerged brief must NOT be removed
+python3 -c "
+import json
+json.dump({'brief': 'brief-NOT-merged', 'branch': 'brief-NOT-merged', 'auto_merge': True}, open('$SCRATCH/.loop/state/pending-merge.json','w'))
+"
+
+> "$SCRATCH/.loop/state/log.jsonl"
+
+python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from startup_repair import run_startup_repair
+from actions import init_paths
+paths = init_paths('$SCRATCH')
+run_startup_repair(paths, '$SCRATCH')
+" 2>/dev/null
+
+if [ -f "$SCRATCH/.loop/state/pending-merge.json" ]; then
+    pass "pending-merge.json preserved for unmerged brief"
+else
+    fail "pending-merge.json incorrectly removed for unmerged brief"
+fi
+
+rm -f "$SCRATCH/.loop/state/pending-merge.json"
+
+fi  # startup_repair.py exists (test 16)
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
