@@ -1412,6 +1412,205 @@ esac
 
 rm -rf "$HQS_SCRATCH"
 
+# ── Tests 29-35 (brief-026): loop init + hive config ─────────────────────────
+
+LOOP_BIN="$SCRIPT_DIR/../bin/loop"
+HIVE_BIN="$SCRIPT_DIR/../target/release/hive"
+
+# ── Test 29: loop init --minimal creates expected .loop/ tree ────────────────
+
+echo ""
+echo "=== Test 29: loop init --minimal — creates expected .loop/ tree ==="
+
+INIT_SCRATCH=$(mktemp -d)
+
+(cd "$INIT_SCRATCH" && bash "$LOOP_BIN" init --minimal) > /dev/null 2>&1
+
+[ -f "$INIT_SCRATCH/.loop/state/running.json" ] \
+    && pass "loop init --minimal: .loop/state/running.json exists" \
+    || fail "loop init --minimal: .loop/state/running.json missing"
+
+[ -f "$INIT_SCRATCH/.loop/state/goals.md" ] \
+    && pass "loop init --minimal: .loop/state/goals.md exists" \
+    || fail "loop init --minimal: .loop/state/goals.md missing"
+
+[ -f "$INIT_SCRATCH/.loop/state/stewardship-log.md" ] \
+    && pass "loop init --minimal: stewardship-log.md exists" \
+    || fail "loop init --minimal: stewardship-log.md missing"
+
+[ -f "$INIT_SCRATCH/.loop/briefs/README.md" ] \
+    && pass "loop init --minimal: .loop/briefs/README.md exists" \
+    || fail "loop init --minimal: .loop/briefs/README.md missing"
+
+[ -d "$INIT_SCRATCH/.loop/signals" ] \
+    && pass "loop init --minimal: .loop/signals/ dir exists" \
+    || fail "loop init --minimal: .loop/signals/ dir missing"
+
+[ -f "$INIT_SCRATCH/.loop/config.json" ] \
+    && pass "loop init --minimal: .loop/config.json exists" \
+    || fail "loop init --minimal: .loop/config.json missing"
+
+[ ! -d "$INIT_SCRATCH/wiki" ] \
+    && pass "loop init --minimal: no wiki/ scaffold created (minimal mode)" \
+    || fail "loop init --minimal: wiki/ created unexpectedly in minimal mode"
+
+# ── Test 30: loop init --wiki-full creates expected wiki scaffold ────────────
+
+echo ""
+echo "=== Test 30: loop init --wiki-full — creates wiki scaffold ==="
+
+WIKI_SCRATCH=$(mktemp -d)
+
+(cd "$WIKI_SCRATCH" && bash "$LOOP_BIN" init --wiki-full) > /dev/null 2>&1
+
+[ -f "$WIKI_SCRATCH/wiki/soul.md" ] \
+    && pass "loop init --wiki-full: wiki/soul.md exists" \
+    || fail "loop init --wiki-full: wiki/soul.md missing"
+
+[ -f "$WIKI_SCRATCH/wiki/CLAUDE.md" ] \
+    && pass "loop init --wiki-full: wiki/CLAUDE.md exists" \
+    || fail "loop init --wiki-full: wiki/CLAUDE.md missing"
+
+[ -f "$WIKI_SCRATCH/wiki/briefs/cards/README.md" ] \
+    && pass "loop init --wiki-full: wiki/briefs/cards/README.md exists" \
+    || fail "loop init --wiki-full: wiki/briefs/cards/README.md missing"
+
+[ -f "$WIKI_SCRATCH/wiki/operating-docs/director-context.md" ] \
+    && pass "loop init --wiki-full: wiki/operating-docs/director-context.md exists" \
+    || fail "loop init --wiki-full: wiki/operating-docs/director-context.md missing"
+
+[ -f "$WIKI_SCRATCH/zensical.toml" ] \
+    && pass "loop init --wiki-full: zensical.toml exists" \
+    || fail "loop init --wiki-full: zensical.toml missing"
+
+# CLAUDE.md must contain the session-start load order section (non-trivial content)
+if grep -q "Session-start\|session.start\|load order" "$WIKI_SCRATCH/wiki/CLAUDE.md" 2>/dev/null; then
+    pass "loop init --wiki-full: wiki/CLAUDE.md has session-start load order content"
+else
+    fail "loop init --wiki-full: wiki/CLAUDE.md appears empty or missing expected content"
+fi
+
+# director-context.md must exist with readable content (non-empty)
+if [ -s "$WIKI_SCRATCH/wiki/operating-docs/director-context.md" ]; then
+    pass "loop init --wiki-full: director-context.md is non-empty"
+else
+    fail "loop init --wiki-full: director-context.md is empty or missing"
+fi
+
+# ── Test 31: loop init refuses when .loop/ already exists ────────────────────
+
+echo ""
+echo "=== Test 31: loop init refuses when .loop/ already exists ==="
+
+REFUSE_MSG=$(cd "$INIT_SCRATCH" && bash "$LOOP_BIN" init --minimal 2>&1 || true)
+case "$REFUSE_MSG" in
+    *"already initialized"*)
+        pass "loop init: refuses with 'already initialized' message when .loop/ exists" ;;
+    *)
+        fail "loop init: expected refusal message — got '$REFUSE_MSG'" ;;
+esac
+
+# running.json must still have its original empty-state content (not clobbered)
+RUNNING_AFTER=$(python3 -c "import json; d=json.load(open('$INIT_SCRATCH/.loop/state/running.json')); print(isinstance(d.get('active'), list))" 2>/dev/null)
+assert_eq "loop init refuse: running.json not clobbered after refused re-init" \
+    "$RUNNING_AFTER" "True"
+
+# ── Test 32: loop init --dry-run changes nothing on disk ─────────────────────
+
+echo ""
+echo "=== Test 32: loop init --dry-run — changes nothing on disk ==="
+
+DRY_SCRATCH=$(mktemp -d)
+
+DRY_OUT=$(cd "$DRY_SCRATCH" && bash "$LOOP_BIN" init --wiki-full --dry-run 2>&1)
+
+[ ! -d "$DRY_SCRATCH/.loop" ] \
+    && pass "loop init --dry-run: .loop/ not created on disk" \
+    || fail "loop init --dry-run: .loop/ was created (should be dry-run)"
+
+[ ! -d "$DRY_SCRATCH/wiki" ] \
+    && pass "loop init --dry-run: wiki/ not created on disk" \
+    || fail "loop init --dry-run: wiki/ was created (should be dry-run)"
+
+case "$DRY_OUT" in
+    *"Would create"*)
+        pass "loop init --dry-run: stdout mentions 'Would create'" ;;
+    *)
+        fail "loop init --dry-run: stdout missing 'Would create' — got '$DRY_OUT'" ;;
+esac
+
+# ── Test 33: .loop/config.json seeded by init is valid JSON with beehive key ─
+
+echo ""
+echo "=== Test 33: loop init seeds .loop/config.json with valid JSON + beehive key ==="
+
+CONFIG_VALID=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$INIT_SCRATCH/.loop/config.json'))
+    print('valid')
+except Exception as e:
+    print(f'invalid: {e}')
+" 2>/dev/null)
+assert_eq "loop init: .loop/config.json is valid JSON" "$CONFIG_VALID" "valid"
+
+CONFIG_HAS_BEEHIVE=$(python3 -c "
+import json
+d = json.load(open('$INIT_SCRATCH/.loop/config.json'))
+print('yes' if 'beehive' in d else 'no')
+" 2>/dev/null)
+assert_eq "loop init: .loop/config.json has 'beehive' key" "$CONFIG_HAS_BEEHIVE" "yes"
+
+# ── Test 34: hive binary exits with message when run outside .loop/ dir ──────
+
+echo ""
+echo "=== Test 34: hive binary exits non-zero with message when no .loop/ found ==="
+
+if [ ! -f "$HIVE_BIN" ]; then
+    fail "hive binary not found at $HIVE_BIN — run install.sh or cargo build first"
+    fail "hive: cannot verify exit-without-.loop/ behavior (binary missing)"
+else
+
+NO_LOOP_STDERR=$("$HIVE_BIN" 2>&1 1>/dev/null || true)
+NO_LOOP_EXIT=$( { "$HIVE_BIN" > /dev/null 2>&1; echo $?; } || echo "1" )
+
+# Check exit code is 1
+assert_eq "hive: exits 1 when no .loop/ directory found" "$NO_LOOP_EXIT" "1"
+
+# Check stderr contains the expected message
+case "$NO_LOOP_STDERR" in
+    *"No .loop/"*|*"loop init"*)
+        pass "hive: stderr mentions missing .loop/ and 'loop init'" ;;
+    *)
+        fail "hive: expected .loop/ missing message — got '$NO_LOOP_STDERR'" ;;
+esac
+
+fi  # hive binary exists
+
+# ── Test 35: hive config unit tests pass via cargo test ──────────────────────
+
+echo ""
+echo "=== Test 35: hive config.rs unit tests pass (palette override + invalid JSON fallback) ==="
+
+if ! command -v cargo > /dev/null 2>&1; then
+    fail "hive config unit tests: cargo not found — skipping"
+else
+
+CARGO_MANIFEST="$SCRIPT_DIR/../crates/hive/Cargo.toml"
+if [ ! -f "$CARGO_MANIFEST" ]; then
+    fail "hive config unit tests: crates/hive/Cargo.toml not found"
+else
+
+CARGO_OUT=$(cargo test --quiet --manifest-path "$CARGO_MANIFEST" -- config 2>&1)
+CARGO_EXIT=$?
+assert_eq "hive config unit tests: all pass (palette override + invalid JSON fallback)" \
+    "$CARGO_EXIT" "0"
+
+fi  # Cargo.toml exists
+fi  # cargo available
+
+rm -rf "$INIT_SCRATCH" "$WIKI_SCRATCH" "$DRY_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
