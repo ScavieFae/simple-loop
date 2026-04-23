@@ -799,6 +799,51 @@ assert_eq "history[0].brief is brief-BF-test (moved from active)" "$HIST_BRIEF" 
 
 fi  # startup_repair.py exists (test 15)
 
+# ── Test 15b: backfill_history moves merged brief from awaiting_review[] ────
+
+echo ""
+echo "=== Test 15b: backfill_history — merged brief still in awaiting_review[] gets moved to history[] ==="
+
+if [ ! -f "$STARTUP_REPAIR" ]; then
+    fail "startup_repair.py not found — skipping test 15b"
+else
+
+# Covers the hand-merge drift class: scav merges via `git merge --no-ff` directly,
+# bypassing the daemon's merge handler, which doesn't update running.json.awaiting_review.
+# Next startup_repair should move the brief to history just like it does for active[].
+write_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [{'brief': 'brief-BF-test', 'branch': 'brief-BF-test'}],
+    'history': []
+}"
+
+> "$SCRATCH/.loop/state/log.jsonl"
+
+ACTION_COUNT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from startup_repair import run_startup_repair
+from actions import init_paths
+paths = init_paths('$SCRATCH')
+actions = run_startup_repair(paths, '$SCRATCH')
+print(len(actions))
+" 2>/dev/null)
+assert_eq "backfill_history returns 1 action for awaiting_review+merged brief" "$ACTION_COUNT" "1"
+
+RJ="$SCRATCH/.loop/state/running.json"
+AR_LEN=$(json_get "$RJ" "len(d.get('awaiting_review',[]))")
+assert_eq "awaiting_review[] is empty after backfill (brief moved out)" "$AR_LEN" "0"
+
+HIST_LEN=$(json_get "$RJ" "len(d.get('history',[]))")
+assert_eq "history[] has 1 entry after moving from awaiting_review" "$HIST_LEN" "1"
+
+HIST_BRIEF=$(json_get "$RJ" "d['history'][0]['brief']")
+assert_eq "history[0].brief is brief-BF-test (moved from awaiting_review)" "$HIST_BRIEF" "brief-BF-test"
+
+fi  # startup_repair.py exists (test 15b)
+
 # ── Test 16: clean_stale_queues removes stale pending-merge.json ─────────────
 
 echo ""

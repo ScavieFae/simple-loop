@@ -98,6 +98,7 @@ def backfill_history(running: dict, project_dir: str, card_dirs: list,
     history = list(running.get("history", []))
     active = list(running.get("active", []))
     completed = list(running.get("completed_pending_eval", []))
+    awaiting_review = list(running.get("awaiting_review", []))
     actions = []
 
     history_briefs = {e.get("brief") for e in history}
@@ -108,6 +109,7 @@ def backfill_history(running: dict, project_dir: str, card_dirs: list,
 
         active = [e for e in active if e.get("brief") != brief_id]
         completed = [e for e in completed if e.get("brief") != brief_id]
+        awaiting_review = [e for e in awaiting_review if e.get("brief") != brief_id]
 
         history.insert(0, {
             "brief": brief_id,
@@ -127,6 +129,7 @@ def backfill_history(running: dict, project_dir: str, card_dirs: list,
     result_running["history"] = history
     result_running["active"] = active
     result_running["completed_pending_eval"] = completed
+    result_running["awaiting_review"] = awaiting_review
     return result_running, actions
 
 
