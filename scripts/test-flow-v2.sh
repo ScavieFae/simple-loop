@@ -687,6 +687,118 @@ assert_eq "second run is idempotent (0 actions when no duplicates)" "$ACTION_COU
 
 fi  # startup_repair.py exists
 
+# ── Test 14: backfill_history adds merged brief to history[] ─────────────────
+
+echo ""
+echo "=== Test 14: backfill_history — merged brief absent from history gets backfilled ==="
+
+if [ ! -f "$STARTUP_REPAIR" ]; then
+    fail "startup_repair.py not found — skipping test 14"
+else
+
+# Create an actual merge commit so git log --merges sees it
+git -C "$SCRATCH" checkout -q -b brief-BF-test-branch 2>/dev/null
+git -C "$SCRATCH" commit --allow-empty -q -m "wip: brief-BF-test work"
+git -C "$SCRATCH" checkout -q main 2>/dev/null
+git -C "$SCRATCH" merge --no-ff -q brief-BF-test-branch -m "Merge brief-BF-test: test backfill" 2>/dev/null
+git -C "$SCRATCH" branch -d -q brief-BF-test-branch 2>/dev/null
+
+# Seed running.json with brief-BF-test absent from all arrays
+write_running "{
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': []
+}"
+
+# Clear log so assertions are clean
+> "$SCRATCH/.loop/state/log.jsonl"
+
+ACTION_COUNT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from startup_repair import run_startup_repair
+from actions import init_paths
+paths = init_paths('$SCRATCH')
+actions = run_startup_repair(paths, '$SCRATCH')
+print(len(actions))
+" 2>/dev/null)
+assert_eq "backfill_history returns 1 action for merged brief" "$ACTION_COUNT" "1"
+
+RJ="$SCRATCH/.loop/state/running.json"
+HIST_LEN=$(json_get "$RJ" "len(d.get('history',[]))")
+assert_eq "history[] has 1 entry after backfill" "$HIST_LEN" "1"
+
+HIST_BRIEF=$(json_get "$RJ" "d['history'][0]['brief']")
+assert_eq "history[0].brief is brief-BF-test" "$HIST_BRIEF" "brief-BF-test"
+
+HIST_SHA=$(json_get "$RJ" "bool(d['history'][0].get('merge_sha',''))")
+assert_eq "history[0].merge_sha is present" "$HIST_SHA" "True"
+
+HIST_REASON=$(json_get "$RJ" "d['history'][0].get('reason','')")
+assert_eq "history[0].reason is backfilled_from_git" "$HIST_REASON" "backfilled_from_git"
+
+LOG_HAS_BACKFILL=$(python3 -c "
+with open('$SCRATCH/.loop/state/log.jsonl') as f:
+    lines = f.readlines()
+import json
+for line in reversed(lines):
+    d = json.loads(line)
+    if d.get('reason') == 'backfilled_from_git':
+        print('YES')
+        break
+else:
+    print('NO')
+" 2>/dev/null)
+assert_eq "log.jsonl has backfilled_from_git event" "$LOG_HAS_BACKFILL" "YES"
+
+fi  # startup_repair.py exists (test 14)
+
+# ── Test 15: backfill_history moves merged brief from active[] to history[] ──
+
+echo ""
+echo "=== Test 15: backfill_history — merged brief still in active[] gets moved to history[] ==="
+
+if [ ! -f "$STARTUP_REPAIR" ]; then
+    fail "startup_repair.py not found — skipping test 15"
+else
+
+# Merge commit for brief-BF-test already exists from test 14 — reuse it.
+# Seed running.json with brief-BF-test in active[]
+write_running "{
+    'active': [{'brief': 'brief-BF-test', 'branch': 'brief-BF-test'}],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': []
+}"
+
+> "$SCRATCH/.loop/state/log.jsonl"
+
+ACTION_COUNT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from startup_repair import run_startup_repair
+from actions import init_paths
+paths = init_paths('$SCRATCH')
+actions = run_startup_repair(paths, '$SCRATCH')
+print(len(actions))
+" 2>/dev/null)
+assert_eq "backfill_history returns 1 action for active+merged brief" "$ACTION_COUNT" "1"
+
+RJ="$SCRATCH/.loop/state/running.json"
+ACTIVE_LEN=$(json_get "$RJ" "len(d.get('active',[]))")
+assert_eq "active[] is empty after backfill (brief moved out)" "$ACTIVE_LEN" "0"
+
+HIST_LEN=$(json_get "$RJ" "len(d.get('history',[]))")
+assert_eq "history[] has 1 entry after moving from active" "$HIST_LEN" "1"
+
+HIST_BRIEF=$(json_get "$RJ" "d['history'][0]['brief']")
+assert_eq "history[0].brief is brief-BF-test (moved from active)" "$HIST_BRIEF" "brief-BF-test"
+
+fi  # startup_repair.py exists (test 15)
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
