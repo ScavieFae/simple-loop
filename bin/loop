@@ -120,6 +120,18 @@ cmd_init() {
             echo "  .loop/briefs/README.md"
             echo "  .loop/signals/"
             echo "  .loop/config.json"
+            if [ "$_init_mode" = "wiki-full" ]; then
+                echo "  wiki/soul.md"
+                echo "  wiki/CLAUDE.md"
+                echo "  wiki/briefs/cards/README.md"
+                echo "  wiki/briefs/runway.md"
+                echo "  wiki/briefs/_template.md"
+                echo "  wiki/operating-docs/README.md"
+                echo "  wiki/operating-docs/director-context.md"
+                echo "  wiki/decisions/README.md"
+                echo "  wiki/riffs/README.md"
+                echo "  zensical.toml"
+            fi
             return 0
         fi
 
@@ -169,6 +181,339 @@ MD
   "beehive": {}
 }
 CJSON
+
+        # ── Wiki-full scaffold ────────────────────────────────────
+        if [ "$_init_mode" = "wiki-full" ]; then
+            mkdir -p wiki/briefs/cards wiki/operating-docs wiki/decisions wiki/riffs
+
+            cat > wiki/soul.md <<'MD'
+# Soul
+
+A living document. What is this project, why does it exist, what does it refuse to become?
+
+## What this project is
+
+<!-- Write it here. -->
+
+## Why it exists
+
+<!-- What breaks if this project doesn't exist? -->
+
+## What it refuses to be
+
+<!-- The constraints that make this project coherent. Write the refusals. -->
+
+## Current questions
+
+<!-- What's unsettled. The things you'd answer differently in three months. -->
+MD
+
+            cat > wiki/CLAUDE.md <<'MD'
+# Agent instructions
+
+## Session-start load order
+
+Always, in order:
+
+1. **Memories auto-load** — feedback_*.md + project_*.md + reference_*.md. Review the index.
+2. **`CLAUDE.md`** — auto-loaded. Conventions, tech stack, who-operates-here.
+3. **`wiki/soul.md`** — what this project refuses to be. 2 minutes.
+4. **`.loop/state/goals.md`** — current priority + queue + done.
+5. **`git log --oneline -30`** — recent decisions + who made them.
+6. **`cat .loop/state/running.json`** — what's in flight.
+7. **`ls .loop/state/signals/`** — any open escalates.
+8. **`wiki/briefs/runway.md`** — upcoming pre-filed briefs. Skim the list.
+9. **`wiki/operating-docs/director-context.md`** — pull-on-demand index + operating mode.
+
+**Then** wait for direction. Do not preload briefs or research docs ahead of need.
+
+## Three durable conventions
+
+**Cite specifics.** `brief-NNN`, commit SHAs, `ADR-NNN` — not "recent work" or "the API thing." Specificity surfaces disagreement fast.
+
+**Use the tools that exist.** Cards, stewardship-log, audit/capture patterns, harness-updates runbook, the memory system, runway doc. When something new comes up, first ask: does an existing tool handle this?
+
+**Match the phase.** Clay-wetting (exploration, questions) → add to the pile, don't polish. Ship mode (commits, merges, demos) → cut and ship. Demo-prep → honest framing over perfect. Reading the phase is half the game.
+
+## Dispatch floor
+
+Orchestrate; don't implement. If a task will touch more than one file or produce more than 40 lines of prose/code, write a brief and dispatch. Main-thread time goes to drafting the ask, reviewing the diff, deciding — not to writing the artifact.
+
+Context compaction is the receipt that the dispatch floor was ignored. When a session compacts, the first post-mortem question is: which of those tasks should have been subagents?
+
+## Conventions
+
+- **Commit prefixes:** `[scav]`, `[scaviefae]`, or `[titania]`.
+- **Preserve en-dashes (–)** in writing. Don't silently convert to em-dashes.
+- **Riffs** use `<!-- riff id="..." status="draft|developing|tested" could_become="..." -->` blocks. Don't clean them up.
+- **Source citations** use `[source: url]` inline.
+- **No LLM-speak.** No "Great question." No "Absolutely." No "I'd be happy to help." Just answer.
+
+## Project-specific
+
+<!-- Fill in below: who operates here, tech stack, what not to do. -->
+MD
+
+            cat > wiki/briefs/cards/README.md <<'MD'
+# Brief cards
+
+Each brief lives in its own directory here: `cards/brief-NNN-slug/`. The card collects all artifacts for one brief:
+
+- `index.md` — the brief itself (symlinked from `.loop/briefs/brief-NNN-slug.md`)
+- `plan.md` — implementation plan (optional, written by worker)
+- `closeout.md` — summary written at completion
+- `evaluation.md` — validator review
+
+## Adding a brief
+
+1. Create a directory: `mkdir wiki/briefs/cards/brief-NNN-slug/`
+2. Write the brief: `wiki/briefs/cards/brief-NNN-slug/index.md`
+3. Symlink it: `ln -s ../../wiki/briefs/cards/brief-NNN-slug/index.md .loop/briefs/brief-NNN-slug.md`
+4. Add it to `goals.md` under `## Queued next`.
+MD
+
+            cat > wiki/briefs/runway.md <<'MD'
+# Briefs runway
+
+Pre-filed scope notes for upcoming briefs. Not dispatchable as-is — each entry is enough context for a future session to write a full brief card without rediscovering the thread. Promote to a proper `wiki/briefs/cards/brief-NNN-*/index.md` when ready to dispatch.
+
+Queue semantics: **Queued** in `goals.md` means daemon-dispatchable. **Runway** entries here are drafts — reserved but not ready.
+
+---
+
+<!-- Add runway entries here as: ## Title (runway-NNN) with brief intent + context -->
+MD
+
+            # Use the bundle's brief template if available, else write a minimal one
+            local _sl_root
+            _sl_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+            if [ -f "$_sl_root/templates/brief-template.md" ]; then
+                cp "$_sl_root/templates/brief-template.md" wiki/briefs/_template.md
+            else
+                cat > wiki/briefs/_template.md <<'MD'
+# Brief: [name]
+
+**ID:** brief-NNN-slug
+**Branch:** brief-NNN-slug
+**Status:** queued
+**Model:** sonnet
+
+## Intent
+
+One sentence. The artifact that exists when this brief is done.
+
+## Motivation
+
+Two or three sentences. Why this, why now, what breaks if we skip it.
+
+## Scope
+
+### In
+
+- Specific thing this brief covers
+
+### Out
+
+- Specific thing this brief does NOT touch
+
+## Tasks
+
+1. [task]
+2. [task]
+
+## Completion criteria
+
+- [ ] Criterion one
+- [ ] Criterion two
+
+## Escalation triggers
+
+- Build fails three cycles in a row
+- Dependency needed that isn't in the workspace
+
+## Budget
+
+Max N cycles. After that, stop and report.
+
+## Anti-patterns
+
+- Don't refactor beyond what the cycle requires
+- Don't touch [specific file / area]
+
+## Artifact
+
+What lands when this brief closes? Where does it live?
+
+## Verification
+
+```bash
+# commands to confirm completion criteria pass
+```
+MD
+            fi
+
+            cat > wiki/operating-docs/README.md <<'MD'
+# Operating docs
+
+Runbooks, procedures, and working conventions for this project. The bundle-authoritative versions of the core operating docs live at `docs/operating/` in simple-loop master. Project-specific operating docs — anything about how this project specifically runs — live here.
+
+## Bundle docs (reference upstream for latest)
+
+- [Harness updates](harness-updates.md) — escape hatches, propagation paths, restart protocols
+- [Overnight stewardship](overnight-stewardship.md) — rubric for unattended operation
+- [Hand-merge brief](hand-merge-brief.md) — recipe for manual merges when the daemon can't
+- [Daemon push auth](daemon-push-auth.md) — fixing auth failures on daemon push
+- [Post-session briefs](post-session-briefs.md) — audit + capture brief patterns
+- [Multi-instance loop](multi-instance-loop.md) — running simple-loop across multiple projects
+
+## Project-specific docs
+
+<!-- Add project-specific operating docs below as they accrue. -->
+MD
+
+            cat > wiki/operating-docs/director-context.md <<'MD'
+# Director context
+
+The onboarding package for a fresh session stepping into the director seat. Read this after the session-start load order in `CLAUDE.md`.
+
+## Why this file exists
+
+A fresh session without project context struggles — not from intelligence gap, from discovery gap. This doc closes the gap.
+
+**What transfers across sessions vs what doesn't.**
+
+| Durable (survives session end) | Dies with the session's context |
+|---|---|
+| Feedback memories (auto-load) | Narrative thread of the day |
+| Any file on disk | Mental map of where everything lives |
+| Commit history + running.json state | Voice-phase calibration |
+| Goals queue + runway | Knowledge of what you *didn't* pull |
+| Explicit conventions in CLAUDE.md | Nuance in pushback style |
+
+Memories + this doc + the artifacts on disk together get you ~80% back. The remaining 20% only comes from reading widely and asking cleanly when you don't know.
+
+## Calibrate on state — first thing, every session
+
+```bash
+git log --oneline -20
+cat .loop/state/goals.md | head -60
+cat .loop/state/running.json | python3 -m json.tool | head -40
+```
+
+Three minutes. Shows what landed, what's focused on, what the daemon thinks.
+
+## Pull-on-demand index
+
+When the conversation touches a surface, pull the specific file(s). Not before.
+
+| If working on … | Pull |
+|---|---|
+| Brief writing | latest brief card as a shape reference, `wiki/briefs/runway.md` |
+| Design decisions | `wiki/decisions/` — skim index, pull specific ones by number |
+| Exploratory thinking | `wiki/riffs/` |
+| Harness / daemon | `wiki/operating-docs/harness-updates.md` |
+| Stewardship / overnight | `.loop/state/stewardship-log.md` |
+
+<!-- Add project-specific pull-on-demand rows here. -->
+
+## Operating mode
+
+- **Cite specifics.** Brief IDs, commit SHAs, ADR numbers — not "recent work."
+- **Pull before you commit to a position.** Don't theorize about code; read it.
+- **Use the tools we've built.** Cards, stewardship-log, audit/capture patterns, runway doc. Don't invent parallel systems.
+- **Match the phase.** Clay-wetting → add to the pile. Ship mode → cut and ship.
+- **Dispatch reflex.** >40 lines of code/prose → write a brief. Main thread is for orchestrating, not implementing.
+- **Honor taste gates.** Aesthetic judgments belong to the human. Proxy-approve only when explicitly delegated with a rubric.
+- **Be honest about stubs.** "This is faked" lands better than ambiguity.
+- **Push back with alternatives, not objections.** Offer the path, not just the no.
+MD
+
+            cat > wiki/decisions/README.md <<'MD'
+# Decisions
+
+ADR-style records written when a riff graduates into a committed direction, or when a contested technical choice is resolved. Each entry includes:
+
+- **Context** — what's the situation
+- **Decision** — what we chose
+- **Consequences** — what this closes off or enables
+- **Alternatives considered** — the paths not taken and why
+
+Dated. Not modified after recording — if the decision reverses later, a new ADR supersedes it.
+
+## Format
+
+File name: `NNN-short-slug.md`. Number sequentially from 001.
+
+## Current decisions
+
+<!-- List decisions here as: - [NNN: title](NNN-slug.md) — one-line summary -->
+MD
+
+            cat > wiki/riffs/README.md <<'MD'
+# Riffs
+
+Exploratory thinking. Half-ideas. Things that might be wrong. Each riff carries a status tag:
+
+- **`draft`** — first pass, not yet stress-tested
+- **`developing`** — multiple revisions, gaining conviction
+- **`tested`** — validated against reality; usually a step away from becoming a spec or decision
+
+Riffs don't commit anyone. They're allowed to be wrong. When one graduates — or gets discarded — the reasoning goes into `wiki/decisions/`.
+
+## Riff block grammar
+
+```markdown
+<!-- riff id="unique-id" status="draft|developing|tested" could_become="tweet, blog, talk, ADR, spec" -->
+Exploratory thinking here. Speculative, might be wrong.
+<!-- /riff -->
+```
+
+Don't clean up riff blocks. They're working state, not polish.
+
+## Current riffs
+
+<!-- List active riffs here as: - [title](filename.md) — `status`. One-line note. -->
+MD
+
+            cat > zensical.toml <<'TOML'
+[site]
+name = "Project Wiki"
+description = ""
+
+[build]
+docs_dir = "wiki"
+site_dir = "site"
+
+[theme]
+name = "material"
+
+[[nav]]
+title = "Home"
+file = "index.md"
+
+[[nav]]
+title = "Soul"
+file = "soul.md"
+
+[[nav]]
+title = "Briefs"
+file = "briefs/index.md"
+
+[[nav]]
+title = "Decisions"
+file = "decisions/README.md"
+
+[[nav]]
+title = "Riffs"
+file = "riffs/README.md"
+
+[[nav]]
+title = "Operating Docs"
+file = "operating-docs/README.md"
+TOML
+
+            echo "  wiki/ skeleton created."
+        fi
 
         echo ""
         echo "Simple-loop scaffolded in \`$PWD\`. Next: create your first brief in \`wiki/briefs/cards/\` (or wherever your cards live)."
