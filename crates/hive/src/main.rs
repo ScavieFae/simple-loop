@@ -1,3 +1,4 @@
+mod config;
 mod state;
 
 use anyhow::Result;
@@ -107,6 +108,8 @@ struct App {
     /// the Signals panel is in "From the Hive" (no-signals) mode.
     learning_index: usize,
     last_learning_rotation: Instant,
+    /// Per-project palette + layout config from `.loop/config.json`.
+    config: config::HiveConfig,
 }
 
 const LEARNING_ROTATION_SECS: u64 = 60;
@@ -129,8 +132,13 @@ impl App {
             signal_modal_scroll: 0,
             learning_index: 0,
             last_learning_rotation: Instant::now(),
+            config: config::HiveConfig::load(),
         }
     }
+
+    // ── palette helpers ───────────────────────────────────────────────────────
+    fn col_primary(&self) -> Color { Color::from_u32(self.config.palette.primary) }
+    fn col_muted(&self) -> Color { Color::from_u32(self.config.palette.muted) }
 
     fn refresh_state(&mut self) {
         self.hive = state::HiveState::load();
@@ -219,13 +227,15 @@ impl App {
         } else {
             BorderType::Rounded
         };
+        let primary = self.col_primary();
+        let muted = self.col_muted();
         let title_style = if focused {
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+            Style::default().fg(primary).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(MUTED)
+            Style::default().fg(muted)
         };
         let border_style = if focused {
-            Style::default().fg(AMBER)
+            Style::default().fg(primary)
         } else {
             Style::default().fg(DIM_BORDER)
         };
@@ -375,7 +385,7 @@ fn budget_color(current: usize, budget: usize) -> Color {
     }
 }
 
-fn render_cells<'a>(cells: &state::CellsState) -> Text<'a> {
+fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Text<'a> {
     let mut lines: Vec<Line<'a>> = Vec::new();
     let section_header = |label: &'static str, color: Color| {
         Line::from(vec![
@@ -397,7 +407,9 @@ fn render_cells<'a>(cells: &state::CellsState) -> Text<'a> {
     if cells.active.is_empty() {
         lines.push(empty_row("— hive idle"));
     } else {
-        for brief in &cells.active {
+        let total_active = cells.active.len();
+        let show_active = total_active.min(active_section_height as usize);
+        for brief in cells.active.iter().take(show_active) {
             lines.push(Line::from(vec![
                 Span::styled("  ⬢ ", Style::default().fg(AMBER)),
                 Span::styled(
@@ -485,6 +497,12 @@ fn render_cells<'a>(cells: &state::CellsState) -> Text<'a> {
                     Span::styled(display, Style::default().fg(MUTED)),
                 ]));
             }
+        }
+        if total_active > show_active {
+            lines.push(Line::from(Span::styled(
+                format!("  + {} more…", total_active - show_active),
+                Style::default().fg(MUTED),
+            )));
         }
     }
     lines.push(Line::from(""));
@@ -1240,7 +1258,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         app.maybe_rotate_learning();
 
         let hive_text = render_hive(&app);
-        let cells_text = render_cells(&app.cells);
+        let cells_text = render_cells(&app.cells, app.config.layout.active_section_height);
         let (dance_floor_text, dance_floor_line_count) = render_dance_floor(&app.dance_floor);
         // Mode switch: Signals-slot shows actual signals when something
         // needs attention, cycles "From the Hive" learnings when calm.
@@ -1288,10 +1306,10 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                 Paragraph::new(Line::from(vec![
                     Span::styled(
                         "🐝 Beehive",
-                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                        Style::default().fg(app.col_primary()).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("  ·  ", Style::default().fg(MUTED)),
-                    Span::styled(cwd, Style::default().fg(MUTED)),
+                    Span::styled("  ·  ", Style::default().fg(app.col_muted())),
+                    Span::styled(cwd, Style::default().fg(app.col_muted())),
                 ])),
                 outer[0],
             );
