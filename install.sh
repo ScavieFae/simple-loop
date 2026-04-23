@@ -56,6 +56,11 @@ cp "$SCRIPT_DIR/templates/config.sh" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/templates/brief-template.md" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/templates/prompts/"*.md "$INSTALL_DIR/templates/prompts/"
 
+# Copy docs (conventions, operating docs, templates used by `loop init`)
+if [ -d "$SCRIPT_DIR/docs" ]; then
+    cp -r "$SCRIPT_DIR/docs" "$INSTALL_DIR/docs"
+fi
+
 # Copy v2 core
 if [ -d "$SCRIPT_DIR/core" ]; then
     # Core agents

@@ -185,8 +185,13 @@ CJSON
         # ── Wiki-full scaffold ────────────────────────────────────
         if [ "$_init_mode" = "wiki-full" ]; then
             mkdir -p wiki/briefs/cards wiki/operating-docs wiki/decisions wiki/riffs
+            local _sl_root
+            _sl_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-            cat > wiki/soul.md <<'MD'
+            if [ -f "$_sl_root/docs/templates/soul-template.md" ]; then
+                cp "$_sl_root/docs/templates/soul-template.md" wiki/soul.md
+            else
+                cat > wiki/soul.md <<'MD'
 # Soul
 
 A living document. What is this project, why does it exist, what does it refuse to become?
@@ -207,8 +212,12 @@ A living document. What is this project, why does it exist, what does it refuse 
 
 <!-- What's unsettled. The things you'd answer differently in three months. -->
 MD
+            fi
 
-            cat > wiki/CLAUDE.md <<'MD'
+            if [ -f "$_sl_root/docs/templates/CLAUDE-md-template.md" ]; then
+                cp "$_sl_root/docs/templates/CLAUDE-md-template.md" wiki/CLAUDE.md
+            else
+                cat > wiki/CLAUDE.md <<'MD'
 # Agent instructions
 
 ## Session-start load order
@@ -253,6 +262,7 @@ Context compaction is the receipt that the dispatch floor was ignored. When a se
 
 <!-- Fill in below: who operates here, tech stack, what not to do. -->
 MD
+            fi
 
             cat > wiki/briefs/cards/README.md <<'MD'
 # Brief cards
@@ -285,8 +295,6 @@ Queue semantics: **Queued** in `goals.md` means daemon-dispatchable. **Runway** 
 MD
 
             # Use the bundle's brief template if available, else write a minimal one
-            local _sl_root
-            _sl_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
             if [ -f "$_sl_root/templates/brief-template.md" ]; then
                 cp "$_sl_root/templates/brief-template.md" wiki/briefs/_template.md
             else
@@ -371,7 +379,10 @@ Runbooks, procedures, and working conventions for this project. The bundle-autho
 <!-- Add project-specific operating docs below as they accrue. -->
 MD
 
-            cat > wiki/operating-docs/director-context.md <<'MD'
+            if [ -f "$_sl_root/docs/templates/director-context-template.md" ]; then
+                cp "$_sl_root/docs/templates/director-context-template.md" wiki/operating-docs/director-context.md
+            else
+                cat > wiki/operating-docs/director-context.md <<'MD'
 # Director context
 
 The onboarding package for a fresh session stepping into the director seat. Read this after the session-start load order in `CLAUDE.md`.
@@ -427,6 +438,7 @@ When the conversation touches a surface, pull the specific file(s). Not before.
 - **Be honest about stubs.** "This is faked" lands better than ambiguity.
 - **Push back with alternatives, not objections.** Offer the path, not just the no.
 MD
+            fi
 
             cat > wiki/decisions/README.md <<'MD'
 # Decisions
