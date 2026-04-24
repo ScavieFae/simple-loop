@@ -1969,6 +1969,101 @@ assert_eq "dirty-tree: pre_merge_clean event logged when untracked review remove
 
 rm -rf "$DT_SCRATCH"
 
+# ── Test 45b: pre-merge clean covers the specific brief's card dir ─────────────
+# Covers the 2026-04-24 recurring pattern: worker artifacts (closeout.md, plan.md,
+# cycle PNGs) land as untracked duplicates at wiki/briefs/cards/<brief>/ on main,
+# blocking merges from brief-XXX. Safe to clean the specific brief's card dir
+# because the branch owns its own card dir by convention. NOT safe to broaden to
+# wiki/briefs/cards/ — other briefs' cards are legitimate tracked content on main.
+
+echo ""
+echo "=== Test 45b: pre-merge clean covers the merging brief's own card dir ==="
+
+DT45B_SCRATCH=$(mktemp -d)
+git -C "$DT45B_SCRATCH" init -q -b main
+git -C "$DT45B_SCRATCH" config user.email "test@test"
+git -C "$DT45B_SCRATCH" config user.name "Test"
+
+mkdir -p "$DT45B_SCRATCH/.loop/state/signals"
+mkdir -p "$DT45B_SCRATCH/.loop/worktrees"
+cat > "$DT45B_SCRATCH/.loop/config.sh" <<'EOF'
+PROJECT_NAME="test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+EOF
+touch "$DT45B_SCRATCH/.loop/state/log.jsonl"
+
+echo "base" > "$DT45B_SCRATCH/base.txt"
+git -C "$DT45B_SCRATCH" add base.txt
+git -C "$DT45B_SCRATCH" commit -q -m "init"
+
+git init --bare -q "$DT45B_SCRATCH/origin.git"
+git -C "$DT45B_SCRATCH" remote add origin "$DT45B_SCRATCH/origin.git"
+git -C "$DT45B_SCRATCH" push -q origin main
+
+# Branch commits a brief card (closeout.md under wiki/briefs/cards/<brief>/)
+DT45B_BRIEF="brief-card-clean-test"
+DT45B_CLOSEOUT_REL="wiki/briefs/cards/${DT45B_BRIEF}/closeout.md"
+git -C "$DT45B_SCRATCH" checkout -q -b "$DT45B_BRIEF"
+mkdir -p "$DT45B_SCRATCH/$(dirname "$DT45B_CLOSEOUT_REL")"
+echo "# Closeout from branch" > "$DT45B_SCRATCH/$DT45B_CLOSEOUT_REL"
+git -C "$DT45B_SCRATCH" add "$DT45B_CLOSEOUT_REL"
+git -C "$DT45B_SCRATCH" commit -q -m "${DT45B_BRIEF}: closeout"
+git -C "$DT45B_SCRATCH" checkout -q main
+
+# Simulate the bug: closeout.md dropped as untracked on main's tree
+mkdir -p "$DT45B_SCRATCH/$(dirname "$DT45B_CLOSEOUT_REL")"
+echo "# Untracked duplicate on main" > "$DT45B_SCRATCH/$DT45B_CLOSEOUT_REL"
+
+python3 -c "
+import json
+json.dump({
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [{'brief': '$DT45B_BRIEF', 'branch': '$DT45B_BRIEF'}],
+    'awaiting_review': [],
+    'history': []
+}, open('$DT45B_SCRATCH/.loop/state/running.json', 'w'), indent=2)
+"
+cat > "$DT45B_SCRATCH/.loop/state/pending-merge.json" <<PMEOF
+{"brief": "$DT45B_BRIEF", "branch": "$DT45B_BRIEF", "title": "brief-card clean test", "evaluation": ""}
+PMEOF
+
+DT45B_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, merge
+paths = init_paths('$DT45B_SCRATCH')
+try:
+    result = merge(paths)
+    print('ok' if result is not False else 'false')
+except Exception as e:
+    msg = str(e).lower()
+    if 'overwritten' in msg or 'dirty' in msg or 'please move' in msg:
+        print('dirty_tree_abort')
+    else:
+        print('ok_push_or_cleanup')
+" 2>/dev/null | tail -1)
+assert_eq "brief-card-clean: merge() completes despite untracked closeout.md under wiki/briefs/cards/<brief>/" \
+    "$DT45B_RESULT" "ok"
+
+# Verify pre_merge_clean event includes the brief-card path
+DT45B_LOGGED=$(python3 -c "
+import json
+try:
+    with open('$DT45B_SCRATCH/.loop/state/log.jsonl') as f:
+        events = [json.loads(l) for l in f if l.strip()]
+    clean_events = [e for e in events if e.get('action') == 'daemon:pre_merge_clean']
+    card_events = [e for e in clean_events if 'wiki/briefs/cards/$DT45B_BRIEF/' in e.get('path', '')]
+    print('logged_for_brief_card' if card_events else ('logged_other_only' if clean_events else 'not_logged'))
+except Exception as e:
+    print('error:' + str(e))
+" 2>/dev/null)
+assert_eq "brief-card-clean: pre_merge_clean logged path for the brief-card dir specifically" \
+    "$DT45B_LOGGED" "logged_for_brief_card"
+
+rm -rf "$DT45B_SCRATCH"
+
 # ── Tests 46-51 (brief-034 cycle 3): concurrency gate in dispatch ─────────────
 # Verify THROTTLE cap + Parallel-safe/Edit-surface overlap detection in
 # actions.dispatch. Covers the four gate outcomes (throttle_reached,

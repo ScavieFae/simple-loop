@@ -785,11 +785,26 @@ def merge(paths):
     git(project_dir, "fetch", remote, check=False)
     git(project_dir, "pull", "--ff-only", remote, main_branch, check=False)
 
-    # Pre-merge safe-path clean: remove untracked validator review files that
-    # the validator wrapper may have written to main's working tree. These are
-    # never valuable in main's tree (the branch commits carry them); clean is
-    # safe-path-only (explicit allowlist, never -fdX, never broad).
+    # Pre-merge safe-path clean: remove untracked files that the worker /
+    # validator wrapper may have written to main's working tree. These are
+    # never valuable in main's tree — the branch commits carry the canonical
+    # versions. Clean is safe-path-only (explicit allowlist, never -fdX,
+    # never broad).
+    #
+    # Paths that apply to every merge:
+    #   - validator review files (per brief-028; wrapper writes to main root)
+    #
+    # Paths that apply to THIS merge only:
+    #   - the specific brief's card directory — worker artifacts (plan.md,
+    #     closeout.md, review.md, smoke.md, cycle PNGs) sometimes land as
+    #     untracked duplicates in main's tree. Safe to clean for the brief
+    #     being merged because the branch owns its card dir by convention.
+    #     NOT safe to broaden to `wiki/briefs/cards/` — other briefs' cards
+    #     are legitimate tracked content on main.
     SAFE_CLEAN_PATHS = [".loop/modules/validator/state/reviews/"]
+    brief_card_path = f"wiki/briefs/cards/{brief}/"
+    if os.path.isdir(os.path.join(project_dir, brief_card_path)):
+        SAFE_CLEAN_PATHS.append(brief_card_path)
     for clean_path in SAFE_CLEAN_PATHS:
         result = git(project_dir, "clean", "-fd", clean_path, check=False)
         if result.returncode == 0 and result.stdout.strip():
