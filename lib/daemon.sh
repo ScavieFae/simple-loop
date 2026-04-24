@@ -23,8 +23,12 @@ PROJECT_DIR="${1:?Usage: daemon.sh <project_dir> [heartbeat_seconds]}"
 PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 LOOP_DIR="$PROJECT_DIR/.loop"
 
-# Source project config
+# Source project config. config.sh is tracked (project defaults);
+# config.local.sh is gitignored and holds secrets (CLOUDFLARE_API_TOKEN, etc).
+# Local overlay sourced AFTER config.sh so local values win. Projects create
+# config.local.sh on demand; simple-loop does not ship it. Never commit secrets.
 [ -f "$LOOP_DIR/config.sh" ] && source "$LOOP_DIR/config.sh"
+[ -f "$LOOP_DIR/config.local.sh" ] && source "$LOOP_DIR/config.local.sh"
 
 STATE_DIR="$LOOP_DIR/state"
 SIGNALS_DIR="$STATE_DIR/signals"
