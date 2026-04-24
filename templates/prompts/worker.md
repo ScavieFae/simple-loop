@@ -21,7 +21,18 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
 
 5. **Commit.** Stage your changes and commit with a descriptive message. You are on a brief branch — commit there. Do NOT push; the daemon handles pushing.
 
-6. **Update progress.** Update `.loop/state/progress.json`:
+6. **Update progress.**
+
+   **6a. Human-gate check.** Before setting status, check the brief's `Human-gate:` field:
+   - Look for `**Human-gate:**` or `Human-gate:` in the brief file.
+   - If the value is `none` or the field is absent → skip to 6b, no artifact needed.
+   - If the value is `smoke` AND you are setting status to `"complete"` or `"blocked"` (smoke required but can't be done by the worker): write `smoke.md` in `wiki/briefs/cards/<brief-id>/`.
+   - If the value is `review` AND you are setting status to `"complete"` or `"blocked"`: write `review.md` in the card dir.
+   - If the value is `escalation-possible` AND you are setting status to `"blocked"` (a genuine escalation trigger fired): write `escalation.md` in the card dir.
+   - Use the artifact template at `~/.local/share/simple-loop/templates/artifacts/human-gate.md`. Fill all sections from context about the brief. Create the card dir if it doesn't exist.
+   - **Do NOT produce an artifact for `Human-gate: none` or a missing field.** Plumbing briefs are unaffected by this step.
+
+   **6b. Set status.** Update `.loop/state/progress.json`:
    - Increment `iteration`
    - Move completed task from `tasks_remaining` to `tasks_completed`
    - Add anything you learned to `learnings`

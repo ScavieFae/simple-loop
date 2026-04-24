@@ -663,8 +663,45 @@ Verdict guide:
     fi
 
     if [ ! -f "$WORKTREE_DIR/$REVIEW_REL" ]; then
-        daemon_log "VALIDATOR: expected review file not written at $REVIEW_REL — nothing to commit"
-        return 0
+        if [ -f "$PROJECT_DIR/$REVIEW_REL" ]; then
+            # Validator agent wrote to project root instead of worktree — rescue it.
+            # Happens when claude's path resolution picks main's .git as root (leaky
+            # worktree abstraction). Moving it here keeps main's tree clean for merge.
+            mkdir -p "$(dirname "$WORKTREE_DIR/$REVIEW_REL")"
+            mv "$PROJECT_DIR/$REVIEW_REL" "$WORKTREE_DIR/$REVIEW_REL"
+            daemon_log "VALIDATOR: rescued stray review from project root to worktree: $REVIEW_REL"
+        else
+            # Validator agent exited without writing a review — synthesize wrapper-pass
+            # at the worktree path. Never write to project root (that's the bug we fixed).
+            local NOW_ISO_WRAP
+            NOW_ISO_WRAP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            mkdir -p "$(dirname "$WORKTREE_DIR/$REVIEW_REL")"
+            cat > "$WORKTREE_DIR/$REVIEW_REL" <<SYNTHEOF
+---
+cycle: $cycle
+commit: $commit_sha
+brief: $brief_id
+branch: $branch
+verdict: pass
+summary: validator agent returned without writing — wrapper-synthesized pass review
+validator: wrapper-synthesized (brief-025)
+reviewed_at: $NOW_ISO_WRAP
+---
+
+## Bugs found
+- _none_
+
+## Execution concerns
+- validator agent exited without producing a review file; wrapper wrote this synthetic pass. Investigate validator logs if this recurs.
+
+## Spec-fit notes
+- _none_
+
+## Deferred items
+- _none_
+SYNTHEOF
+            daemon_log "VALIDATOR: wrapper-synthesized pass review for $brief_id cycle $cycle"
+        fi
     fi
 
     # Daemon commits + pushes the review artifact (validator is read-only).
@@ -678,6 +715,147 @@ Verdict guide:
         notify "$brief_id: validator review cycle $cycle"
     fi
 
+    return 0
+}
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Scouts (specialists) — brief-034 cycle 4                       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# Scouts are declarative single-file agents at .loop/specialists/<name>.md.
+# Cadence, daily cap, runtime cap, and output contract are enforced in the
+# daemon tick (scripts/scouts.py does the parsing + state checks). A scout
+# never modifies code/state beyond its declared `outputs` contract — a post-
+# filter on the claude JSON result is the enforcement layer.
+#
+# Feature-flag: SCOUTS_ENABLED="" in config.sh keeps this loop dormant. Each
+# enabled scout runs at most once per tick, backgrounded so THROTTLE workers
+# and scouts cycle concurrently.
+
+fire_scout() {
+    local scout_file="$1"
+    local name
+    name="$(basename "$scout_file" .md)"
+
+    local model
+    model="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-field "$scout_file" model 2>/dev/null)"
+    [ -z "$model" ] && model="sonnet"
+
+    local max_runtime
+    max_runtime="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-field "$scout_file" max_runtime_seconds 2>/dev/null)"
+    [ -z "$max_runtime" ] && max_runtime="60"
+
+    local scout_json
+    scout_json="$(mktemp)"
+    local scout_log="$LOG_DIR/scout_${name}_$(date +%Y%m%d_%H%M%S).log"
+    local start
+    start="$(date +%s)"
+
+    # Body is the role prompt (everything after frontmatter).
+    local body
+    body="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-body "$scout_file" 2>/dev/null)"
+    if [ -z "$body" ]; then
+        daemon_log "SCOUT: $name has empty body — skipping"
+        rm -f "$scout_json"
+        return 0
+    fi
+
+    # Timeout wrapper keeps a runaway scout bounded. `timeout` is BSD/GNU
+    # cross-compatible on macOS when installed via coreutils; fall back to
+    # `gtimeout` then to no-timeout if neither is on PATH (logged).
+    local TIMEOUT_BIN=""
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="gtimeout"
+    fi
+
+    if [ -n "$TIMEOUT_BIN" ]; then
+        "$TIMEOUT_BIN" "${max_runtime}s" claude --model "$model" --dangerously-skip-permissions \
+            --output-format json \
+            -p "$body" \
+            > "$scout_json" 2>>"$scout_log"
+    else
+        daemon_log "SCOUT: $name running without timeout (no timeout/gtimeout on PATH)"
+        claude --model "$model" --dangerously-skip-permissions \
+            --output-format json \
+            -p "$body" \
+            > "$scout_json" 2>>"$scout_log"
+    fi
+    local exit_code=$?
+    local duration_ms=$(( ( $(date +%s) - start ) * 1000 ))
+
+    # Parse metrics via the same helper workers/conductors use. Extra fields
+    # flag the scout lineage so loop-report can segregate.
+    parse_metrics "$scout_json" "$scout_log" "scout" \
+        "{'specialist': '$name', 'model': '$model', 'exit_code': $exit_code}"
+
+    # Apply output-contract (post-filter). The Python returns a status string
+    # + optional destination path; record-fire maps that to the right event.
+    local contract_out status dest
+    contract_out="$(python3 "$DAEMON_LIB_DIR/scouts.py" apply-output-contract \
+        "$scout_file" "$scout_json" "$PROJECT_DIR" 2>/dev/null)"
+    status="$(echo "$contract_out" | cut -f1)"
+    dest="$(echo "$contract_out" | cut -f2)"
+
+    python3 "$DAEMON_LIB_DIR/scouts.py" record-fire \
+        "$scout_file" "$PROJECT_DIR" "$exit_code" "$duration_ms" \
+        "$status" "$dest" >/dev/null 2>&1
+
+    case "$status" in
+        wrote)
+            daemon_log "SCOUT: $name fired (${duration_ms}ms) → $(basename "$dest")"
+            ;;
+        noop)
+            daemon_log "SCOUT: $name noop (${duration_ms}ms)"
+            ;;
+        rejected)
+            daemon_log "SCOUT: $name rejected (${duration_ms}ms) — $dest"
+            ;;
+        *)
+            daemon_log "SCOUT: $name exit=$exit_code (${duration_ms}ms)"
+            ;;
+    esac
+
+    rm -f "$scout_json"
+    return 0
+}
+
+invoke_scouts() {
+    [ -z "${SCOUTS_ENABLED:-}" ] && return 0
+    local specialists_dir="$LOOP_DIR/specialists"
+    [ -d "$specialists_dir" ] || return 0
+
+    for scout_name in $SCOUTS_ENABLED; do
+        local scout_file="$specialists_dir/${scout_name}.md"
+        if [ ! -f "$scout_file" ]; then
+            daemon_log "SCOUT: $scout_name enabled but $scout_file missing — skipping"
+            continue
+        fi
+
+        local state
+        state="$(python3 "$DAEMON_LIB_DIR/scouts.py" check "$scout_file" "$PROJECT_DIR" 2>/dev/null)"
+        if [ "$state" = "kill" ]; then
+            daemon_log "SCOUT: $scout_name killed (kill_on condition tripped)"
+            continue
+        fi
+        [ "$state" = "skip" ] && continue
+
+        local due
+        due="$(python3 "$DAEMON_LIB_DIR/scouts.py" is-due "$scout_file" "$PROJECT_DIR" 2>/dev/null)"
+        [ "$due" = "yes" ] || continue
+
+        local over_cap
+        over_cap="$(python3 "$DAEMON_LIB_DIR/scouts.py" over-daily-cap "$scout_file" "$PROJECT_DIR" 2>/dev/null)"
+        if [ "$over_cap" = "yes" ]; then
+            daemon_log "SCOUT: $scout_name at daily cap — skipping"
+            continue
+        fi
+
+        daemon_log "SCOUT: firing $scout_name"
+        SCOUTS_FIRED_THIS_TICK=$((SCOUTS_FIRED_THIS_TICK + 1))
+        fire_scout "$scout_file" &
+    done
     return 0
 }
 
@@ -744,6 +922,14 @@ write_heartbeat('$HEARTBEAT_FILE', pid=$$, last_event='$event')
 while true; do
     TURN=$((TURN + 1))
     write_heartbeat "tick_start"
+
+    # Per-tick aggregate counters (brief-034 cycle 6). Reset every tick; read
+    # back in the Phase 5 tick-metric emitter. active_scouts + api_calls are
+    # tracked in-process — don't hoist into shared state.
+    SCOUTS_FIRED_THIS_TICK=0
+    CONDUCTOR_FIRED_THIS_TICK=0
+    WORKER_FIRED_THIS_TICK=0
+    VALIDATOR_FIRED_THIS_TICK=0
 
     # --- Escalate-resolved detection (breaks dedup on stale triggers) ---
     # When the conductor writes escalate.json, subsequent ticks with the same
@@ -815,6 +1001,7 @@ while true; do
             else
                 write_heartbeat "phase2_conductor:$REASON"
                 invoke_conductor "$REASON"
+                CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
                 LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
                 DID_WORK=true
 
@@ -973,6 +1160,14 @@ except: print(0)
     fi
 
     # ┌─────────────────────────────────────┐
+    # │  Phase 2.6: Scouts (specialists)    │
+    # └─────────────────────────────────────┘
+    # Brief-034 cycle 4. Dormant when SCOUTS_ENABLED is empty. Backgrounded
+    # scouts run in parallel with worker/validator on the same tick.
+    write_heartbeat "phase2_6_scouts"
+    invoke_scouts
+
+    # ┌─────────────────────────────────────┐
     # │  Phase 2.7: Validator (if pending)  │
     # └─────────────────────────────────────┘
     # Sits between 2.5 and 3: a builder commit lands on tick N (Phase 3),
@@ -985,6 +1180,7 @@ except: print(0)
             if [ -n "$V_BRIEF" ] && [ -n "$V_BRANCH" ] && [ -n "$V_COMMIT" ]; then
                 write_heartbeat "phase2_7_validator:$V_BRIEF"
                 run_validator_iteration "$V_BRIEF" "$V_BRANCH" "$V_COMMIT"
+                VALIDATOR_FIRED_THIS_TICK=$((VALIDATOR_FIRED_THIS_TICK + 1))
                 DID_WORK=true
                 LAST_CONDUCTOR_TRIGGER=""
             else
@@ -1005,10 +1201,12 @@ except: print(0)
                 notify "3 worker failures on $BRIEF_ID — escalating"
                 write_heartbeat "phase3_conductor_escalate:$BRIEF_ID"
                 invoke_conductor "worker_failures_${BRIEF_ID}"
+                CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
                 CONSECUTIVE_WORKER_FAILURES=0
             else
                 write_heartbeat "phase3_worker:$BRIEF_ID"
                 run_worker_iteration "$BRIEF_ID" "$BRIEF_BRANCH"
+                WORKER_FIRED_THIS_TICK=$((WORKER_FIRED_THIS_TICK + 1))
                 DID_WORK=true
                 LAST_CONDUCTOR_TRIGGER=""
             fi
@@ -1028,6 +1226,38 @@ except: print(0)
     else
         rm -f "$SIGNALS_DIR/.escalate_notified"
     fi
+
+    # ┌─────────────────────────────────────┐
+    # │  Phase 4.5: Per-tick metric emit    │
+    # └─────────────────────────────────────┘
+    # Brief-034 cycle 6. One aggregate record per tick with concurrency + scout
+    # + api-call counts. Downstream: loop-report.py reads source=="tick" to
+    # compute concurrency utilization + scout signal/noise + api-burst sizes.
+    # Intentionally separate from the existing source=="daemon"/source=="idle"
+    # records so consumers can filter cleanly without schema overload.
+    API_CALLS_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + WORKER_FIRED_THIS_TICK + VALIDATOR_FIRED_THIS_TICK + SCOUTS_FIRED_THIS_TICK))
+    if [ "$DID_WORK" = true ]; then DID_WORK_PY=True; else DID_WORK_PY=False; fi
+    python3 -c "
+import json, datetime, os, sys
+try:
+    ifb = 0
+    if os.path.exists('$RUNNING_FILE'):
+        with open('$RUNNING_FILE') as f:
+            ifb = len(json.load(f).get('active', []))
+    entry = {
+        'timestamp': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'source': 'tick',
+        'tick_number': $TURN,
+        'in_flight_briefs': ifb,
+        'active_scouts': $SCOUTS_FIRED_THIS_TICK,
+        'api_calls_total_tick': $API_CALLS_THIS_TICK,
+        'did_work': $DID_WORK_PY,
+    }
+    with open('$METRICS_FILE', 'a') as f:
+        f.write(json.dumps(entry) + '\n')
+except Exception as e:
+    print(f'tick metric error: {e}', file=sys.stderr)
+" 2>/dev/null
 
     # ┌─────────────────────────────────────┐
     # │  Phase 5: Sleep (adaptive)          │

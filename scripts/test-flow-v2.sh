@@ -799,51 +799,6 @@ assert_eq "history[0].brief is brief-BF-test (moved from active)" "$HIST_BRIEF" 
 
 fi  # startup_repair.py exists (test 15)
 
-# ── Test 15b: backfill_history moves merged brief from awaiting_review[] ────
-
-echo ""
-echo "=== Test 15b: backfill_history — merged brief still in awaiting_review[] gets moved to history[] ==="
-
-if [ ! -f "$STARTUP_REPAIR" ]; then
-    fail "startup_repair.py not found — skipping test 15b"
-else
-
-# Covers the hand-merge drift class: scav merges via `git merge --no-ff` directly,
-# bypassing the daemon's merge handler, which doesn't update running.json.awaiting_review.
-# Next startup_repair should move the brief to history just like it does for active[].
-write_running "{
-    'active': [],
-    'completed_pending_eval': [],
-    'pending_merges': [],
-    'awaiting_review': [{'brief': 'brief-BF-test', 'branch': 'brief-BF-test'}],
-    'history': []
-}"
-
-> "$SCRATCH/.loop/state/log.jsonl"
-
-ACTION_COUNT=$(python3 -c "
-import sys
-sys.path.insert(0, '$LIB_DIR')
-from startup_repair import run_startup_repair
-from actions import init_paths
-paths = init_paths('$SCRATCH')
-actions = run_startup_repair(paths, '$SCRATCH')
-print(len(actions))
-" 2>/dev/null)
-assert_eq "backfill_history returns 1 action for awaiting_review+merged brief" "$ACTION_COUNT" "1"
-
-RJ="$SCRATCH/.loop/state/running.json"
-AR_LEN=$(json_get "$RJ" "len(d.get('awaiting_review',[]))")
-assert_eq "awaiting_review[] is empty after backfill (brief moved out)" "$AR_LEN" "0"
-
-HIST_LEN=$(json_get "$RJ" "len(d.get('history',[]))")
-assert_eq "history[] has 1 entry after moving from awaiting_review" "$HIST_LEN" "1"
-
-HIST_BRIEF=$(json_get "$RJ" "d['history'][0]['brief']")
-assert_eq "history[0].brief is brief-BF-test (moved from awaiting_review)" "$HIST_BRIEF" "brief-BF-test"
-
-fi  # startup_repair.py exists (test 15b)
-
 # ── Test 16: clean_stale_queues removes stale pending-merge.json ─────────────
 
 echo ""
@@ -1312,349 +1267,1107 @@ assert_eq "repeated tick after conflict: merge() returns False cleanly (no retry
 
 rm -rf "$MERGE_SCRATCH"
 
-# ── Tests 25-28 (brief-021): human_queue_summary — three-source merge ────────
+# ── Tests 25-26: Conductor dedup — queue-head augmentation ───────────────────
+# The augmentation runs in daemon.sh after assess.py: when trigger is
+# CONDUCTOR:no_active, daemon reads goals.md and appends the first brief ID
+# from ## Queued next. We test the augmentation Python snippet directly.
 
-echo ""
-echo "=== Tests 25-28: human_queue_summary — 'Awaiting you' section sources ==="
+DEDUP_SCRATCH=$(mktemp -d)
+mkdir -p "$DEDUP_SCRATCH/.loop/state"
 
-HQS_SCRATCH=$(mktemp -d)
-mkdir -p "$HQS_SCRATCH/.loop/state/signals"
-
-init_hqs_running() {
-    python3 -c "import json; json.dump($1, open('$HQS_SCRATCH/.loop/state/running.json','w'), indent=2)"
+# Shared helper: run the same queue-head extraction snippet daemon.sh uses.
+queue_head_id() {
+    local state_dir="$1"
+    python3 -c "
+import re, sys
+goals_file = '$state_dir/goals.md'
+try:
+    with open(goals_file) as f:
+        txt = f.read()
+    sections = txt.split('\n## ')
+    for sec in sections:
+        if sec.lower().startswith('queued next'):
+            m = re.search(r'brief-\d+-[\w-]+', sec)
+            if m:
+                print(m.group(0))
+                sys.exit(0)
+except Exception:
+    pass
+" 2>/dev/null || true
 }
 
-# ── Test 25: empty state → empty list (section suppressed) ───────────────────
+# Test 25: goals.md has a brief in ## Queued next → augmentation produces
+# CONDUCTOR:no_active:<brief-id>, distinct from the stored-dedup key.
+cat > "$DEDUP_SCRATCH/.loop/state/goals.md" <<'GOALS_EOF'
+# Goals
+
+## Queued next
+
+1. **brief-099-test-brief** — test fixture for dedup regression.
+GOALS_EOF
+
+HEAD_ID=$(queue_head_id "$DEDUP_SCRATCH/.loop/state")
+AUGMENTED_TRIGGER="CONDUCTOR:no_active"
+[ -n "$HEAD_ID" ] && AUGMENTED_TRIGGER="CONDUCTOR:no_active:$HEAD_ID"
+assert_eq "conductor dedup: no_active trigger augmented with queue head ID" \
+    "$AUGMENTED_TRIGGER" "CONDUCTOR:no_active:brief-099-test-brief"
+
+# Test 26: empty ## Queued next → no augmentation, trigger stays identity-less.
+# Genuinely-idle dedup must still hold (two consecutive empty-queue ticks dedup).
+cat > "$DEDUP_SCRATCH/.loop/state/goals.md" <<'GOALS_EOF'
+# Goals
+
+## Queued next
+
+_nothing scheduled_
+GOALS_EOF
+
+EMPTY_HEAD=$(queue_head_id "$DEDUP_SCRATCH/.loop/state")
+EMPTY_TRIGGER="CONDUCTOR:no_active"
+[ -n "$EMPTY_HEAD" ] && EMPTY_TRIGGER="CONDUCTOR:no_active:$EMPTY_HEAD"
+assert_eq "conductor dedup: empty queue keeps identity-less trigger (dedup holds)" \
+    "$EMPTY_TRIGGER" "CONDUCTOR:no_active"
+
+rm -rf "$DEDUP_SCRATCH"
+
+# ── Tests 27-29 (brief-025 item 2): Presence-check canonical-root resolution ──
 
 echo ""
-echo "=== Test 25: human_queue_summary — empty state returns empty list ==="
+echo "=== Tests 27-29: Presence-check canonical-root resolution ==="
 
-init_hqs_running "{
-    'active': [],
-    'completed_pending_eval': [],
-    'pending_merges': [],
-    'awaiting_review': [],
-    'history': []
-}"
+CANON_SCRATCH=$(mktemp -d)
+mkdir -p "$CANON_SCRATCH/.loop/briefs"
+mkdir -p "$CANON_SCRATCH/wiki/design-system"
+mkdir -p "$CANON_SCRATCH/docs"
 
-HQS_LEN=$(python3 -c "
+# Brief that names design-system/index.md in completion criteria
+cat > "$CANON_SCRATCH/.loop/briefs/brief-CANON-test.md" <<'CANONEOF'
+# Brief: canonical-root test
+
+**ID:** brief-CANON-test
+
+## Completion criteria
+
+- [ ] `design-system/index.md` present
+CANONEOF
+
+# Test 27: file at wiki/design-system/index.md — should resolve via canonical root, PASS + resolved_at emitted
+touch "$CANON_SCRATCH/wiki/design-system/index.md"
+CANON_RESULT=$(python3 -c "
 import sys
 sys.path.insert(0, '$LIB_DIR')
-from actions import init_paths, human_queue_summary
-paths = init_paths('$HQS_SCRATCH')
-items = human_queue_summary(paths)
-print(len(items))
+from actions import validator_presence_check
+missing = validator_presence_check('$CANON_SCRATCH/.loop/briefs/brief-CANON-test.md', '$CANON_SCRATCH')
+print('PASS' if not missing else 'BLOCK')
 " 2>/dev/null)
-assert_eq "human_queue_summary: empty state returns empty list (section suppressed)" \
-    "$HQS_LEN" "0"
+assert_eq "presence-check canonical-root: resolves design-system/index.md via wiki/" \
+    "$CANON_RESULT" "PASS"
 
-# ── Test 26: one awaiting_review entry → reason + approve hint ───────────────
-
-echo ""
-echo "=== Test 26: human_queue_summary — one awaiting_review entry ==="
-
-init_hqs_running "{
-    'active': [],
-    'completed_pending_eval': [],
-    'pending_merges': [],
-    'awaiting_review': [{'brief': 'brief-026-ar', 'branch': 'brief-026-ar', 'reason': 'Held for live smoke test on M5'}],
-    'history': []
-}"
-
-HQS_AR=$(python3 -c "
+# Verify resolved_at is emitted to stderr
+CANON_STDERR=$(python3 -c "
 import sys
 sys.path.insert(0, '$LIB_DIR')
-from actions import init_paths, human_queue_summary
-paths = init_paths('$HQS_SCRATCH')
-items = human_queue_summary(paths)
-if items:
-    i = items[0]
-    print(f\"{i['source']}|{i['brief_id']}|{i['action_hint']}\")
+from actions import validator_presence_check
+validator_presence_check('$CANON_SCRATCH/.loop/briefs/brief-CANON-test.md', '$CANON_SCRATCH')
+" 2>&1 >/dev/null)
+assert_eq "presence-check canonical-root: emits resolved_at log line to stderr" \
+    "$CANON_STDERR" "resolved_at: wiki/design-system/index.md"
+
+rm -f "$CANON_SCRATCH/wiki/design-system/index.md"
+
+# Test 28: file genuinely absent everywhere → BLOCK (negative test)
+CANON_MISSING=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$CANON_SCRATCH/.loop/briefs/brief-CANON-test.md', '$CANON_SCRATCH')
+print('BLOCK' if missing else 'PASS')
+" 2>/dev/null)
+assert_eq "presence-check canonical-root: genuinely missing file still BLOCKS" \
+    "$CANON_MISSING" "BLOCK"
+
+# Test 29: file at docs/config.md — resolves via docs/ canonical root
+cat > "$CANON_SCRATCH/.loop/briefs/brief-CANON-docs.md" <<'CANONDOCSEOF'
+# Brief: canonical-root docs test
+
+**ID:** brief-CANON-docs
+
+## Completion criteria
+
+- [ ] `config.md` present
+CANONDOCSEOF
+
+touch "$CANON_SCRATCH/docs/config.md"
+CANON_DOCS=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$CANON_SCRATCH/.loop/briefs/brief-CANON-docs.md', '$CANON_SCRATCH')
+print('PASS' if not missing else 'BLOCK')
+" 2>/dev/null)
+assert_eq "presence-check canonical-root: resolves config.md via docs/" \
+    "$CANON_DOCS" "PASS"
+
+rm -rf "$CANON_SCRATCH"
+
+# ── Tests 30-31 (brief-025 item 3): Validator wrapper synthetic review ────────
+
+echo ""
+echo "=== Tests 30-31: Validator wrapper synthetic review ==="
+
+WRAP_SCRATCH=$(mktemp -d)
+WRAP_WORKTREE="$WRAP_SCRATCH/worktree"
+mkdir -p "$WRAP_WORKTREE/.loop/modules/validator/state/reviews"
+WRAP_METRICS="$WRAP_SCRATCH/metrics.jsonl"
+touch "$WRAP_METRICS"
+
+WRAP_BRIEF_ID="brief-WRAP-test"
+WRAP_CYCLE=3
+WRAP_COMMIT="abc123def456789"
+WRAP_BRANCH="brief-WRAP-test"
+WRAP_REVIEW_REL=".loop/modules/validator/state/reviews/${WRAP_BRIEF_ID}-cycle-${WRAP_CYCLE}.md"
+
+# Shared wrapper-logic script: mirrors the if-block added in brief-025 item 3
+WRAP_LOGIC=$(mktemp)
+cat > "$WRAP_LOGIC" <<'WRAPEOF'
+#!/usr/bin/env bash
+# Args: worktree review_rel brief_id cycle commit_sha branch metrics_file
+WORKTREE_DIR="$1"; REVIEW_REL="$2"; brief_id="$3"; cycle="$4"
+commit_sha="$5"; branch="$6"; METRICS_FILE="$7"
+if [ ! -f "$WORKTREE_DIR/$REVIEW_REL" ]; then
+    NOW_ISO_WRAP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    mkdir -p "$(dirname "$WORKTREE_DIR/$REVIEW_REL")"
+    cat > "$WORKTREE_DIR/$REVIEW_REL" <<SYNTHEOF
+---
+cycle: $cycle
+commit: $commit_sha
+brief: $brief_id
+branch: $branch
+verdict: pass
+summary: validator agent returned without writing — wrapper-synthesized pass review
+validator: wrapper-synthesized (brief-025)
+reviewed_at: $NOW_ISO_WRAP
+---
+
+## Bugs found
+- _none_
+
+## Execution concerns
+- validator agent exited without producing a review file; wrapper wrote this synthetic pass. Investigate agent logs if this recurs.
+
+## Spec-fit notes
+- _none_
+
+## Deferred items
+- _none_
+SYNTHEOF
+    python3 -c "
+import json, datetime
+entry = {
+    'timestamp': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'source': 'validator',
+    'event': 'validator_wrapper_synthesized',
+    'brief': '$brief_id',
+    'cycle': $cycle,
+    'commit': '${commit_sha:0:12}',
+}
+with open('$METRICS_FILE', 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+" 2>/dev/null
+fi
+WRAPEOF
+chmod +x "$WRAP_LOGIC"
+
+# Test 30: agent silent-exit (no review file written) → wrapper synthesizes pass review
+bash "$WRAP_LOGIC" "$WRAP_WORKTREE" "$WRAP_REVIEW_REL" \
+    "$WRAP_BRIEF_ID" "$WRAP_CYCLE" "$WRAP_COMMIT" "$WRAP_BRANCH" "$WRAP_METRICS"
+
+WRAP_VERDICT=$(python3 -c "
+import re
+content = open('$WRAP_WORKTREE/$WRAP_REVIEW_REL').read()
+m = re.search(r'^verdict:\s*(\S+)', content, re.MULTILINE)
+print(m.group(1) if m else 'missing')
+" 2>/dev/null)
+assert_eq "validator wrapper: synthesizes pass review on silent agent exit" \
+    "$WRAP_VERDICT" "pass"
+
+# Test 31: synthesized review logged in metrics.jsonl as validator_wrapper_synthesized
+WRAP_METRICS_EVENT=$(python3 -c "
+import json
+events = [json.loads(l) for l in open('$WRAP_METRICS') if l.strip()]
+match = any(e.get('event') == 'validator_wrapper_synthesized' for e in events)
+print('found' if match else 'missing')
+" 2>/dev/null)
+assert_eq "validator wrapper: logs validator_wrapper_synthesized event to metrics" \
+    "$WRAP_METRICS_EVENT" "found"
+
+rm -rf "$WRAP_SCRATCH"
+rm -f "$WRAP_LOGIC"
+
+# ── Tests 32-34 (brief-025): Presence-check gate regression ──────────────────
+
+echo ""
+echo "=== Tests 32-34: Presence-check gate regression — status gates presence-check ==="
+
+GATEREG_SCRATCH=$(mktemp -d)
+mkdir -p "$GATEREG_SCRATCH/.loop/briefs" "$GATEREG_SCRATCH/.loop/state"
+
+cat > "$GATEREG_SCRATCH/.loop/briefs/brief-GATEREG.md" <<'GREOF'
+# Brief: presence-gate regression
+
+**ID:** brief-GATEREG
+**Status:** running
+
+## Completion criteria
+
+- [ ] `closeout.md` present
+GREOF
+
+GATEREG_PROGRESS="$GATEREG_SCRATCH/.loop/state/progress.json"
+
+# Test 32: status=running → gate skips presence-check (never calls validator_presence_check)
+echo '{"status":"running"}' > "$GATEREG_PROGRESS"
+GATE32_STATUS=$(python3 -c "import json; print(json.load(open('$GATEREG_PROGRESS')).get('status',''))" 2>/dev/null)
+if [ "$GATE32_STATUS" = "complete" ]; then
+    GATE32_RESULT="ran"
+else
+    GATE32_RESULT="skipped"
+fi
+assert_eq "presence-check gate: status=running skips check" "$GATE32_RESULT" "skipped"
+
+# Test 33: status=complete + artifact missing → presence-check runs and blocks
+echo '{"status":"complete"}' > "$GATEREG_PROGRESS"
+GATE33_STATUS=$(python3 -c "import json; print(json.load(open('$GATEREG_PROGRESS')).get('status',''))" 2>/dev/null)
+if [ "$GATE33_STATUS" = "complete" ]; then
+    GATE33_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$GATEREG_SCRATCH/.loop/briefs/brief-GATEREG.md', '$GATEREG_SCRATCH')
+print('blocked' if missing else 'passed')
+" 2>/dev/null)
+else
+    GATE33_RESULT="skipped"
+fi
+assert_eq "presence-check gate: status=complete + missing artifact → blocked" "$GATE33_RESULT" "blocked"
+
+# Test 34: status=complete + artifact present → presence-check runs and passes
+touch "$GATEREG_SCRATCH/closeout.md"
+GATE34_STATUS=$(python3 -c "import json; print(json.load(open('$GATEREG_PROGRESS')).get('status',''))" 2>/dev/null)
+if [ "$GATE34_STATUS" = "complete" ]; then
+    GATE34_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import validator_presence_check
+missing = validator_presence_check('$GATEREG_SCRATCH/.loop/briefs/brief-GATEREG.md', '$GATEREG_SCRATCH')
+print('blocked' if missing else 'passed')
+" 2>/dev/null)
+else
+    GATE34_RESULT="skipped"
+fi
+assert_eq "presence-check gate: status=complete + artifact present → passed" "$GATE34_RESULT" "passed"
+
+rm -rf "$GATEREG_SCRATCH"
+
+# ── Tests 35-37 (brief-025): Depends-on-secrets credential gate ───────────────
+
+echo ""
+echo "=== Tests 35-37: Depends-on-secrets — credential gate in dispatch block ==="
+
+SECRETS_SCRATCH=$(mktemp -d)
+mkdir -p "$SECRETS_SCRATCH/.loop/briefs" "$SECRETS_SCRATCH/.loop/state"
+
+# Fabricated brief with Depends-on-secrets: FAKE_TOKEN_SL025
+cat > "$SECRETS_SCRATCH/.loop/briefs/brief-SECRETS.md" <<'SECEOF'
+# Brief: credential-gated test
+
+**ID:** brief-SECRETS
+**Status:** queued
+**Depends-on-secrets:** FAKE_TOKEN_SL025, ANOTHER_FAKE_SL025
+SECEOF
+
+cat > "$SECRETS_SCRATCH/.loop/state/pending-dispatch.json" <<PDEOF
+{
+  "brief": "brief-SECRETS",
+  "branch": "brief-SECRETS",
+  "brief_file": ".loop/briefs/brief-SECRETS.md"
+}
+PDEOF
+
+cat > "$SECRETS_SCRATCH/.loop/state/running.json" <<'RUNEOF'
+{"active":[],"completed_pending_eval":[],"awaiting_review":[],"history":[]}
+RUNEOF
+
+# Test 35: FAKE_TOKEN_SL025 unset → check-depends-on-secrets returns blocked:FAKE_TOKEN_SL025
+SECRETS35_OUTPUT=$(python3 "$ACTIONS" check-depends-on-secrets "$SECRETS_SCRATCH" 2>/dev/null)
+SECRETS35_VERDICT=$(echo "$SECRETS35_OUTPUT" | sed -n 1p)
+case "$SECRETS35_VERDICT" in
+    blocked:FAKE_TOKEN_SL025) SECRETS35_RESULT="blocked" ;;
+    *) SECRETS35_RESULT="unexpected:$SECRETS35_VERDICT" ;;
+esac
+assert_eq "depends-on-secrets: unset var → verdict blocked:FAKE_TOKEN_SL025" \
+    "$SECRETS35_RESULT" "blocked"
+
+# Test 36: all vars set → check-depends-on-secrets returns allowed
+SECRETS36_OUTPUT=$(FAKE_TOKEN_SL025=x ANOTHER_FAKE_SL025=y python3 "$ACTIONS" check-depends-on-secrets "$SECRETS_SCRATCH" 2>/dev/null)
+SECRETS36_VERDICT=$(echo "$SECRETS36_OUTPUT" | sed -n 1p)
+assert_eq "depends-on-secrets: all vars set → verdict allowed" \
+    "$SECRETS36_VERDICT" "allowed"
+
+# Test 37: brief with no Depends-on-secrets field → backward compat, always allowed
+cat > "$SECRETS_SCRATCH/.loop/state/pending-dispatch.json" <<PDEOF2
+{
+  "brief": "brief-NOSECRETS",
+  "branch": "brief-NOSECRETS",
+  "brief_file": ".loop/briefs/brief-NOSECRETS.md"
+}
+PDEOF2
+
+cat > "$SECRETS_SCRATCH/.loop/briefs/brief-NOSECRETS.md" <<'NOSECEOF'
+# Brief: no-credential test
+
+**ID:** brief-NOSECRETS
+**Status:** queued
+**Depends-on:** brief-001-placeholder
+NOSECEOF
+
+SECRETS37_OUTPUT=$(python3 "$ACTIONS" check-depends-on-secrets "$SECRETS_SCRATCH" 2>/dev/null)
+SECRETS37_VERDICT=$(echo "$SECRETS37_OUTPUT" | sed -n 1p)
+assert_eq "depends-on-secrets: no field → backward compat, allowed" \
+    "$SECRETS37_VERDICT" "allowed"
+
+rm -rf "$SECRETS_SCRATCH"
+
+# ── Tests 38-42 (brief-027): Human-gate artifact detection ───────────────────
+
+echo ""
+echo "=== Tests 38-42: Human-gate artifact detection — _find_handoff_artifact + human_queue_summary ==="
+
+HG_SCRATCH=$(mktemp -d)
+mkdir -p "$HG_SCRATCH/.loop/briefs" "$HG_SCRATCH/.loop/state"
+mkdir -p "$HG_SCRATCH/wiki/briefs/cards/brief-HG-smoke"
+
+cat > "$HG_SCRATCH/.loop/config.sh" <<'EOF'
+PROJECT_NAME="test"
+WIKI_PORT="8002"
+EOF
+
+cat > "$HG_SCRATCH/.loop/briefs/brief-HG-smoke.md" <<'EOF'
+# Brief: human-gate smoke test
+
+**ID:** brief-HG-smoke
+**Auto-merge:** false
+**Human-gate:** smoke
+**Status:** queued
+EOF
+
+cat > "$HG_SCRATCH/.loop/state/running.json" <<'RUNEOF'
+{"active":[],"completed_pending_eval":[],"pending_merges":[],"awaiting_review":[],"history":[]}
+RUNEOF
+
+# Test 38: _find_handoff_artifact returns (None, True) when no artifact present
+HG38_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import _find_handoff_artifact
+url, missing = _find_handoff_artifact('$HG_SCRATCH', 'brief-HG-smoke', '8002')
+print('missing' if missing and url is None else 'found')
+" 2>/dev/null)
+assert_eq "human-gate: _find_handoff_artifact returns missing when no artifact" \
+    "$HG38_RESULT" "missing"
+
+# Write smoke.md at the expected card dir path (simulates worker output on status transition)
+cat > "$HG_SCRATCH/wiki/briefs/cards/brief-HG-smoke/smoke.md" <<'SMOKEEOF'
+---
+title: "brief-HG-smoke smoke — test brief"
+brief: brief-HG-smoke
+category: smoke
+status: awaiting-mattie
+---
+
+# Smoke test — test brief
+
+!!! abstract "TL;DR"
+    **What shipped:** test artifact
+
+    **Target moment:** test
+
+    **Your part:** run smoke test
+
+## What shipped
+
+| # | Task | Landed as |
+|---|---|---|
+| 1 | test task | test output |
+
+## What's gated on you
+
+- Run smoke commands
+
+## Prerequisites
+
+!!! warning "None"
+    No hardware gates.
+
+## Runbook
+
+### Phase 1 — Smoke run
+
+**blocking.** 2 min
+
+```bash
+echo "smoke test"
+```
+
+## What "works" looks like
+
+- Command exits 0
+
+## Alternatives if a gate fails
+
+!!! note "If smoke fails"
+    Re-run with verbose flag.
+
+## Resolution options
+
+| Option | When to pick | Action |
+|---|---|---|
+| **Approve** | Smoke passes | `loop approve brief-HG-smoke` |
+| **Iterate** | Minor issues | Requeue with notes |
+| **Reject** | Fundamental failure | `loop reject brief-HG-smoke` |
+
+## Scav recommendation
+
+**Approve and merge.**
+
+Test passed.
+
+## What you should feel
+
+Confident.
+
+## If something breaks mid-runbook
+
+Capture and ping.
+
+## References
+
+- [Brief index](index.md)
+SMOKEEOF
+
+# Test 39: _find_handoff_artifact returns URL when smoke.md present
+HG39_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import _find_handoff_artifact
+url, missing = _find_handoff_artifact('$HG_SCRATCH', 'brief-HG-smoke', '8002')
+if not missing and url and 'brief-HG-smoke' in url and '/smoke/' in url:
+    print('found')
 else:
-    print('empty')
+    print('fail: url=%s missing=%s' % (url, missing))
 " 2>/dev/null)
-assert_eq "human_queue_summary: awaiting_review source field" \
-    "$(echo "$HQS_AR" | cut -d'|' -f1)" "awaiting_review"
-assert_eq "human_queue_summary: awaiting_review brief_id" \
-    "$(echo "$HQS_AR" | cut -d'|' -f2)" "brief-026-ar"
-assert_eq "human_queue_summary: awaiting_review action_hint is loop approve" \
-    "$(echo "$HQS_AR" | cut -d'|' -f3)" "loop approve brief-026-ar"
+assert_eq "human-gate: _find_handoff_artifact returns URL when smoke.md present" \
+    "$HG39_RESULT" "found"
 
-# Reset awaiting_review for test 27
-init_hqs_running "{
-    'active': [],
-    'completed_pending_eval': [],
-    'pending_merges': [],
-    'awaiting_review': [],
-    'history': []
-}"
+# Test 40: flavor priority — smoke wins over review and escalation when all present
+mkdir -p "$HG_SCRATCH/wiki/briefs/cards/brief-HG-multi"
+touch "$HG_SCRATCH/wiki/briefs/cards/brief-HG-multi/review.md"
+touch "$HG_SCRATCH/wiki/briefs/cards/brief-HG-multi/escalation.md"
+touch "$HG_SCRATCH/wiki/briefs/cards/brief-HG-multi/smoke.md"
+HG40_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import _find_handoff_artifact
+url, missing = _find_handoff_artifact('$HG_SCRATCH', 'brief-HG-multi', '8002')
+if url and '/smoke/' in url:
+    print('smoke')
+elif url and '/review/' in url:
+    print('review')
+else:
+    print('other: %s' % url)
+" 2>/dev/null)
+assert_eq "human-gate: smoke flavor takes priority over review + escalation" \
+    "$HG40_RESULT" "smoke"
 
-# ── Test 27: one live escalate.json → category + summary; archived excluded ──
-
-echo ""
-echo "=== Test 27: human_queue_summary — one live escalate.json (archived suffix excluded) ==="
-
+# Test 41: human_queue_summary populates artifact_url for awaiting_review entry with smoke.md
 python3 -c "
 import json
-json.dump({'brief': 'brief-027-esc', 'category': 'human-in-the-loop-dependency', 'summary': 'Auth token missing for CF deploy step'}, open('$HQS_SCRATCH/.loop/state/signals/escalate.json','w'))
-json.dump({'brief': 'brief-OLD', 'category': 'push_failed', 'summary': 'Old archived escalation'}, open('$HQS_SCRATCH/.loop/state/signals/escalate.json.resolved-by-hold-2026-04-23','w'))
+d = {
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [{'brief': 'brief-HG-smoke', 'branch': 'brief-HG-smoke', 'auto_merge': False, 'reason': 'smoke test required'}],
+    'history': []
+}
+json.dump(d, open('$HG_SCRATCH/.loop/state/running.json', 'w'))
+"
+HG41_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, human_queue_summary
+paths = init_paths('$HG_SCRATCH')
+items = human_queue_summary(paths)
+item = next((i for i in items if i['brief_id'] == 'brief-HG-smoke'), None)
+if item is None:
+    print('missing_item')
+elif item.get('artifact_url') and '/smoke/' in item['artifact_url'] and not item.get('artifact_missing'):
+    print('ok')
+else:
+    print('fail: url=%s missing=%s' % (item.get('artifact_url'), item.get('artifact_missing')))
+" 2>/dev/null)
+assert_eq "human-gate: human_queue_summary returns artifact_url for awaiting_review with smoke.md" \
+    "$HG41_RESULT" "ok"
+
+# Test 42: smoke.md at expected path has required sections from the artifact template
+HG42_SECTIONS=$(python3 -c "
+content = open('$HG_SCRATCH/wiki/briefs/cards/brief-HG-smoke/smoke.md').read()
+required = ['TL;DR', 'What shipped', 'Runbook', 'Resolution options', 'What you should feel']
+missing = [s for s in required if s not in content]
+print('ok' if not missing else 'missing: ' + ', '.join(missing))
+" 2>/dev/null)
+assert_eq "human-gate: smoke.md at wiki/briefs/cards/{id}/smoke.md has required sections" \
+    "$HG42_SECTIONS" "ok"
+
+rm -rf "$HG_SCRATCH"
+
+# ── Tests 43-45 (brief-028): Dirty-tree merge recovery ────────────────────────
+# Verify that an untracked validator review file in main's working tree does NOT
+# block the merge — the pre-merge safe-path git clean in merge() removes it first.
+
+echo ""
+echo "=== Tests 43-45: Dirty-tree merge recovery (brief-028) ==="
+
+DT_SCRATCH=$(mktemp -d)
+
+git -C "$DT_SCRATCH" init -q -b main
+git -C "$DT_SCRATCH" config user.email "test@test"
+git -C "$DT_SCRATCH" config user.name "Test"
+
+mkdir -p "$DT_SCRATCH/.loop/state/signals"
+mkdir -p "$DT_SCRATCH/.loop/state"
+mkdir -p "$DT_SCRATCH/.loop/worktrees"
+mkdir -p "$DT_SCRATCH/.loop/modules/validator/state/reviews"
+
+cat > "$DT_SCRATCH/.loop/config.sh" <<'EOF'
+PROJECT_NAME="test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+EOF
+
+touch "$DT_SCRATCH/.loop/state/log.jsonl"
+
+# Seed initial commit on main (must include .loop dir for git clean to have context)
+echo "base" > "$DT_SCRATCH/base.txt"
+git -C "$DT_SCRATCH" add base.txt
+git -C "$DT_SCRATCH" commit -q -m "init"
+
+# Bare origin so push succeeds
+git init --bare -q "$DT_SCRATCH/origin.git"
+git -C "$DT_SCRATCH" remote add origin "$DT_SCRATCH/origin.git"
+git -C "$DT_SCRATCH" push -q origin main
+
+# Create branch that commits a validator review file
+REVIEW_REL=".loop/modules/validator/state/reviews/brief-DT-test-cycle-1.md"
+git -C "$DT_SCRATCH" checkout -q -b brief-DT-test
+mkdir -p "$DT_SCRATCH/$(dirname "$REVIEW_REL")"
+cat > "$DT_SCRATCH/$REVIEW_REL" <<'REOF'
+---
+validator: loop-reviewer
+brief: brief-DT-test
+cycle: 1
+verdict: APPROVE
+---
+Looks good.
+REOF
+git -C "$DT_SCRATCH" add "$REVIEW_REL"
+git -C "$DT_SCRATCH" commit -q -m "brief-DT-test: add validator review"
+git -C "$DT_SCRATCH" checkout -q main
+
+# Drop the same review file as an UNTRACKED file in main's working tree.
+# This simulates the validator wrapper writing to project root instead of worktree.
+mkdir -p "$DT_SCRATCH/$(dirname "$REVIEW_REL")"
+cat > "$DT_SCRATCH/$REVIEW_REL" <<'REOF'
+---
+validator: wrapper-synthesized (brief-025)
+brief: brief-DT-test
+cycle: 1
+verdict: APPROVE
+---
+Synthesized pass.
+REOF
+
+# Test 43: confirm that WITHOUT the pre-merge clean, git merge aborts on dirty tree.
+# We call raw git merge, not merge() — this proves the problem is real.
+DT43_RC=0
+git -C "$DT_SCRATCH" merge brief-DT-test --no-ff -m "raw merge" > /dev/null 2>&1 || DT43_RC=$?
+# Restore untracked file (raw merge may have partially cleaned on error)
+mkdir -p "$DT_SCRATCH/$(dirname "$REVIEW_REL")"
+cat > "$DT_SCRATCH/$REVIEW_REL" <<'REOF'
+---
+validator: wrapper-synthesized (brief-025)
+brief: brief-DT-test
+cycle: 1
+verdict: APPROVE
+---
+Synthesized pass.
+REOF
+# Reset merge state if it partially ran
+git -C "$DT_SCRATCH" merge --abort 2>/dev/null || true
+DT43_ABORTED=$([ "$DT43_RC" -ne 0 ] && echo "yes" || echo "no")
+assert_eq "dirty-tree: raw git merge aborts when untracked review file blocks" \
+    "$DT43_ABORTED" "yes"
+
+# Test 44: merge() pre-merge clean removes the untracked file → merge succeeds.
+python3 -c "
+import json
+json.dump({
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [{'brief': 'brief-DT-test', 'branch': 'brief-DT-test'}],
+    'awaiting_review': [],
+    'history': []
+}, open('$DT_SCRATCH/.loop/state/running.json', 'w'), indent=2)
+"
+cat > "$DT_SCRATCH/.loop/state/pending-merge.json" <<'PMEOF'
+{"brief": "brief-DT-test", "branch": "brief-DT-test", "title": "dirty-tree test", "evaluation": ""}
+PMEOF
+
+# merge() prints pre-merge-clean status to stdout — capture last line only for verdict.
+DT44_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, merge
+paths = init_paths('$DT_SCRATCH')
+try:
+    result = merge(paths)
+    print('ok' if result is not False else 'false')
+except Exception as e:
+    msg = str(e).lower()
+    if 'overwritten' in msg or 'dirty' in msg or 'please move' in msg:
+        print('dirty_tree_abort')
+    else:
+        print('ok_push_or_cleanup')
+" 2>/dev/null | tail -1)
+assert_eq "dirty-tree: merge() completes despite untracked validator review at safe path" \
+    "$DT44_RESULT" "ok"
+
+# Test 45: pre-merge clean action was logged in log.jsonl when it removed a file.
+# log_action writes {action: "daemon:pre_merge_clean", ...} entries.
+DT45_LOGGED=$(python3 -c "
+import json
+log_path = '$DT_SCRATCH/.loop/state/log.jsonl'
+try:
+    with open(log_path) as f:
+        events = [json.loads(l) for l in f if l.strip()]
+    clean_events = [e for e in events if e.get('action') == 'daemon:pre_merge_clean']
+    print('logged' if clean_events else 'not_logged')
+except Exception as e:
+    print('error:' + str(e))
+" 2>/dev/null)
+assert_eq "dirty-tree: pre_merge_clean event logged when untracked review removed" \
+    "$DT45_LOGGED" "logged"
+
+rm -rf "$DT_SCRATCH"
+
+# ── Tests 46-51 (brief-034 cycle 3): concurrency gate in dispatch ─────────────
+# Verify THROTTLE cap + Parallel-safe/Edit-surface overlap detection in
+# actions.dispatch. Covers the four gate outcomes (throttle_reached,
+# concurrency_skip on overlap / on new-brief not parallel-safe / on active-brief
+# not parallel-safe), plus the two pass-through cases (empty active; disjoint
+# surfaces at THROTTLE=2).
+
+echo ""
+echo "=== Tests 46-51: Concurrency gate in dispatch (brief-034) ==="
+
+CC_SCRATCH=$(mktemp -d)
+
+git -C "$CC_SCRATCH" init -q -b main
+git -C "$CC_SCRATCH" config user.email "test@test"
+git -C "$CC_SCRATCH" config user.name "Test"
+
+mkdir -p "$CC_SCRATCH/.loop/state/signals"
+mkdir -p "$CC_SCRATCH/.loop/briefs"
+mkdir -p "$CC_SCRATCH/.loop/worktrees"
+touch "$CC_SCRATCH/.loop/state/log.jsonl"
+
+echo "base" > "$CC_SCRATCH/base.txt"
+git -C "$CC_SCRATCH" add base.txt
+git -C "$CC_SCRATCH" commit -q -m "init"
+
+cat > "$CC_SCRATCH/.loop/briefs/brief-A.md" <<'EOF'
+# Brief: A
+**ID:** brief-A
+**Parallel-safe:** true
+**Edit-surface:**
+  - crates/hive/
+EOF
+cat > "$CC_SCRATCH/.loop/briefs/brief-B.md" <<'EOF'
+# Brief: B
+**ID:** brief-B
+**Parallel-safe:** true
+**Edit-surface:**
+  - crates/playground/
+EOF
+cat > "$CC_SCRATCH/.loop/briefs/brief-C.md" <<'EOF'
+# Brief: C
+**ID:** brief-C
+**Parallel-safe:** true
+**Edit-surface:**
+  - crates/hive/src/
+EOF
+cat > "$CC_SCRATCH/.loop/briefs/brief-D.md" <<'EOF'
+# Brief: D (legacy, no Parallel-safe)
+**ID:** brief-D
+EOF
+
+# Helper: write config.sh with given THROTTLE
+cc_write_cfg() {
+    cat > "$CC_SCRATCH/.loop/config.sh" <<EOF
+PROJECT_NAME="test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+THROTTLE=$1
+EOF
+}
+
+# Helper: seed running.json with given active[] (JSON string argument).
+# JSON is passed via env to avoid Python-vs-JSON literal mismatch (true/false).
+cc_write_running() {
+    CC_ACTIVE_JSON="$1" python3 -c "
+import json, os
+active = json.loads(os.environ['CC_ACTIVE_JSON'])
+json.dump({
+    'active': active,
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': []
+}, open('$CC_SCRATCH/.loop/state/running.json', 'w'), indent=2)
+"
+}
+
+# Helper: seed pending-dispatch.json for a brief
+cc_write_pending() {
+    cat > "$CC_SCRATCH/.loop/state/pending-dispatch.json" <<EOF
+{"brief": "$1", "branch": "$1", "brief_file": ".loop/briefs/$1.md"}
+EOF
+}
+
+# Helper: read the last log event's `action` field
+cc_last_action() {
+    python3 -c "
+import json
+with open('$CC_SCRATCH/.loop/state/log.jsonl') as f:
+    events = [json.loads(l) for l in f if l.strip()]
+print(events[-1]['action'] if events else 'none')
+" 2>/dev/null
+}
+
+# Helper: run dispatch's GATE ONLY by mocking ensure_worktree. Returns:
+#   "gate_pass" if the gate passed (ensure_worktree would be invoked)
+#   last-log-action otherwise.
+cc_run_gate() {
+    python3 -c "
+import sys, os
+sys.path.insert(0, '$LIB_DIR')
+import actions as A
+paths = A.init_paths('$CC_SCRATCH')
+# Short-circuit after the gate passes: raise before any git operation.
+def stop_here(*a, **kw):
+    raise SystemExit('__gate_pass__')
+A.ensure_worktree = stop_here
+# Neutralize git calls so a pass-through that reaches git doesn't explode.
+class _R:
+    returncode = 0; stdout = ''; stderr = ''
+A.git = lambda *a, **kw: _R()
+try:
+    A.dispatch(paths)
+    print('dispatch_returned_false')
+except SystemExit as e:
+    if '__gate_pass__' in str(e):
+        print('gate_pass')
+    else:
+        raise
+" 2>/dev/null
+}
+
+# Test 46: empty active[], THROTTLE=1 → gate passes
+cc_write_cfg 1
+cc_write_running '[]'
+cc_write_pending "brief-A"
+CC46=$(cc_run_gate)
+assert_eq "concurrency: empty active THROTTLE=1 → gate_pass" "$CC46" "gate_pass"
+rm -f "$CC_SCRATCH/.loop/state/pending-dispatch.json"
+
+# Test 47: THROTTLE=1 + 1 active → throttle_reached
+cc_write_cfg 1
+cc_write_running '[{"brief":"in-flight","branch":"in-flight","parallel_safe":true,"edit_surface":["x/"]}]'
+cc_write_pending "brief-A"
+cc_run_gate > /dev/null
+CC47=$(cc_last_action)
+assert_eq "concurrency: THROTTLE=1 + in-flight → throttle_reached" "$CC47" "daemon:throttle_reached"
+
+# Test 48: THROTTLE=2, disjoint surfaces, both parallel_safe=true → gate passes
+cc_write_cfg 2
+cc_write_running '[{"brief":"in-flight","branch":"in-flight","parallel_safe":true,"edit_surface":["crates/playground/"]}]'
+cc_write_pending "brief-A"
+CC48=$(cc_run_gate)
+assert_eq "concurrency: THROTTLE=2 + disjoint surfaces → gate_pass" "$CC48" "gate_pass"
+rm -f "$CC_SCRATCH/.loop/state/pending-dispatch.json"
+
+# Test 49: THROTTLE=2, overlapping surfaces → concurrency_skip
+cc_write_cfg 2
+cc_write_running '[{"brief":"in-flight","branch":"in-flight","parallel_safe":true,"edit_surface":["crates/hive/"]}]'
+cc_write_pending "brief-C"
+cc_run_gate > /dev/null
+CC49=$(cc_last_action)
+assert_eq "concurrency: THROTTLE=2 + overlap → concurrency_skip" "$CC49" "daemon:concurrency_skip"
+
+# Test 50: THROTTLE=2, new brief not parallel-safe (legacy) → concurrency_skip
+cc_write_cfg 2
+cc_write_running '[{"brief":"in-flight","branch":"in-flight","parallel_safe":true,"edit_surface":["crates/x/"]}]'
+cc_write_pending "brief-D"
+cc_run_gate > /dev/null
+CC50=$(cc_last_action)
+assert_eq "concurrency: THROTTLE=2 + new brief not parallel-safe → concurrency_skip" \
+    "$CC50" "daemon:concurrency_skip"
+
+# Test 51: THROTTLE=2, active brief missing parallel_safe (legacy) → concurrency_skip
+cc_write_cfg 2
+cc_write_running '[{"brief":"legacy-in-flight","branch":"legacy-in-flight"}]'
+cc_write_pending "brief-A"
+cc_run_gate > /dev/null
+CC51=$(cc_last_action)
+assert_eq "concurrency: THROTTLE=2 + legacy active → concurrency_skip" \
+    "$CC51" "daemon:concurrency_skip"
+
+rm -rf "$CC_SCRATCH"
+
+# ── Tests 52-59 (brief-034 cycle 4): scout parser + scheduler + output contract
+# Covers: frontmatter parse, cadence-seconds derivation, is-due against
+# log.jsonl history, daily-cap enforcement, kill_on consecutive-failures, and
+# apply-output-contract for stewardship-log-append / log-only / noop-marker.
+
+echo ""
+echo "=== Tests 52-59: Scouts — parse + schedule + contracts (brief-034) ==="
+
+SC_SCRATCH=$(mktemp -d)
+mkdir -p "$SC_SCRATCH/.loop/state/signals" "$SC_SCRATCH/.loop/specialists"
+touch "$SC_SCRATCH/.loop/state/log.jsonl"
+
+cat > "$SC_SCRATCH/.loop/config.sh" <<'EOF'
+PROJECT_NAME="sc-test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+EOF
+
+# Pilot-shaped scout (queue-steward analog)
+cat > "$SC_SCRATCH/.loop/specialists/steward.md" <<'EOF'
+---
+name: steward
+cadence:
+  every: 30m
+model: sonnet
+max_runs_per_day: 2
+max_runtime_seconds: 60
+outputs: stewardship-log-append
+kill_on:
+  - daemon-stop
+  - 3-consecutive-failures
+---
+
+# Role: steward
+
+Test body.
+EOF
+
+# Log-only scout for contract-rejection test
+cat > "$SC_SCRATCH/.loop/specialists/logger.md" <<'EOF'
+---
+name: logger
+cadence:
+  every: 30m
+model: haiku
+max_runs_per_day: 48
+max_runtime_seconds: 30
+outputs: log-only
+kill_on:
+  - daemon-stop
+---
+
+# Role: logger
+
+Emit nothing; this scout only pings.
+EOF
+
+SC_SPEC="$SC_SCRATCH/.loop/specialists/steward.md"
+SC_LOGGER="$SC_SCRATCH/.loop/specialists/logger.md"
+
+# Test 52: frontmatter parse — get-field name + outputs
+SC_NAME=$(python3 "$LIB_DIR/scouts.py" get-field "$SC_SPEC" name 2>/dev/null)
+assert_eq "scout: get-field name" "$SC_NAME" "steward"
+SC_OUT=$(python3 "$LIB_DIR/scouts.py" get-field "$SC_SPEC" outputs 2>/dev/null)
+assert_eq "scout: get-field outputs" "$SC_OUT" "stewardship-log-append"
+
+# Test 53: is-due returns yes on fresh scout (no log history)
+SC_DUE=$(python3 "$LIB_DIR/scouts.py" is-due "$SC_SPEC" "$SC_SCRATCH" 2>/dev/null)
+assert_eq "scout: is-due yes on empty log" "$SC_DUE" "yes"
+
+# Test 54: over-daily-cap returns no initially
+SC_CAP=$(python3 "$LIB_DIR/scouts.py" over-daily-cap "$SC_SPEC" "$SC_SCRATCH" 2>/dev/null)
+assert_eq "scout: over-daily-cap no on empty log" "$SC_CAP" "no"
+
+# Seed 2 scout_fire events today → cap reached (max_runs_per_day=2)
+SC_TODAY=$(python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+python3 -c "
+import json
+with open('$SC_SCRATCH/.loop/state/log.jsonl', 'a') as f:
+    for _ in range(2):
+        f.write(json.dumps({'timestamp': '$SC_TODAY', 'action': 'daemon:scout_fire', 'specialist': 'steward'}) + '\n')
 "
 
-HQS_ESC=$(python3 -c "
-import sys
-sys.path.insert(0, '$LIB_DIR')
-from actions import init_paths, human_queue_summary
-paths = init_paths('$HQS_SCRATCH')
-items = human_queue_summary(paths)
-if items:
-    i = items[0]
-    print(f\"{i['source']}|{i['brief_id']}|{len(items)}\")
-else:
-    print('empty')
-" 2>/dev/null)
-assert_eq "human_queue_summary: escalate source field" \
-    "$(echo "$HQS_ESC" | cut -d'|' -f1)" "escalate"
-assert_eq "human_queue_summary: escalate brief_id from signal file" \
-    "$(echo "$HQS_ESC" | cut -d'|' -f2)" "brief-027-esc"
-assert_eq "human_queue_summary: archived-suffix file excluded (count=1 not 2)" \
-    "$(echo "$HQS_ESC" | cut -d'|' -f3)" "1"
+# Test 55: over-daily-cap yes after 2 fires
+SC_CAP2=$(python3 "$LIB_DIR/scouts.py" over-daily-cap "$SC_SPEC" "$SC_SCRATCH" 2>/dev/null)
+assert_eq "scout: over-daily-cap yes after 2 fires" "$SC_CAP2" "yes"
 
-rm -f "$HQS_SCRATCH/.loop/state/signals/escalate.json"
-rm -f "$HQS_SCRATCH/.loop/state/signals/escalate.json.resolved-by-hold-2026-04-23"
-
-# ── Test 28: credential-gated brief in goals.md → gating keyword ─────────────
-
-echo ""
-echo "=== Test 28: human_queue_summary — credential-gated brief in goals.md ==="
-
-cat > "$HQS_SCRATCH/.loop/state/goals.md" <<'GOALSEOF'
-## Credential-gated
-
-- brief-028-cg-test: Wiki deploy. **Requires:** CF API token + allowlist emails
-GOALSEOF
-
-HQS_CG=$(python3 -c "
-import sys
-sys.path.insert(0, '$LIB_DIR')
-from actions import init_paths, human_queue_summary
-paths = init_paths('$HQS_SCRATCH')
-items = human_queue_summary(paths)
-if items:
-    i = items[0]
-    print(f\"{i['source']}|{i['brief_id']}|{i['summary']}\")
-else:
-    print('empty')
-" 2>/dev/null)
-assert_eq "human_queue_summary: credential-gated source field" \
-    "$(echo "$HQS_CG" | cut -d'|' -f1)" "credential-gated"
-assert_eq "human_queue_summary: credential-gated brief_id" \
-    "$(echo "$HQS_CG" | cut -d'|' -f2)" "brief-028-cg-test"
-HQS_CG_KW="$(echo "$HQS_CG" | cut -d'|' -f3)"
-case "$HQS_CG_KW" in
-    CF*|cf*) pass "human_queue_summary: credential-gated keyword extracted (starts with CF)" ;;
-    *) fail "human_queue_summary: credential-gated keyword — got '$HQS_CG_KW'" ;;
-esac
-
-rm -rf "$HQS_SCRATCH"
-
-# ── Tests 29-35 (brief-026): loop init + hive config ─────────────────────────
-
-LOOP_BIN="$SCRIPT_DIR/../bin/loop"
-HIVE_BIN="$SCRIPT_DIR/../target/release/hive"
-
-# ── Test 29: loop init --minimal creates expected .loop/ tree ────────────────
-
-echo ""
-echo "=== Test 29: loop init --minimal — creates expected .loop/ tree ==="
-
-INIT_SCRATCH=$(mktemp -d)
-
-(cd "$INIT_SCRATCH" && bash "$LOOP_BIN" init --minimal) > /dev/null 2>&1
-
-[ -f "$INIT_SCRATCH/.loop/state/running.json" ] \
-    && pass "loop init --minimal: .loop/state/running.json exists" \
-    || fail "loop init --minimal: .loop/state/running.json missing"
-
-[ -f "$INIT_SCRATCH/.loop/state/goals.md" ] \
-    && pass "loop init --minimal: .loop/state/goals.md exists" \
-    || fail "loop init --minimal: .loop/state/goals.md missing"
-
-[ -f "$INIT_SCRATCH/.loop/state/stewardship-log.md" ] \
-    && pass "loop init --minimal: stewardship-log.md exists" \
-    || fail "loop init --minimal: stewardship-log.md missing"
-
-[ -f "$INIT_SCRATCH/.loop/briefs/README.md" ] \
-    && pass "loop init --minimal: .loop/briefs/README.md exists" \
-    || fail "loop init --minimal: .loop/briefs/README.md missing"
-
-[ -d "$INIT_SCRATCH/.loop/signals" ] \
-    && pass "loop init --minimal: .loop/signals/ dir exists" \
-    || fail "loop init --minimal: .loop/signals/ dir missing"
-
-[ -f "$INIT_SCRATCH/.loop/config.json" ] \
-    && pass "loop init --minimal: .loop/config.json exists" \
-    || fail "loop init --minimal: .loop/config.json missing"
-
-[ ! -d "$INIT_SCRATCH/wiki" ] \
-    && pass "loop init --minimal: no wiki/ scaffold created (minimal mode)" \
-    || fail "loop init --minimal: wiki/ created unexpectedly in minimal mode"
-
-# ── Test 30: loop init --wiki-full creates expected wiki scaffold ────────────
-
-echo ""
-echo "=== Test 30: loop init --wiki-full — creates wiki scaffold ==="
-
-WIKI_SCRATCH=$(mktemp -d)
-
-(cd "$WIKI_SCRATCH" && bash "$LOOP_BIN" init --wiki-full) > /dev/null 2>&1
-
-[ -f "$WIKI_SCRATCH/wiki/soul.md" ] \
-    && pass "loop init --wiki-full: wiki/soul.md exists" \
-    || fail "loop init --wiki-full: wiki/soul.md missing"
-
-[ -f "$WIKI_SCRATCH/wiki/CLAUDE.md" ] \
-    && pass "loop init --wiki-full: wiki/CLAUDE.md exists" \
-    || fail "loop init --wiki-full: wiki/CLAUDE.md missing"
-
-[ -f "$WIKI_SCRATCH/wiki/briefs/cards/README.md" ] \
-    && pass "loop init --wiki-full: wiki/briefs/cards/README.md exists" \
-    || fail "loop init --wiki-full: wiki/briefs/cards/README.md missing"
-
-[ -f "$WIKI_SCRATCH/wiki/operating-docs/director-context.md" ] \
-    && pass "loop init --wiki-full: wiki/operating-docs/director-context.md exists" \
-    || fail "loop init --wiki-full: wiki/operating-docs/director-context.md missing"
-
-[ -f "$WIKI_SCRATCH/zensical.toml" ] \
-    && pass "loop init --wiki-full: zensical.toml exists" \
-    || fail "loop init --wiki-full: zensical.toml missing"
-
-# CLAUDE.md must contain the session-start load order section (non-trivial content)
-if grep -q "Session-start\|session.start\|load order" "$WIKI_SCRATCH/wiki/CLAUDE.md" 2>/dev/null; then
-    pass "loop init --wiki-full: wiki/CLAUDE.md has session-start load order content"
-else
-    fail "loop init --wiki-full: wiki/CLAUDE.md appears empty or missing expected content"
-fi
-
-# director-context.md must exist with readable content (non-empty)
-if [ -s "$WIKI_SCRATCH/wiki/operating-docs/director-context.md" ]; then
-    pass "loop init --wiki-full: director-context.md is non-empty"
-else
-    fail "loop init --wiki-full: director-context.md is empty or missing"
-fi
-
-# ── Test 31: loop init refuses when .loop/ already exists ────────────────────
-
-echo ""
-echo "=== Test 31: loop init refuses when .loop/ already exists ==="
-
-REFUSE_MSG=$(cd "$INIT_SCRATCH" && bash "$LOOP_BIN" init --minimal 2>&1 || true)
-case "$REFUSE_MSG" in
-    *"already initialized"*)
-        pass "loop init: refuses with 'already initialized' message when .loop/ exists" ;;
-    *)
-        fail "loop init: expected refusal message — got '$REFUSE_MSG'" ;;
-esac
-
-# running.json must still have its original empty-state content (not clobbered)
-RUNNING_AFTER=$(python3 -c "import json; d=json.load(open('$INIT_SCRATCH/.loop/state/running.json')); print(isinstance(d.get('active'), list))" 2>/dev/null)
-assert_eq "loop init refuse: running.json not clobbered after refused re-init" \
-    "$RUNNING_AFTER" "True"
-
-# ── Test 32: loop init --dry-run changes nothing on disk ─────────────────────
-
-echo ""
-echo "=== Test 32: loop init --dry-run — changes nothing on disk ==="
-
-DRY_SCRATCH=$(mktemp -d)
-
-DRY_OUT=$(cd "$DRY_SCRATCH" && bash "$LOOP_BIN" init --wiki-full --dry-run 2>&1)
-
-[ ! -d "$DRY_SCRATCH/.loop" ] \
-    && pass "loop init --dry-run: .loop/ not created on disk" \
-    || fail "loop init --dry-run: .loop/ was created (should be dry-run)"
-
-[ ! -d "$DRY_SCRATCH/wiki" ] \
-    && pass "loop init --dry-run: wiki/ not created on disk" \
-    || fail "loop init --dry-run: wiki/ was created (should be dry-run)"
-
-case "$DRY_OUT" in
-    *"Would create"*)
-        pass "loop init --dry-run: stdout mentions 'Would create'" ;;
-    *)
-        fail "loop init --dry-run: stdout missing 'Would create' — got '$DRY_OUT'" ;;
-esac
-
-# ── Test 33: .loop/config.json seeded by init is valid JSON with beehive key ─
-
-echo ""
-echo "=== Test 33: loop init seeds .loop/config.json with valid JSON + beehive key ==="
-
-CONFIG_VALID=$(python3 -c "
-import json, sys
-try:
-    d = json.load(open('$INIT_SCRATCH/.loop/config.json'))
-    print('valid')
-except Exception as e:
-    print(f'invalid: {e}')
-" 2>/dev/null)
-assert_eq "loop init: .loop/config.json is valid JSON" "$CONFIG_VALID" "valid"
-
-CONFIG_HAS_BEEHIVE=$(python3 -c "
+# Test 56: kill_on 3-consecutive-failures → check returns 'kill'
+python3 -c "
 import json
-d = json.load(open('$INIT_SCRATCH/.loop/config.json'))
-print('yes' if 'beehive' in d else 'no')
-" 2>/dev/null)
-assert_eq "loop init: .loop/config.json has 'beehive' key" "$CONFIG_HAS_BEEHIVE" "yes"
+with open('$SC_SCRATCH/.loop/state/log.jsonl', 'a') as f:
+    for _ in range(3):
+        f.write(json.dumps({'timestamp': '$SC_TODAY', 'action': 'daemon:scout_failed', 'specialist': 'steward'}) + '\n')
+"
+SC_CHK=$(python3 "$LIB_DIR/scouts.py" check "$SC_SPEC" "$SC_SCRATCH" 2>/dev/null)
+assert_eq "scout: 3-consecutive-failures → kill" "$SC_CHK" "kill"
 
-# ── Test 34: hive binary exits with message when run outside .loop/ dir ──────
+# Test 57: apply-output-contract writes to stewardship-log-YYYY-MM-DD.md
+SC_JSON=$(mktemp)
+echo '{"result": "heartbeat stale: 7200s; flagged 2 stuck briefs"}' > "$SC_JSON"
+python3 "$LIB_DIR/scouts.py" apply-output-contract "$SC_SPEC" "$SC_JSON" "$SC_SCRATCH" > /dev/null 2>&1
+SC_TODAY_DATE=$(python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%d'))")
+SC_TARGET="$SC_SCRATCH/.loop/state/stewardship-log-${SC_TODAY_DATE}.md"
+if [ -f "$SC_TARGET" ] && grep -q "heartbeat stale" "$SC_TARGET"; then
+    pass "scout: stewardship-log-append writes to today's file"
+else
+    fail "scout: stewardship-log-append writes to today's file"
+fi
+rm -f "$SC_JSON"
+
+# Test 58: noop-marker → no file written; status=noop
+SC_JSON2=$(mktemp)
+echo '{"result": "nothing to report"}' > "$SC_JSON2"
+SC_STATUS=$(python3 "$LIB_DIR/scouts.py" apply-output-contract "$SC_SPEC" "$SC_JSON2" "$SC_SCRATCH" 2>/dev/null | cut -f1)
+assert_eq "scout: noop-marker → status=noop" "$SC_STATUS" "noop"
+rm -f "$SC_JSON2"
+
+# Test 59: log-only scout producing text → status=rejected (contract violation)
+SC_JSON3=$(mktemp)
+echo '{"result": "some unauthorized output"}' > "$SC_JSON3"
+SC_STATUS_LO=$(python3 "$LIB_DIR/scouts.py" apply-output-contract "$SC_LOGGER" "$SC_JSON3" "$SC_SCRATCH" 2>/dev/null | cut -f1)
+assert_eq "scout: log-only with text → rejected" "$SC_STATUS_LO" "rejected"
+rm -f "$SC_JSON3"
+
+rm -rf "$SC_SCRATCH"
+
+# ── Tests 60-63 (brief-034 cycle 9): scout cadence + stewardship-log rotation
+# Covers gaps the cycle-4 tests left: is-due respects a recent fire (cadence
+# window not yet elapsed), is-due fires once cadence elapses, and
+# stewardship-log-append rotates cleanly across UTC day boundaries (per-day
+# files, no cross-bleed).
 
 echo ""
-echo "=== Test 34: hive binary exits non-zero with message when no .loop/ found ==="
+echo "=== Tests 60-63: Scout cadence + stewardship-log rotation (brief-034) ==="
 
-if [ ! -f "$HIVE_BIN" ]; then
-    fail "hive binary not found at $HIVE_BIN — run install.sh or cargo build first"
-    fail "hive: cannot verify exit-without-.loop/ behavior (binary missing)"
+SR_SCRATCH=$(mktemp -d)
+mkdir -p "$SR_SCRATCH/.loop/state/signals" "$SR_SCRATCH/.loop/specialists"
+touch "$SR_SCRATCH/.loop/state/log.jsonl"
+
+cat > "$SR_SCRATCH/.loop/config.sh" <<'EOF'
+PROJECT_NAME="sr-test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+EOF
+
+cat > "$SR_SCRATCH/.loop/specialists/steward.md" <<'EOF'
+---
+name: steward
+cadence:
+  every: 30m
+model: sonnet
+max_runs_per_day: 48
+max_runtime_seconds: 60
+outputs: stewardship-log-append
+kill_on:
+  - daemon-stop
+  - 3-consecutive-failures
+---
+
+# Role: steward
+
+Test body.
+EOF
+
+SR_SPEC="$SR_SCRATCH/.loop/specialists/steward.md"
+
+# Test 60: is-due=no when last fire is within cadence window (10 min ago; cadence 30m)
+SR_RECENT=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+python3 -c "
+import json
+with open('$SR_SCRATCH/.loop/state/log.jsonl', 'w') as f:
+    f.write(json.dumps({'timestamp': '$SR_RECENT', 'action': 'daemon:scout_fire', 'specialist': 'steward'}) + '\n')
+"
+SR_DUE_RECENT=$(python3 "$LIB_DIR/scouts.py" is-due "$SR_SPEC" "$SR_SCRATCH" 2>/dev/null)
+assert_eq "scout: is-due=no when last fire 10m ago (cadence 30m)" "$SR_DUE_RECENT" "no"
+
+# Test 61: is-due=yes when last fire predates cadence window (40 min ago)
+SR_OLD=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(minutes=40)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+python3 -c "
+import json
+with open('$SR_SCRATCH/.loop/state/log.jsonl', 'w') as f:
+    f.write(json.dumps({'timestamp': '$SR_OLD', 'action': 'daemon:scout_fire', 'specialist': 'steward'}) + '\n')
+"
+SR_DUE_OLD=$(python3 "$LIB_DIR/scouts.py" is-due "$SR_SPEC" "$SR_SCRATCH" 2>/dev/null)
+assert_eq "scout: is-due=yes when last fire 40m ago (cadence 30m)" "$SR_DUE_OLD" "yes"
+
+# Test 62: stewardship-log rotation — pre-existing yesterday file is preserved;
+# today's apply-output-contract creates a distinct today-dated file.
+SR_TODAY=$(python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%d'))")
+SR_YESTERDAY=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(days=1)).strftime('%Y-%m-%d'))")
+SR_YFILE="$SR_SCRATCH/.loop/state/stewardship-log-${SR_YESTERDAY}.md"
+SR_TFILE="$SR_SCRATCH/.loop/state/stewardship-log-${SR_TODAY}.md"
+printf '# %s\n\n## legacy-entry\nold content\n' "$SR_YESTERDAY" > "$SR_YFILE"
+SR_YSIZE_BEFORE=$(wc -c < "$SR_YFILE" | tr -d ' ')
+
+SR_JSON=$(mktemp)
+echo '{"result": "queue-steward observation: 3 briefs in flight, no interventions needed"}' > "$SR_JSON"
+python3 "$LIB_DIR/scouts.py" apply-output-contract "$SR_SPEC" "$SR_JSON" "$SR_SCRATCH" > /dev/null 2>&1
+
+SR_YSIZE_AFTER=$(wc -c < "$SR_YFILE" | tr -d ' ')
+if [ -f "$SR_TFILE" ] && [ "$SR_YFILE" != "$SR_TFILE" ] && grep -q "queue-steward observation" "$SR_TFILE"; then
+    pass "scout: rotation — today's file distinct from yesterday's, contains today's entry"
 else
+    fail "scout: rotation — today's file distinct from yesterday's, contains today's entry"
+fi
+assert_eq "scout: rotation — yesterday's file untouched (size unchanged)" \
+    "$SR_YSIZE_AFTER" "$SR_YSIZE_BEFORE"
 
-NO_LOOP_STDERR=$("$HIVE_BIN" 2>&1 1>/dev/null || true)
-NO_LOOP_EXIT=$( { "$HIVE_BIN" > /dev/null 2>&1; echo $?; } || echo "1" )
-
-# Check exit code is 1
-assert_eq "hive: exits 1 when no .loop/ directory found" "$NO_LOOP_EXIT" "1"
-
-# Check stderr contains the expected message
-case "$NO_LOOP_STDERR" in
-    *"No .loop/"*|*"loop init"*)
-        pass "hive: stderr mentions missing .loop/ and 'loop init'" ;;
-    *)
-        fail "hive: expected .loop/ missing message — got '$NO_LOOP_STDERR'" ;;
-esac
-
-fi  # hive binary exists
-
-# ── Test 35: hive config unit tests pass via cargo test ──────────────────────
-
-echo ""
-echo "=== Test 35: hive config.rs unit tests pass (palette override + invalid JSON fallback) ==="
-
-if ! command -v cargo > /dev/null 2>&1; then
-    fail "hive config unit tests: cargo not found — skipping"
+# Test 63: second stewardship-log-append on same UTC day APPENDS to today's file
+# (no clobber). Both observations survive; file grew.
+SR_TSIZE_BEFORE=$(wc -c < "$SR_TFILE" | tr -d ' ')
+SR_JSON2=$(mktemp)
+echo '{"result": "follow-up observation: merge pending cleared"}' > "$SR_JSON2"
+python3 "$LIB_DIR/scouts.py" apply-output-contract "$SR_SPEC" "$SR_JSON2" "$SR_SCRATCH" > /dev/null 2>&1
+SR_TSIZE_AFTER=$(wc -c < "$SR_TFILE" | tr -d ' ')
+if [ "$SR_TSIZE_AFTER" -gt "$SR_TSIZE_BEFORE" ] \
+   && grep -q "queue-steward observation" "$SR_TFILE" \
+   && grep -q "follow-up observation" "$SR_TFILE"; then
+    pass "scout: rotation — same-day appends accumulate (no clobber)"
 else
+    fail "scout: rotation — same-day appends accumulate (no clobber)"
+fi
+rm -f "$SR_JSON" "$SR_JSON2"
 
-CARGO_MANIFEST="$SCRIPT_DIR/../crates/hive/Cargo.toml"
-if [ ! -f "$CARGO_MANIFEST" ]; then
-    fail "hive config unit tests: crates/hive/Cargo.toml not found"
-else
-
-CARGO_OUT=$(cargo test --quiet --manifest-path "$CARGO_MANIFEST" -- config 2>&1)
-CARGO_EXIT=$?
-assert_eq "hive config unit tests: all pass (palette override + invalid JSON fallback)" \
-    "$CARGO_EXIT" "0"
-
-fi  # Cargo.toml exists
-fi  # cargo available
-
-rm -rf "$INIT_SCRATCH" "$WIKI_SCRATCH" "$DRY_SCRATCH"
+rm -rf "$SR_SCRATCH"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

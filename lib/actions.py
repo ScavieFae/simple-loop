@@ -114,6 +114,117 @@ def load_running(paths):
     return rc
 
 
+# ─── brief-034 concurrency: frontmatter parse + overlap detection ────
+
+PARALLEL_SAFE_LINE_RE = re.compile(r"^\s*\*\*Parallel-safe:\*\*\s*(\S+)", re.IGNORECASE)
+EDIT_SURFACE_LINE_RE = re.compile(r"^\s*\*\*Edit-surface:\*\*\s*(.*?)\s*$", re.IGNORECASE)
+
+
+def _normalize_surface_path(p):
+    p = p.strip()
+    if p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _paths_overlap(a, b):
+    """Pair-wise overlap check for two edit-surface paths.
+
+    Exact match, directory-prefix (trailing /), or fnmatch-style glob match
+    (bidirectional) all count as overlap. Empty string on either side → overlap
+    (claims-everything sentinel is handled by the list-level caller).
+    """
+    import fnmatch
+    a = _normalize_surface_path(a)
+    b = _normalize_surface_path(b)
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    if "*" in a and fnmatch.fnmatch(b, a):
+        return True
+    if "*" in b and fnmatch.fnmatch(a, b):
+        return True
+    if a.endswith("/") and (b.startswith(a) or b == a.rstrip("/")):
+        return True
+    if b.endswith("/") and (a.startswith(b) or a == b.rstrip("/")):
+        return True
+    return False
+
+
+def edit_surfaces_overlap(a, b):
+    """True if any path in list a overlaps any path in list b.
+
+    Empty list = claims-everything = always overlaps.
+    """
+    if not a or not b:
+        return True
+    for pa in a:
+        for pb in b:
+            if _paths_overlap(pa, pb):
+                return True
+    return False
+
+
+def parse_concurrency_frontmatter(brief_file_path):
+    """Parse Parallel-safe + Edit-surface fields from a brief markdown file.
+
+    Returns (parallel_safe: bool, edit_surface: list[str]).
+    Missing/unparseable → (False, []), equivalent to pre-034 "runs alone".
+    Template placeholders matching "[...]" are filtered out of edit_surface.
+    """
+    parallel_safe = False
+    edit_surface = []
+    if not brief_file_path or not os.path.exists(brief_file_path):
+        return parallel_safe, edit_surface
+    try:
+        with open(brief_file_path) as f:
+            lines = f.readlines()
+    except (IOError, OSError):
+        return parallel_safe, edit_surface
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        ps_m = PARALLEL_SAFE_LINE_RE.match(line)
+        if ps_m:
+            val = ps_m.group(1).strip().strip('"').strip("'").lower()
+            parallel_safe = (val == "true")
+            i += 1
+            continue
+
+        es_m = EDIT_SURFACE_LINE_RE.match(line)
+        if es_m:
+            inline = es_m.group(1).strip()
+            if inline:
+                edit_surface = [
+                    p.strip() for p in inline.split(",")
+                    if p.strip() and not (p.strip().startswith("[") and p.strip().endswith("]"))
+                ]
+                i += 1
+                continue
+            j = i + 1
+            while j < n:
+                next_line = lines[j]
+                item_m = re.match(r"^\s+-\s*(.+?)\s*$", next_line)
+                if item_m:
+                    item = item_m.group(1).strip()
+                    if item and not (item.startswith("[") and item.endswith("]")):
+                        edit_surface.append(item)
+                    j += 1
+                    continue
+                if next_line.strip() == "":
+                    j += 1
+                    continue
+                break
+            i = j
+            continue
+        i += 1
+
+    return parallel_safe, edit_surface
+
+
 def save_running(paths, data):
     """Write running.json and commit."""
     with open(paths["running_file"], "w") as f:
@@ -128,15 +239,45 @@ def save_running(paths, data):
 _CREDENTIAL_GATE_RE = re.compile(r"\*\*Requires\b", re.IGNORECASE)
 _REQUIRES_KEYWORD_RE = re.compile(r"Requires[^*\n]*:\**\s*(.+?)(?:\s*$|\s{2,})", re.IGNORECASE)
 
+# Artifact flavors checked in priority order.
+_ARTIFACT_FLAVORS = ("smoke", "review", "escalation")
+
+
+def _find_handoff_artifact(project_dir, brief_id, wiki_port):
+    """Return (artifact_url, artifact_missing) for a brief's handoff artifact.
+
+    Scans wiki/briefs/cards/{brief_id}/ for smoke.md, review.md, escalation.md
+    in that order. Returns the Zensical URL of the first found, or (None, True)
+    if none exists. wiki_port is read from WIKI_PORT in config.sh (default 8002).
+    """
+    card_dir = os.path.join(project_dir, "wiki", "briefs", "cards", brief_id)
+    for flavor in _ARTIFACT_FLAVORS:
+        if os.path.exists(os.path.join(card_dir, f"{flavor}.md")):
+            url = f"http://localhost:{wiki_port}/briefs/cards/{brief_id}/{flavor}/"
+            return (url, False)
+    return (None, True)
+
 
 def human_queue_summary(paths):
     """Return human-gated items from three sources.
 
-    Each item: {source, brief_id, summary, action_hint}. Three sources:
-    awaiting_review[] from running.json, live signal files, and
-    credential-gated entries in goals.md. Returns empty list when nothing
-    is waiting — callers suppress the section entirely in that case.
+    Each item: {source, brief_id, summary, action_hint, artifact_url,
+    artifact_missing}. Three sources: awaiting_review[] from running.json,
+    live signal files, and credential-gated entries in goals.md. Returns
+    empty list when nothing is waiting — callers suppress the section
+    entirely in that case.
+
+    artifact_url is the Zensical URL of the brief's handoff artifact
+    (smoke/review/escalation.md) when it exists, else None.
+    artifact_missing is True for awaiting_review/escalate items with no
+    handoff artifact present — signal to show a warning.
+    credential-gated items always have artifact_missing=False (no gate yet).
     """
+    project_dir = paths.get("project_dir", "")
+    loop_dir = paths.get("loop_dir", os.path.join(project_dir, ".loop"))
+    config = read_config(loop_dir)
+    wiki_port = config.get("WIKI_PORT", "8002")
+
     items = []
 
     # Source A: awaiting_review[] from running.json
@@ -147,11 +288,14 @@ def human_queue_summary(paths):
             if not brief_id:
                 continue
             reason = entry.get("reason", "human approval needed")
+            artifact_url, artifact_missing = _find_handoff_artifact(project_dir, brief_id, wiki_port)
             items.append({
                 "source": "awaiting_review",
                 "brief_id": brief_id,
                 "summary": reason[:60],
                 "action_hint": f"loop approve {brief_id}",
+                "artifact_url": artifact_url,
+                "artifact_missing": artifact_missing,
             })
     except Exception:
         pass
@@ -176,11 +320,14 @@ def human_queue_summary(paths):
                 brief_id = sig.get("brief", os.path.splitext(fname)[0])
                 category = sig.get("category", sig.get("type", fname.replace(".json", "")))
                 raw_summary = sig.get("summary", sig.get("reason", category))
+                artifact_url, artifact_missing = _find_handoff_artifact(project_dir, brief_id, wiki_port)
                 items.append({
                     "source": "escalate",
                     "brief_id": brief_id,
                     "summary": str(raw_summary)[:60],
                     "action_hint": f"resolve signals/{fname}",
+                    "artifact_url": artifact_url,
+                    "artifact_missing": artifact_missing,
                 })
     except Exception:
         pass
@@ -220,6 +367,8 @@ def human_queue_summary(paths):
                         "brief_id": brief_id,
                         "summary": keyword,
                         "action_hint": None,
+                        "artifact_url": None,
+                        "artifact_missing": False,
                     })
     except Exception:
         pass
@@ -463,7 +612,13 @@ def remove_worktree(paths, brief):
 
 
 def dispatch(paths):
-    """Process pending-dispatch.json: create worktree + branch, init progress, update state."""
+    """Process pending-dispatch.json: concurrency gate + worktree + progress init.
+
+    Brief-034: enforces THROTTLE cap and Parallel-safe/Edit-surface checks before
+    dispatching. When blocked, logs concurrency_skip / throttle_reached and
+    removes pending-dispatch.json (conductor will re-queue next tick if still
+    wanted). When clean, adds per-entry concurrency metadata to active[].
+    """
     if not os.path.exists(paths["pending_dispatch"]):
         print("No pending-dispatch.json found", file=sys.stderr)
         return False
@@ -471,6 +626,12 @@ def dispatch(paths):
     config = read_config(paths["loop_dir"])
     remote = config["GIT_REMOTE"]
     main_branch = config["GIT_MAIN_BRANCH"]
+    try:
+        throttle = int(str(config.get("THROTTLE", "1")).split("#", 1)[0].strip() or "1")
+    except (ValueError, TypeError):
+        throttle = 1
+    if throttle < 1:
+        throttle = 1
 
     with open(paths["pending_dispatch"]) as f:
         spec = json.load(f)
@@ -482,6 +643,63 @@ def dispatch(paths):
 
     project_dir = paths["project_dir"]
 
+    # ── Concurrency gate ─────────────────────────────────────────────
+    rc = load_running(paths)
+    active = rc.get("active", [])
+    in_flight = len(active)
+
+    if in_flight >= throttle:
+        log_action(paths, "throttle_reached", {
+            "brief": brief,
+            "throttle": throttle,
+            "in_flight_count": in_flight,
+        })
+        print(f"throttle_reached: {brief} deferred "
+              f"(in_flight={in_flight}, throttle={throttle})", file=sys.stderr)
+        os.remove(paths["pending_dispatch"])
+        return False
+
+    brief_file_abs = (brief_file if os.path.isabs(brief_file)
+                      else os.path.join(project_dir, brief_file))
+    parallel_safe, edit_surface = parse_concurrency_frontmatter(brief_file_abs)
+
+    if active:
+        block_reason = None
+        blocked_by = None
+        overlap_paths = []
+        if not parallel_safe:
+            block_reason = "new_brief_not_parallel_safe"
+            blocked_by = active[0].get("brief", "")
+        else:
+            for entry in active:
+                other_ps = entry.get("parallel_safe", False)
+                other_es = entry.get("edit_surface", [])
+                if not other_ps:
+                    block_reason = "active_brief_not_parallel_safe"
+                    blocked_by = entry.get("brief", "")
+                    break
+                if edit_surfaces_overlap(edit_surface, other_es):
+                    block_reason = "edit_surface_overlap"
+                    blocked_by = entry.get("brief", "")
+                    overlap_paths = sorted(
+                        {p for p in edit_surface for q in other_es if _paths_overlap(p, q)} |
+                        {q for p in edit_surface for q in other_es if _paths_overlap(p, q)}
+                    )
+                    break
+
+        if block_reason:
+            log_action(paths, "concurrency_skip", {
+                "brief": brief,
+                "blocked_by": blocked_by,
+                "reason": block_reason,
+                "overlap_paths": overlap_paths,
+            })
+            print(f"concurrency_skip: {brief} blocked by {blocked_by} ({block_reason})",
+                  file=sys.stderr)
+            os.remove(paths["pending_dispatch"])
+            return False
+
+    # ── Proceed with dispatch ────────────────────────────────────────
     # Fetch latest (no checkout needed — main tree untouched)
     git(project_dir, "fetch", remote, check=False)
 
@@ -509,13 +727,17 @@ def dispatch(paths):
     git(wt_dir, "commit", "-m", f"Initialize brief {brief}")
     git(wt_dir, "push", "-u", remote, branch)
 
-    # Update running.json on main (main tree untouched except this state file)
+    # Update running.json on main with per-entry concurrency metadata.
     rc = load_running(paths)
+    worker_slot = len(rc.get("active", []))
     rc.setdefault("active", []).append({
         "brief": brief,
         "branch": branch,
         "brief_file": brief_file,
         "dispatched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "parallel_safe": parallel_safe,
+        "edit_surface": edit_surface,
+        "worker_slot": worker_slot,
     })
     save_running(paths, rc)
     git(project_dir, "push", remote, main_branch, check=False)
@@ -523,8 +745,13 @@ def dispatch(paths):
     # Remove queue file
     os.remove(paths["pending_dispatch"])
 
-    log_action(paths, "dispatch", {"brief": brief, "branch": branch, "notes": notes})
-    print(f"Dispatched {brief} on branch {branch} (worktree: {wt_dir})")
+    log_action(paths, "dispatch", {
+        "brief": brief, "branch": branch, "notes": notes,
+        "worker_slot": worker_slot, "throttle": throttle,
+        "parallel_safe": parallel_safe,
+    })
+    print(f"Dispatched {brief} on branch {branch} "
+          f"(slot={worker_slot}, throttle={throttle})")
     return True
 
 
@@ -557,6 +784,19 @@ def merge(paths):
 
     git(project_dir, "fetch", remote, check=False)
     git(project_dir, "pull", "--ff-only", remote, main_branch, check=False)
+
+    # Pre-merge safe-path clean: remove untracked validator review files that
+    # the validator wrapper may have written to main's working tree. These are
+    # never valuable in main's tree (the branch commits carry them); clean is
+    # safe-path-only (explicit allowlist, never -fdX, never broad).
+    SAFE_CLEAN_PATHS = [".loop/modules/validator/state/reviews/"]
+    for clean_path in SAFE_CLEAN_PATHS:
+        result = git(project_dir, "clean", "-fd", clean_path, check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            log_action(paths, "pre_merge_clean", {
+                "brief": brief, "path": clean_path, "removed": result.stdout.strip()
+            })
+            print(f"pre-merge clean [{clean_path}]: {result.stdout.strip()}")
 
     # Merge the branch (using local ref if available, otherwise remote)
     merge_msg = f"Merge {brief}: {title}"
