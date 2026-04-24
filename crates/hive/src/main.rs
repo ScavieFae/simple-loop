@@ -83,6 +83,10 @@ const BLUE: Color = Color::from_u32(0x005B9BD5);
 // Worker = pop-green (bees collecting nectar); Validator = orange (quality gate)
 const POP_GREEN: Color = Color::from_u32(0x0039FF80);
 const ORANGE: Color = Color::from_u32(0x00FF8C00);
+// Scouts = teal (observation pings, not throughput). Deliberately chosen to
+// read as calmer than conductor/worker colors so the dance floor separates
+// brief-cycle noise from scout observation at a glance.
+const TEAL: Color = Color::from_u32(0x005DADE2);
 
 // ── app state ─────────────────────────────────────────────────────────────────
 
@@ -659,6 +663,57 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         }
     }
 
+    // ── Scouts ────────────────────────────────────────────────────────────────
+    // Declared scouts (files in `.loop/specialists/`) with last-fired age +
+    // today's fire/noop/failure counts. Dormant scouts (file present, never
+    // fired) render with a muted "never" — file-on-disk is the roster, the
+    // log tells you whether SCOUTS_ENABLED actually included them. Suppress
+    // the section entirely when no specialists exist so plain briefs-only
+    // projects don't carry a permanent "no scouts" row.
+    if !cells.scouts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Scouts", TEAL));
+        for sc in &cells.scouts {
+            let (glyph, glyph_color) = match sc.last_event_kind {
+                Some(state::ScoutEventKind::Fire) => ("◉", TEAL),
+                Some(state::ScoutEventKind::Noop) => ("○", MUTED),
+                Some(state::ScoutEventKind::Failed) => ("✗", CORAL),
+                None => ("·", MUTED),
+            };
+            let last_label = match (sc.last_event_at, &sc.last_event_kind) {
+                (Some(ts), Some(kind)) => {
+                    format!("{} {}", kind.label(), state::relative_time(ts))
+                }
+                _ => "never".to_string(),
+            };
+            let last_color = match sc.last_event_kind {
+                Some(state::ScoutEventKind::Failed) => CORAL,
+                Some(state::ScoutEventKind::Fire) => Color::White,
+                Some(state::ScoutEventKind::Noop) => MUTED,
+                None => MUTED,
+            };
+            let counts = format!(
+                "{}✓ {}∅ {}✗",
+                sc.fires_today, sc.noops_today, sc.failures_today
+            );
+            // Highlight failure counts in coral even when the last event was
+            // a successful fire — a trailing failure pattern matters for
+            // "is this scout healthy today" regardless of the most recent tick.
+            let counts_color = if sc.failures_today > 0 { CORAL } else { MUTED };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", glyph), Style::default().fg(glyph_color)),
+                Span::styled(
+                    sc.name.clone(),
+                    Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ·  ", Style::default().fg(MUTED)),
+                Span::styled(last_label, Style::default().fg(last_color)),
+                Span::styled("  ·  ", Style::default().fg(MUTED)),
+                Span::styled(counts, Style::default().fg(counts_color)),
+            ]));
+        }
+    }
+
     // ── Drafts ────────────────────────────────────────────────────────────────
     // Only surface the section when there's something to show — Drafts should
     // be background signal, not visual noise in the common case.
@@ -731,6 +786,7 @@ fn actor_color(actor: Option<&str>) -> Color {
         Some("worker") => POP_GREEN,
         Some("validator") => ORANGE,
         Some("reviewer") => INDIGO,
+        Some("scout") => TEAL,
         Some("builder") | Some("coder") | Some("researcher") => GOLD,
         _ => MUTED,
     }
@@ -787,9 +843,15 @@ fn render_dance_floor<'a>(df: &'a state::DanceFloorState) -> (Text<'a>, u16) {
         let msg = truncate_chars(msg_str, 55);
         let ec = event_color(ev.event.as_deref());
 
+        // Scout events get a leading diamond glyph so they're distinct from
+        // brief-cycle rows even in monochrome terminals / colorblind palettes.
+        // Color alone isn't enough signal for "observation vs throughput".
+        let is_scout = ev.actor.as_deref() == Some("scout");
+        let leading = if is_scout { "◇ " } else { "  " };
+
         let mut spans: Vec<Span<'a>> = vec![
             Span::styled(format!("{:>7}", time_str), Style::default().fg(MUTED)),
-            Span::styled("  ", Style::default()),
+            Span::styled(leading, Style::default().fg(TEAL)),
             Span::styled(format!("{:<11}", actor_str), Style::default().fg(ac)),
             Span::styled("  ", Style::default()),
         ];

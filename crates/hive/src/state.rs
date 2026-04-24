@@ -82,6 +82,10 @@ pub struct RawLogLine {
     pub actor: Option<String>,
     pub event: Option<String>,
     pub brief: Option<String>,
+    /// Set on `daemon:scout_*` events; carries the specialist name so the
+    /// dance floor and Cells Scouts subsection can attribute observations
+    /// per-scout without re-parsing the action string.
+    pub specialist: Option<String>,
 }
 
 impl RawLogLine {
@@ -93,11 +97,20 @@ impl RawLogLine {
     /// `action` before the first colon (e.g. `"daemon:merge"` → `"daemon"`).
     /// The daemon writes log.jsonl entries with `action` but no `actor` —
     /// without this they'd render as mystery `?` rows on the dance floor.
+    ///
+    /// Scouts are a special case: `daemon:scout_fire|scout_noop|scout_failed`
+    /// is daemon-emitted plumbing, but the event is about the *scout*, not the
+    /// daemon's orchestration. Relabel to "scout" so the dance floor gives
+    /// scout events their own actor color + keeps brief-cycle events visually
+    /// separate from observation pings.
     pub fn derived_actor(&self) -> Option<String> {
         if let Some(a) = &self.actor {
             return Some(a.clone());
         }
         if let Some(action) = &self.action {
+            if action.starts_with("daemon:scout_") {
+                return Some("scout".to_string());
+            }
             if let Some((prefix, _)) = action.split_once(':') {
                 return Some(prefix.to_string());
             }
@@ -587,12 +600,53 @@ pub struct RecentlyFinishedBrief {
 /// trailing window without bloating Cells.
 pub const RECENTLY_FINISHED_LIMIT: usize = 5;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScoutEventKind {
+    Fire,
+    Noop,
+    Failed,
+}
+
+impl ScoutEventKind {
+    fn from_action(action: &str) -> Option<Self> {
+        match action {
+            "daemon:scout_fire" => Some(ScoutEventKind::Fire),
+            "daemon:scout_noop" => Some(ScoutEventKind::Noop),
+            "daemon:scout_failed" => Some(ScoutEventKind::Failed),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ScoutEventKind::Fire => "fired",
+            ScoutEventKind::Noop => "noop",
+            ScoutEventKind::Failed => "failed",
+        }
+    }
+}
+
+/// One enabled-or-declared scout specialist. Surfaced in the Cells Scouts
+/// subsection so Mattie can see cadence + health at a glance.
+pub struct Scout {
+    pub name: String,
+    /// Most recent `daemon:scout_*` event for this specialist, or None if
+    /// the scout hasn't fired yet (file present but dormant — typically
+    /// because `SCOUTS_ENABLED` doesn't include this name).
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub last_event_kind: Option<ScoutEventKind>,
+    pub fires_today: usize,
+    pub noops_today: usize,
+    pub failures_today: usize,
+}
+
 pub struct CellsState {
     pub active: Vec<ActiveBrief>,
     pub pending: Vec<PendingBrief>,
     pub queued: Vec<QueuedBrief>,
     pub drafts: Vec<DraftBrief>,
     pub recently_finished: Vec<RecentlyFinishedBrief>,
+    pub scouts: Vec<Scout>,
 }
 
 /// Sort key for any work-unit id: `brief-NNN-slug`, `audit-YYYY-MM-DD-N`,
@@ -937,6 +991,120 @@ pub fn discover_draft_briefs(cards_dir: &Path, exclude: &HashSet<String>) -> Vec
     out
 }
 
+/// Scan `.loop/specialists/*.md` for declared scouts and fold in today's
+/// `daemon:scout_*` events from `log.jsonl`. One pass over the log per
+/// render tick; the scout count is tiny (single-digit in practice) so we
+/// hold a small HashMap keyed by specialist name.
+///
+/// Files starting with `_` (e.g. `_template.md`) and dotfiles are skipped.
+/// Scouts with no events yet still render — file-on-disk is the
+/// authoritative roster so Mattie sees dormant scouts, not just firing
+/// ones. The Cells subsection is where "did queue-steward actually wake
+/// up last night?" gets answered without opening the log.
+pub fn discover_scouts(specialists_dir: &Path, log_path: &Path) -> Vec<Scout> {
+    let Ok(entries) = fs::read_dir(specialists_dir) else {
+        return vec![];
+    };
+
+    struct Acc {
+        last_at: Option<DateTime<Utc>>,
+        last_kind: Option<ScoutEventKind>,
+        fires: usize,
+        noops: usize,
+        failures: usize,
+    }
+    use std::collections::HashMap;
+    let mut by_name: HashMap<String, Acc> = HashMap::new();
+
+    let mut roster: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".md") || name.starts_with('.') || name.starts_with('_') {
+            continue;
+        }
+        let stem = name.trim_end_matches(".md").to_string();
+        by_name.insert(
+            stem.clone(),
+            Acc {
+                last_at: None,
+                last_kind: None,
+                fires: 0,
+                noops: 0,
+                failures: 0,
+            },
+        );
+        roster.push(stem);
+    }
+
+    if !by_name.is_empty() {
+        if let Ok(file) = fs::File::open(log_path) {
+            let today = Utc::now().format("%Y-%m-%d").to_string();
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let Ok(line) = line else { continue };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<RawLogLine>(&line) else {
+                    continue;
+                };
+                let Some(action) = &entry.action else { continue };
+                let Some(kind) = ScoutEventKind::from_action(action) else {
+                    continue;
+                };
+                let Some(spec) = entry.specialist.clone() else { continue };
+                let Some(acc) = by_name.get_mut(&spec) else { continue };
+                let ts_str = entry.ts_str();
+                let ts = ts_str.and_then(parse_log_ts);
+                // Newest-wins for last_event — log.jsonl is append-only and
+                // sorted, but be defensive about timestamp order anyway.
+                match (acc.last_at, ts) {
+                    (None, Some(_)) => {
+                        acc.last_at = ts;
+                        acc.last_kind = Some(kind.clone());
+                    }
+                    (Some(cur), Some(new)) if new >= cur => {
+                        acc.last_at = Some(new);
+                        acc.last_kind = Some(kind.clone());
+                    }
+                    _ => {}
+                }
+                // Daily counts keyed by UTC date prefix of the timestamp —
+                // matches scouts.py fire_count_today which uses the same
+                // YYYY-MM-DD prefix check against raw `ts`/`timestamp`.
+                if let Some(ts_raw) = ts_str {
+                    if ts_raw.starts_with(&today) {
+                        match kind {
+                            ScoutEventKind::Fire => acc.fires += 1,
+                            ScoutEventKind::Noop => acc.noops += 1,
+                            ScoutEventKind::Failed => acc.failures += 1,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    roster.sort();
+    roster
+        .into_iter()
+        .map(|name| {
+            let acc = by_name.remove(&name).unwrap();
+            Scout {
+                name,
+                last_event_at: acc.last_at,
+                last_event_kind: acc.last_kind,
+                fires_today: acc.fires,
+                noops_today: acc.noops,
+                failures_today: acc.failures,
+            }
+        })
+        .collect()
+}
+
 impl CellsState {
     pub fn load() -> Self {
         let running_path = Path::new(".loop/state/running.json");
@@ -1148,12 +1316,16 @@ impl CellsState {
 
         let recently_finished = recent_finished(&raw.history);
 
+        let specialists_dir = Path::new(".loop/specialists");
+        let scouts = discover_scouts(specialists_dir, log_path);
+
         CellsState {
             active,
             pending,
             queued,
             drafts,
             recently_finished,
+            scouts,
         }
     }
 }
@@ -1798,6 +1970,133 @@ mod tests {
         let line = r#"{"ts":"2026-04-21T17:00:00Z","event":"something"}"#;
         let entry: RawLogLine = serde_json::from_str(line).unwrap();
         assert!(entry.derived_actor().is_none());
+    }
+
+    #[test]
+    fn derived_actor_relabels_daemon_scout_as_scout() {
+        let line = r#"{"timestamp":"2026-04-24T02:00:00Z","action":"daemon:scout_fire","specialist":"queue-steward"}"#;
+        let entry: RawLogLine = serde_json::from_str(line).unwrap();
+        assert_eq!(entry.derived_actor().as_deref(), Some("scout"));
+        assert_eq!(entry.specialist.as_deref(), Some("queue-steward"));
+    }
+
+    #[test]
+    fn derived_actor_daemon_non_scout_stays_daemon() {
+        let line = r#"{"timestamp":"2026-04-24T02:00:00Z","action":"daemon:merge","brief":"brief-034"}"#;
+        let entry: RawLogLine = serde_json::from_str(line).unwrap();
+        assert_eq!(entry.derived_actor().as_deref(), Some("daemon"));
+    }
+
+    #[test]
+    fn scout_event_kind_from_action() {
+        assert_eq!(
+            ScoutEventKind::from_action("daemon:scout_fire"),
+            Some(ScoutEventKind::Fire)
+        );
+        assert_eq!(
+            ScoutEventKind::from_action("daemon:scout_noop"),
+            Some(ScoutEventKind::Noop)
+        );
+        assert_eq!(
+            ScoutEventKind::from_action("daemon:scout_failed"),
+            Some(ScoutEventKind::Failed)
+        );
+        assert!(ScoutEventKind::from_action("daemon:merge").is_none());
+    }
+
+    #[test]
+    fn discover_scouts_empty_when_dir_missing() {
+        let missing = std::env::temp_dir().join("hive_scouts_missing_dir_xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        let log = tempfile_write(b"");
+        let scouts = discover_scouts(&missing, &log);
+        assert!(scouts.is_empty());
+        std::fs::remove_file(&log).ok();
+    }
+
+    #[test]
+    fn discover_scouts_reads_files_and_events() {
+        // One dir with two specialist files, a template that should be
+        // ignored, and a log.jsonl with two events for one of them.
+        let dir = std::env::temp_dir().join(format!(
+            "hive_scouts_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("queue-steward.md"), "---\nname: queue-steward\n---\n").unwrap();
+        std::fs::write(dir.join("bug-spotter.md"), "---\nname: bug-spotter\n---\n").unwrap();
+        std::fs::write(dir.join("_template.md"), "---\nname: _template\n---\n").unwrap();
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let now_iso = format!("{}T12:00:00Z", today);
+        let earlier = format!("{}T11:00:00Z", today);
+        let log_data = format!(
+            "{{\"timestamp\":\"{earlier}\",\"action\":\"daemon:scout_fire\",\"specialist\":\"queue-steward\"}}\n\
+             {{\"timestamp\":\"{now_iso}\",\"action\":\"daemon:scout_noop\",\"specialist\":\"queue-steward\"}}\n\
+             {{\"timestamp\":\"{now_iso}\",\"action\":\"daemon:merge\",\"brief\":\"brief-001\"}}\n",
+            earlier = earlier,
+            now_iso = now_iso,
+        );
+        let log = tempfile_write(log_data.as_bytes());
+
+        let scouts = discover_scouts(&dir, &log);
+        // `_template.md` skipped; two scouts in alphabetical order.
+        assert_eq!(scouts.len(), 2);
+        assert_eq!(scouts[0].name, "bug-spotter");
+        assert_eq!(scouts[1].name, "queue-steward");
+
+        // bug-spotter: never fired.
+        assert!(scouts[0].last_event_at.is_none());
+        assert!(scouts[0].last_event_kind.is_none());
+        assert_eq!(scouts[0].fires_today, 0);
+
+        // queue-steward: one fire + one noop today; last event is the noop.
+        assert_eq!(scouts[1].fires_today, 1);
+        assert_eq!(scouts[1].noops_today, 1);
+        assert_eq!(scouts[1].failures_today, 0);
+        assert_eq!(
+            scouts[1].last_event_kind.as_ref(),
+            Some(&ScoutEventKind::Noop)
+        );
+        assert!(scouts[1].last_event_at.is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&log).ok();
+    }
+
+    #[test]
+    fn discover_scouts_failure_counted_and_flagged() {
+        let dir = std::env::temp_dir().join(format!(
+            "hive_scouts_fail_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("queue-steward.md"), "---\n---\n").unwrap();
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let ts = format!("{}T12:00:00Z", today);
+        let log_data = format!(
+            "{{\"timestamp\":\"{ts}\",\"action\":\"daemon:scout_failed\",\"specialist\":\"queue-steward\"}}\n",
+            ts = ts
+        );
+        let log = tempfile_write(log_data.as_bytes());
+
+        let scouts = discover_scouts(&dir, &log);
+        assert_eq!(scouts.len(), 1);
+        assert_eq!(scouts[0].failures_today, 1);
+        assert_eq!(
+            scouts[0].last_event_kind.as_ref(),
+            Some(&ScoutEventKind::Failed)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&log).ok();
     }
 
     #[test]
