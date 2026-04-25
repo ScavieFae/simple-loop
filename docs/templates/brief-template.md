@@ -51,7 +51,13 @@ Two or three sentences. Why this, why now, what breaks if we skip it.
 
 ## Budget
 
-**N cycles.** If at cycle N−2 and 3+ tasks are still incomplete, escalate rather than rushing.
+<!-- Hive parses this section for integers and uses MAX as the cycle budget shown in
+     the active-brief indicator (`cycle X/Y`). Keep it short and only mention the
+     cycle count integer. No "~200 LOC", "N=10 episodes", "3 days" — they get picked
+     up as Y instead of the cycle count. Pattern that works (brief-061): "**6 cycles
+     sonnet.** Two cycles per phase + integration tests + docs." -->
+
+**N cycles.** Brief plan in prose; no other integers in this section.
 
 ## Anti-patterns
 

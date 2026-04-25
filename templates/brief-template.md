@@ -17,6 +17,14 @@
 ## Goal
 [What you're trying to accomplish. 1-2 sentences.]
 
+## Budget
+<!-- Hive's parser scans this section for integers and uses MAX as the cycle budget,
+     so it appears in the active-brief indicator as `cycle X/Y`. Keep this section
+     SHORT and only mention the cycle count integer. Do NOT include "~200 LOC", "N=10
+     episodes", "3 days", or other non-cycle numbers — they'll be picked up as Y.
+     Pattern that works (brief-061): "**6 cycles sonnet.** [one short prose line]." -->
+**N cycles.** [Brief plan in prose. No other integers.]
+
 ## Tasks
 1. [One iteration of work]
 2. [One iteration of work]
