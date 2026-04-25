@@ -2525,6 +2525,10 @@ assert_json "staleness-gate: pending_merges[] still empty"     "$RJ" "len(d['pen
 # Test 68: stale_branch reason preserved verbatim (action-level contract).
 assert_json "staleness-gate: reason contains staleness note"   "$RJ" "'staleness gate triggered' in d['awaiting_review'][0].get('reason','')" "True"
 
+# Test 69: conflict_note field is set — mirrors process-pending-merges merge-conflict path,
+# used by hive and director tooling to display the specific block reason.
+assert_json "staleness-gate: conflict_note field set"          "$RJ" "'staleness gate triggered' in d['awaiting_review'][0].get('conflict_note','')" "True"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

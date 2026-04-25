@@ -460,6 +460,7 @@ def move_to_awaiting_review(paths, brief_id, reason=""):
     moved["auto_merge"] = False
     if reason:
         moved["reason"] = reason
+        moved["conflict_note"] = reason
     rc["active"] = new_active
     rc["awaiting_review"].append(moved)
     save_running(paths, rc)
