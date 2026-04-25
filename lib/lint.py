@@ -375,18 +375,61 @@ def count_by_severity(all_issues: List[Issue]) -> dict:
     return counts
 
 
+# ── Brief status reader ───────────────────────────────────────
+
+def read_brief_status(path: Path) -> Optional[str]:
+    """Read just the Status field from a brief file."""
+    try:
+        content = path.read_text(encoding="utf-8")
+        m = re.search(r"^\*\*Status:\*\*\s*(\S+)", content, re.MULTILINE)
+        return m.group(1).lower() if m else None
+    except Exception:
+        return None
+
+
+def _brief_meta(path: Path) -> tuple:
+    """Return (status, brief_id) from a brief file. Both may be None."""
+    try:
+        content = path.read_text(encoding="utf-8")
+        status_m = re.search(r"^\*\*Status:\*\*\s*(\S+)", content, re.MULTILINE)
+        id_m = re.search(r"^\*\*ID:\*\*\s*(\S+)", content, re.MULTILINE)
+        status = status_m.group(1).lower() if status_m else None
+        brief_id = id_m.group(1).lower() if id_m else None
+        return status, brief_id
+    except Exception:
+        return None, None
+
+
+def _load_history_ids(project_root: Path) -> set:
+    """Load the set of brief IDs in running.json history (already merged)."""
+    running_file = project_root / ".loop" / "state" / "running.json"
+    if not running_file.exists():
+        return set()
+    try:
+        with running_file.open() as f:
+            data = json.load(f)
+        return {e.get("brief", "").lower() for e in data.get("history", [])}
+    except Exception:
+        return set()
+
+
 # ── Main entry point ──────────────────────────────────────────
 
 def main(argv: List[str] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
+    # Parse flags before positional args
+    all_statuses = "--all" in argv
+    argv = [a for a in argv if a != "--all"]
+
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
-        print("Usage: loop lint <brief-path-or-dir>")
+        print("Usage: loop lint [--all] <brief-path-or-dir>")
         print()
         print("  loop lint wiki/briefs/cards/brief-049-scene-reset-on-run/index.md")
-        print("  loop lint wiki/briefs/cards/")
+        print("  loop lint wiki/briefs/cards/              # queued briefs only")
+        print("  loop lint --all wiki/briefs/cards/        # all briefs regardless of status")
         print()
         print("Checks:")
         for name, _ in CHECKS:
@@ -414,13 +457,32 @@ def main(argv: List[str] = None) -> int:
         brief_files = [target]
     elif target.is_dir():
         # Find all index.md files inside brief-* subdirs
-        brief_files = sorted(target.rglob("index.md"))
-        if not brief_files:
-            # Fallback: any .md files directly
-            brief_files = sorted(target.glob("*.md"))
+        candidates = sorted(target.rglob("index.md"))
+        if not candidates:
+            candidates = sorted(target.glob("*.md"))
+
+        if all_statuses:
+            brief_files = candidates
+        else:
+            # Default: queued briefs that haven't been merged yet.
+            # Many old briefs have a stale `Status: queued` field even after merge —
+            # cross-check against running.json history to exclude them.
+            history_ids = _load_history_ids(project_root)
+            filtered = []
+            for bf in candidates:
+                status, brief_id = _brief_meta(bf)
+                if status != "queued":
+                    continue
+                if brief_id and brief_id in history_ids:
+                    continue
+                filtered.append(bf)
+            brief_files = filtered
 
     if not brief_files:
-        print(f"No brief files found at {target_arg}", file=sys.stderr)
+        if target.is_dir() and not all_statuses:
+            print(f"No queued briefs found at {target_arg} (use --all to scan all statuses).", file=sys.stderr)
+        else:
+            print(f"No brief files found at {target_arg}", file=sys.stderr)
         return 0
 
     total_issues = 0
@@ -439,7 +501,7 @@ def main(argv: List[str] = None) -> int:
             output_blocks.append(format_issues(str(rel), issues))
 
     if output_blocks:
-        print("\n".join(output_blocks))
+        print("\n\n".join(output_blocks))
         print()
         files_scanned = len(brief_files)
         issue_word = "issue" if total_issues == 1 else "issues"

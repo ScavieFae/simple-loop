@@ -362,5 +362,86 @@ class TestMain(unittest.TestCase):
         self.assertEqual(main(["/tmp/does-not-exist-xyz/index.md"]), 1)
 
 
+def _make_brief_content(brief_id: str, status: str = "queued") -> str:
+    return (
+        MINIMAL_VALID
+        .replace("**ID:** brief-001-test", f"**ID:** {brief_id}")
+        .replace("**Branch:** brief-001-test", f"**Branch:** {brief_id}")
+        .replace("**Status:** queued", f"**Status:** {status}")
+    )
+
+
+class TestMainDirFilter(unittest.TestCase):
+    """Tests for dir-mode status filtering and --all flag."""
+
+    def _write_running(self, root: Path, history_ids):
+        state_dir = root / ".loop" / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        running = {
+            "active": [],
+            "completed_pending_eval": [],
+            "awaiting_review": [],
+            "history": [{"brief": bid} for bid in history_ids],
+        }
+        (state_dir / "running.json").write_text(json.dumps(running))
+
+    def test_dir_default_excludes_history_queued_briefs(self):
+        """Dir mode skips briefs whose ID is in running.json history (even if Status: queued)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self._write_running(root, history_ids=["brief-001-old"])
+            cards = root / "wiki/briefs/cards"
+            (cards / "brief-001-old").mkdir(parents=True)
+            (cards / "brief-001-old" / "index.md").write_text(
+                _make_brief_content("brief-001-old", "queued")
+            )
+            (cards / "brief-002-new").mkdir(parents=True)
+            (cards / "brief-002-new" / "index.md").write_text(
+                _make_brief_content("brief-002-new", "queued")
+            )
+            # brief-001-old is in history → skipped; brief-002-new is clean → exit 0
+            self.assertEqual(main([str(cards)]), 0)
+
+    def test_dir_default_excludes_non_queued_briefs(self):
+        """Dir mode skips briefs with Status != queued."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cards = root / "wiki/briefs/cards"
+            (cards / "brief-001-active").mkdir(parents=True)
+            (cards / "brief-001-active" / "index.md").write_text(
+                _make_brief_content("brief-001-active", "active")
+            )
+            # Only non-queued brief → no queued briefs found, exit 0
+            result = main([str(cards)])
+            self.assertEqual(result, 0)
+
+    def test_dir_all_flag_includes_non_queued(self):
+        """--all flag scans briefs regardless of status."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cards = root / "wiki/briefs/cards"
+            (cards / "brief-001-active").mkdir(parents=True)
+            (cards / "brief-001-active" / "index.md").write_text(
+                _make_brief_content("brief-001-active", "active")
+            )
+            # With --all: brief-001-active is scanned and clean → exit 0
+            self.assertEqual(main(["--all", str(cards)]), 0)
+
+    def test_dir_all_flag_includes_history_briefs(self):
+        """--all scans merged briefs too (useful for audit)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self._write_running(root, history_ids=["brief-001-old"])
+            cards = root / "wiki/briefs/cards"
+            (cards / "brief-001-old").mkdir(parents=True)
+            # Use Status: merged so check 8 doesn't fire (no queued+history drift)
+            (cards / "brief-001-old" / "index.md").write_text(
+                _make_brief_content("brief-001-old", "merged")
+            )
+            # Default: excluded (status != queued); --all: included → clean, exit 0
+            self.assertEqual(main([str(cards)]), 0)       # excluded by default
+            self.assertEqual(main(["--all", str(cards)]), 0)  # included with --all
+
+
 if __name__ == "__main__":
     unittest.main()
