@@ -48,6 +48,8 @@ NTFY_TOPIC="${SIMPLE_LOOP_NTFY_TOPIC:-${NTFY_TOPIC:-}}"
 GIT_REMOTE="${GIT_REMOTE:-origin}"
 GIT_MAIN_BRANCH="${GIT_MAIN_BRANCH:-main}"
 MAX_COMMITS_BEHIND="${MAX_COMMITS_BEHIND:-30}"
+MAX_CYCLE_WALL_TIME_SECS="${MAX_CYCLE_WALL_TIME_SECS:-5400}"
+WORKER_KILL_GRACE_SECS="${WORKER_KILL_GRACE_SECS:-10}"
 
 # Tracking
 CONSECUTIVE_SKIPS=0
@@ -379,10 +381,29 @@ with open('$PROGRESS_FILE', 'w') as f:
         fi
     fi
 
+    # Per-brief wall-time override (Cycle-wall-time-secs: frontmatter).
+    # Same parser shape as Model: line. Default = MAX_CYCLE_WALL_TIME_SECS.
+    local CYCLE_WALL_TIME_SECS="$MAX_CYCLE_WALL_TIME_SECS"
+    if [ -n "$brief_file_path" ] && [ -f "$WORKTREE_DIR/$brief_file_path" ]; then
+        local brief_cycle_secs
+        brief_cycle_secs=$(grep -m1 '^\*\*Cycle-wall-time-secs:\*\*' "$WORKTREE_DIR/$brief_file_path" 2>/dev/null \
+            | sed 's/.*\*\*Cycle-wall-time-secs:\*\*[[:space:]]*//' \
+            | grep -oE '^[0-9]+')
+        if [ -n "$brief_cycle_secs" ]; then
+            CYCLE_WALL_TIME_SECS="$brief_cycle_secs"
+            daemon_log "WORKER: Cycle-wall-time-secs=$brief_cycle_secs (from brief)"
+        fi
+    fi
+
     # Run one iteration IN THE WORKTREE (main tree untouched)
     local WORKER_LOG="$LOG_DIR/worker_${brief_id}_$(date +%Y%m%d_%H%M%S).log"
-    local WORKER_JSON=$(mktemp)
-    local WORKER_START=$(date +%s)
+    local WORKER_JSON
+    WORKER_JSON=$(mktemp)
+    local WORKER_TIMEOUT_FLAG
+    WORKER_TIMEOUT_FLAG=$(mktemp)
+    rm -f "$WORKER_TIMEOUT_FLAG"  # written by watchdog only if timeout fires
+    local WORKER_START
+    WORKER_START=$(date +%s)
 
     # Read prompt from main tree (canonical), execute in worktree
     local PROMPT_CONTENT
@@ -390,16 +411,62 @@ with open('$PROGRESS_FILE', 'w') as f:
 
     cd "$WORKTREE_DIR"
 
-    claude --model "$WORKER_MODEL" --dangerously-skip-permissions \
+    # Spawn worker in a new process group (os.setpgrp + execvp) so SIGTERM/SIGKILL
+    # on the PGID reaches hung subprocesses (brief-047d: lerobot loader deadlock).
+    # os.setpgrp() makes the python process a new group leader (PGID = its own PID);
+    # os.execvp() replaces python with claude, preserving the PID and PGID.
+    # After exec: WORKER_PID == PGID of the new group containing claude + descendants.
+    python3 -c "import os,sys; os.setpgrp(); os.execvp(sys.argv[1],sys.argv[1:])" \
+        claude --model "$WORKER_MODEL" --dangerously-skip-permissions \
         --output-format json \
         -p "$PROMPT_CONTENT" \
-        > "$WORKER_JSON" 2>>"$WORKER_LOG"
+        > "$WORKER_JSON" 2>>"$WORKER_LOG" &
+    local WORKER_PID
+    WORKER_PID=$!
 
+    # Timeout watchdog: fires after CYCLE_WALL_TIME_SECS, then SIGTERM-grace-SIGKILL
+    # the process group. 10s grace gives in-flight git ops time to settle (KC3).
+    (
+        sleep "$CYCLE_WALL_TIME_SECS"
+        if kill -0 "$WORKER_PID" 2>/dev/null; then
+            touch "$WORKER_TIMEOUT_FLAG"
+            kill -TERM -"$WORKER_PID" 2>/dev/null || kill -TERM "$WORKER_PID" 2>/dev/null
+            sleep "$WORKER_KILL_GRACE_SECS"
+            kill -KILL -"$WORKER_PID" 2>/dev/null || true
+        fi
+    ) &
+    local WATCHDOG_PID
+    WATCHDOG_PID=$!
+
+    wait "$WORKER_PID"
     local WORKER_EXIT=$?
-    local WORKER_END=$(date +%s)
+    local WORKER_END
+    WORKER_END=$(date +%s)
     local WORKER_DURATION=$((WORKER_END - WORKER_START))
 
+    # Cancel watchdog (no-op if already fired; avoids a dangling sleep).
+    kill "$WATCHDOG_PID" 2>/dev/null
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+
     cd "$PROJECT_DIR"
+
+    # ── Timeout path ──────────────────────────────────────────────────────────
+    # Watchdog touched WORKER_TIMEOUT_FLAG when the budget expired. Route to
+    # awaiting_review so a human investigates before redispatching. Already-
+    # committed work on the brief branch is preserved; mid-flight work is lost.
+    if [ -f "$WORKER_TIMEOUT_FLAG" ]; then
+        rm -f "$WORKER_TIMEOUT_FLAG"
+        daemon_log "WORKER: cycle wall-time exceeded ${CYCLE_WALL_TIME_SECS}s — killed worker for $brief_id cycle $iteration"
+        notify "$brief_id: cycle wall-time exceeded (${CYCLE_WALL_TIME_SECS}s) — routed to awaiting_review"
+        parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '$WORKER_MODEL', 'exit_code': $WORKER_EXIT, 'timed_out': True}"
+        rm -f "$WORKER_JSON"
+        python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
+            "cycle wall-time exceeded — human investigation required" \
+            2>>"$LOG_DIR/daemon.log" || true
+        return 0
+    fi
+    rm -f "$WORKER_TIMEOUT_FLAG"
+    # ─────────────────────────────────────────────────────────────────────────
 
     parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '$WORKER_MODEL', 'exit_code': $WORKER_EXIT}"
     rm -f "$WORKER_JSON"
