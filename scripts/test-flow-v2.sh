@@ -2464,6 +2464,36 @@ rm -f "$SR_JSON" "$SR_JSON2"
 
 rm -rf "$SR_SCRATCH"
 
+# ── Tests 64-65: Rebase-conflict → awaiting_review routing (brief-061) ───────
+
+echo ""
+echo "=== Tests 64-65: Rebase-conflict — move-to-awaiting-review with rebase reason ==="
+
+# Test 64: auto-merge:true brief routed to awaiting_review on rebase conflict.
+# auto_merge is forced False so the stale branch can't bypass human review even
+# if the brief originally declared Auto-merge: true.
+write_running "{
+    'active': [{'brief': 'brief-001-auto', 'branch': 'brief-001-auto', 'brief_file': '.loop/briefs/brief-001-auto.md', 'auto_merge': True}],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [],
+    'queue': []
+}"
+
+python3 "$ACTIONS" move-to-awaiting-review brief-001-auto "$SCRATCH" \
+    "rebase conflict against main — human resolution required" > /dev/null 2>&1
+
+assert_json "rebase-conflict: active[] emptied"                "$RJ" "len(d['active'])"                                   "0"
+assert_json "rebase-conflict: brief in awaiting_review[]"      "$RJ" "len(d['awaiting_review'])"                          "1"
+assert_json "rebase-conflict: correct brief id"                "$RJ" "d['awaiting_review'][0]['brief']"                   "brief-001-auto"
+assert_json "rebase-conflict: auto_merge forced False"         "$RJ" "str(d['awaiting_review'][0]['auto_merge'])"         "False"
+assert_json "rebase-conflict: reason preserved verbatim"       "$RJ" "d['awaiting_review'][0].get('reason','')"           "rebase conflict against main — human resolution required"
+
+# Test 65: pending_merges[] unaffected — rebase-conflict does not accidentally
+# promote the brief into the merge queue.
+assert_json "rebase-conflict: pending_merges[] still empty"    "$RJ" "len(d['pending_merges'])"                           "0"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
