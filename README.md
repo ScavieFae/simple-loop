@@ -148,6 +148,7 @@ Each module is installed per-project with `loop add <name>`. It symlinks the mod
 | `loop pause [reason]` | Pause daemon (commits + pushes signal) |
 | `loop resume [instruction]` | Resume daemon |
 | `loop metrics [--since DATE]` | Cost report from `metrics.jsonl` |
+| `loop lint <path>` | Lint a brief file or directory for format drift |
 | `loop help` | Usage |
 
 ### Project layout
@@ -201,6 +202,20 @@ Add JWT-based login to the API. Users POST credentials, get a token back.
 - `npm test` passes
 - No new lint warnings
 ```
+
+### Linting briefs
+
+`loop lint` checks brief files for format drift before dispatch. Deterministic — no LLM calls, subsecond per file, read-only.
+
+```bash
+loop lint wiki/briefs/cards/brief-049-scene-reset-on-run/index.md   # single file
+loop lint wiki/briefs/cards/              # all queued briefs
+loop lint --all wiki/briefs/cards/        # full corpus scan
+```
+
+Checks: frontmatter style, required fields, Budget section, Depends-on validity, dep ID format, ADR link resolution, MANDATORY reading link resolution, Status consistency.
+
+Exit `0` — clean. Exit `1` — drift detected with a human-readable report.
 
 ### Push notifications
 
