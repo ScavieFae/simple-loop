@@ -744,7 +744,9 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
     // Last N merged briefs, dimmed. Historical context — "wait, did brief-013
     // actually land?" without opening git log. Count-based (no time filter)
     // so you always see the most recent merges even on quiet days.
-    if !cells.recently_finished.is_empty() {
+    // Not-doing items render below merged items in the same section, visibly
+    // darker (DIM_BORDER, 0x4A4A4A) to distinguish "shipped" from "declined".
+    if !cells.recently_finished.is_empty() || !cells.not_doing.is_empty() {
         lines.push(Line::from(""));
         lines.push(section_header("Recent", MUTED));
         for rf in &cells.recently_finished {
@@ -762,6 +764,17 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
                     format!("  ·  merged {}", age),
                     Style::default().fg(MUTED).add_modifier(Modifier::DIM),
                 ),
+            ]));
+        }
+        for nd in &cells.not_doing {
+            let tail = match &nd.reason {
+                Some(r) => format!("  ·  not doing — {}", r),
+                None => "  ·  not doing".to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ✗ ", Style::default().fg(DIM_BORDER)),
+                Span::styled(nd.brief.clone(), Style::default().fg(DIM_BORDER)),
+                Span::styled(tail, Style::default().fg(DIM_BORDER).add_modifier(Modifier::DIM)),
             ]));
         }
     }
