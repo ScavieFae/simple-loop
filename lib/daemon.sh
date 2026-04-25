@@ -47,6 +47,7 @@ MAX_ITERATIONS="${MAX_ITERATIONS:-20}"
 NTFY_TOPIC="${SIMPLE_LOOP_NTFY_TOPIC:-${NTFY_TOPIC:-}}"
 GIT_REMOTE="${GIT_REMOTE:-origin}"
 GIT_MAIN_BRANCH="${GIT_MAIN_BRANCH:-main}"
+MAX_COMMITS_BEHIND="${MAX_COMMITS_BEHIND:-30}"
 
 # Tracking
 CONSECUTIVE_SKIPS=0
@@ -1097,14 +1098,43 @@ except: pass
 print('false')
 " 2>/dev/null)
 
-            if [ "$AM_FLAG" = "true" ]; then
-                daemon_log "DAEMON ACTION: move-to-pending-merges $active_entry (auto-merge)"
-                python3 "$DAEMON_ACTIONS" move-to-pending-merges "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
-                notify "$active_entry complete → queued for auto-merge"
-            else
-                daemon_log "DAEMON ACTION: move-to-awaiting-review $active_entry (human approval required)"
-                python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
-                notify "$active_entry complete → awaiting human review (run: loop approve $active_entry)"
+            # Staleness gate: refuse merge if branch is too far behind main,
+            # regardless of Auto-merge flag. Bounded by MAX_COMMITS_BEHIND (default 30).
+            GATE_BRANCH=$(python3 -c "
+import json, sys
+try:
+    with open('$RUNNING_FILE') as f:
+        rc = json.load(f)
+    for b in rc.get('active', []):
+        if b.get('brief') == '$active_entry':
+            print(b.get('branch', ''))
+            sys.exit(0)
+except: pass
+print('')
+" 2>/dev/null)
+            STALENESS_GATED=false
+            if [ -n "$GATE_BRANCH" ]; then
+                CB=$(git -C "$PROJECT_DIR" rev-list --count "${GATE_BRANCH}..${GIT_REMOTE}/${GIT_MAIN_BRANCH}" 2>/dev/null || echo "0")
+                if [ "$CB" -gt "$MAX_COMMITS_BEHIND" ]; then
+                    STALENESS_GATED=true
+                    daemon_log "DAEMON ACTION: merge refused — $active_entry is $CB commits behind main (>$MAX_COMMITS_BEHIND threshold)"
+                    python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" \
+                        "branch is $CB commits behind main — staleness gate triggered, hand-merge required (see wiki/operating-docs/incidents/2026-04-24-brief-049-050-merge-watchlist.md)" \
+                        2>>"$LOG_DIR/daemon.log" && DID_WORK=true
+                    notify "$active_entry merge refused: $CB commits behind main (staleness gate)"
+                fi
+            fi
+
+            if [ "$STALENESS_GATED" = "false" ]; then
+                if [ "$AM_FLAG" = "true" ]; then
+                    daemon_log "DAEMON ACTION: move-to-pending-merges $active_entry (auto-merge)"
+                    python3 "$DAEMON_ACTIONS" move-to-pending-merges "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
+                    notify "$active_entry complete → queued for auto-merge"
+                else
+                    daemon_log "DAEMON ACTION: move-to-awaiting-review $active_entry (human approval required)"
+                    python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
+                    notify "$active_entry complete → awaiting human review (run: loop approve $active_entry)"
+                fi
             fi
         fi
     done

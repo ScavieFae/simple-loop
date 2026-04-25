@@ -2494,6 +2494,37 @@ assert_json "rebase-conflict: reason preserved verbatim"       "$RJ" "d['awaitin
 # promote the brief into the merge queue.
 assert_json "rebase-conflict: pending_merges[] still empty"    "$RJ" "len(d['pending_merges'])"                           "0"
 
+# ── Tests 66-68: Staleness gate → awaiting_review routing (brief-061) ────────
+
+echo ""
+echo "=== Tests 66-68: Staleness gate — stale branch refused merge → awaiting_review ==="
+
+# Test 66: auto-merge:true brief routed to awaiting_review when stale.
+# Daemon computes commits_behind > MAX_COMMITS_BEHIND and calls move-to-awaiting-review
+# with the stale_branch reason. auto_merge is forced False.
+write_running "{
+    'active': [{'brief': 'brief-001-auto', 'branch': 'brief-001-auto', 'brief_file': '.loop/briefs/brief-001-auto.md', 'auto_merge': True}],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [],
+    'queue': []
+}"
+
+python3 "$ACTIONS" move-to-awaiting-review brief-001-auto "$SCRATCH" \
+    "branch is 45 commits behind main — staleness gate triggered, hand-merge required (see wiki/operating-docs/incidents/2026-04-24-brief-049-050-merge-watchlist.md)" > /dev/null 2>&1
+
+assert_json "staleness-gate: active[] emptied"                 "$RJ" "len(d['active'])"                                   "0"
+assert_json "staleness-gate: brief in awaiting_review[]"       "$RJ" "len(d['awaiting_review'])"                          "1"
+assert_json "staleness-gate: correct brief id"                 "$RJ" "d['awaiting_review'][0]['brief']"                   "brief-001-auto"
+assert_json "staleness-gate: auto_merge forced False"          "$RJ" "str(d['awaiting_review'][0]['auto_merge'])"         "False"
+
+# Test 67: pending_merges[] unaffected — stale brief must NOT be promoted to merge queue.
+assert_json "staleness-gate: pending_merges[] still empty"     "$RJ" "len(d['pending_merges'])"                           "0"
+
+# Test 68: stale_branch reason preserved verbatim (action-level contract).
+assert_json "staleness-gate: reason contains staleness note"   "$RJ" "'staleness gate triggered' in d['awaiting_review'][0].get('reason','')" "True"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
