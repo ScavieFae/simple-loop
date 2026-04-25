@@ -596,6 +596,16 @@ pub struct RecentlyFinishedBrief {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// A brief that was considered and explicitly declined (`Status: not-doing`).
+/// Rendered in the Recent section below merged items with a ✗ glyph.
+pub struct NotDoingBrief {
+    pub brief: String,
+    /// The `Not-doing-reason:` frontmatter field, if present.
+    pub reason: Option<String>,
+    /// When the decision was recorded; falls back to brief file mtime.
+    pub declared_at: Option<DateTime<Utc>>,
+}
+
 /// Cap on how many finished briefs to surface. Enough to cover a meaningful
 /// trailing window without bloating Cells.
 pub const RECENTLY_FINISHED_LIMIT: usize = 5;
@@ -646,6 +656,7 @@ pub struct CellsState {
     pub queued: Vec<QueuedBrief>,
     pub drafts: Vec<DraftBrief>,
     pub recently_finished: Vec<RecentlyFinishedBrief>,
+    pub not_doing: Vec<NotDoingBrief>,
     pub scouts: Vec<Scout>,
 }
 
@@ -866,6 +877,88 @@ pub fn parse_depends_on_secrets(brief_path: &Path) -> Vec<String> {
     vec![]
 }
 
+/// Normalize a Status field value to lowercase-hyphenated form for comparison.
+/// Accepts variations like `not-doing`, `Not-Doing`, `not_doing`.
+fn normalize_status(s: &str) -> String {
+    s.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+/// Parse `**Status:**` from a brief markdown file. Returns the normalized
+/// value, or None if absent or unreadable.
+fn parse_brief_status(brief_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(brief_path).ok()?;
+    for line in content.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("**status:**") {
+            let pos = lower.find("**status:**")?;
+            let after = &line[pos + "**status:**".len()..];
+            let value = after.trim().trim_matches(|c: char| ".,;".contains(c));
+            if !value.is_empty() {
+                return Some(normalize_status(value));
+            }
+        }
+    }
+    None
+}
+
+/// Parse `**Not-doing-reason:**` from a brief markdown file. Returns the
+/// trimmed value, or None if absent or unreadable.
+fn parse_not_doing_reason(brief_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(brief_path).ok()?;
+    for line in content.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("**not-doing-reason:**") {
+            let pos = lower.find("**not-doing-reason:**")?;
+            let after = &line[pos + "**not-doing-reason:**".len()..];
+            let value = after.trim().trim_matches(|c: char| ".,;".contains(c));
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Scan `.loop/briefs/*.md` and return entries whose `Status:` is `not-doing`.
+/// Symlinks are followed automatically. `declared_at` falls back to file mtime.
+/// Results are sorted newest-first; ties broken by brief id descending.
+pub fn discover_not_doing_briefs(briefs_dir: &Path) -> Vec<NotDoingBrief> {
+    let Ok(entries) = fs::read_dir(briefs_dir) else {
+        return vec![];
+    };
+    let mut out: Vec<NotDoingBrief> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".md") || name.starts_with('.') || name == "_template.md" {
+            continue;
+        }
+        if parse_brief_status(&path).as_deref() != Some("not-doing") {
+            continue;
+        }
+        let brief_id = name.trim_end_matches(".md").to_string();
+        let reason = parse_not_doing_reason(&path);
+        // fs::metadata follows symlinks — returns target mtime, which is what
+        // we want: when the brief card itself was last touched.
+        let declared_at = fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from);
+        out.push(NotDoingBrief { brief: brief_id, reason, declared_at });
+    }
+    out.sort_by(|a, b| {
+        match (a.declared_at, b.declared_at) {
+            (Some(a_ts), Some(b_ts)) => b_ts.cmp(&a_ts).then_with(|| b.brief.cmp(&a.brief)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b.brief.cmp(&a.brief),
+        }
+    });
+    out
+}
+
 /// Scan `.loop/briefs/*.md` and return work-unit ids not in `exclude`.
 /// Any `.md` file that isn't the `_template.md` is treated as a work unit —
 /// covers `brief-NNN-*`, `audit-YYYY-MM-DD-N`, `capture-YYYY-MM-DD-N`, and
@@ -894,6 +987,9 @@ pub fn discover_queued_briefs(
         }
         let brief_id = name.trim_end_matches(".md").to_string();
         if exclude.contains(&brief_id) {
+            continue;
+        }
+        if parse_brief_status(&path).as_deref() == Some("not-doing") {
             continue;
         }
         let priority_rank = priority.iter().position(|p| priority_matches(p, &brief_id));
@@ -1316,6 +1412,8 @@ impl CellsState {
 
         let recently_finished = recent_finished(&raw.history);
 
+        let not_doing = discover_not_doing_briefs(briefs_dir);
+
         let specialists_dir = Path::new(".loop/specialists");
         let scouts = discover_scouts(specialists_dir, log_path);
 
@@ -1325,6 +1423,7 @@ impl CellsState {
             queued,
             drafts,
             recently_finished,
+            not_doing,
             scouts,
         }
     }
@@ -2133,6 +2232,76 @@ mod tests {
         let json = r#"{"active":[],"completed_pending_eval":[],"history":[]}"#;
         let parsed: RunningJson = serde_json::from_str(json).unwrap();
         assert!(parsed.active.is_empty());
+    }
+
+    #[test]
+    fn discover_not_doing_briefs_picks_up_status_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "hive_not_doing_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // not-doing brief with reason
+        std::fs::write(
+            dir.join("brief-019-daemon-state-repair.md"),
+            "**Status:** not-doing\n**Not-doing-reason:** superseded by brief-061 worker-rebase\n",
+        ).unwrap();
+        // queued brief — should not appear
+        std::fs::write(dir.join("brief-020-foo.md"), "**Status:** queued\n").unwrap();
+        // not-doing with underscore variant
+        std::fs::write(dir.join("brief-021-bar.md"), "**Status:** not_doing\n").unwrap();
+        // not-doing with mixed case
+        std::fs::write(dir.join("brief-022-baz.md"), "**Status:** Not-Doing\n").unwrap();
+        // _template.md — must be skipped
+        std::fs::write(dir.join("_template.md"), "**Status:** not-doing\n").unwrap();
+
+        let result = discover_not_doing_briefs(&dir);
+        let ids: Vec<&str> = result.iter().map(|b| b.brief.as_str()).collect();
+        assert!(ids.contains(&"brief-019-daemon-state-repair"), "should include not-doing brief");
+        assert!(!ids.contains(&"brief-020-foo"), "queued brief must not appear");
+        assert!(ids.contains(&"brief-021-bar"), "not_doing variant should match");
+        assert!(ids.contains(&"brief-022-baz"), "Not-Doing variant should match");
+        assert!(!ids.contains(&"_template"), "_template must be excluded");
+
+        // reason parsed correctly
+        let entry_019 = result.iter().find(|b| b.brief == "brief-019-daemon-state-repair").unwrap();
+        assert_eq!(
+            entry_019.reason.as_deref(),
+            Some("superseded by brief-061 worker-rebase"),
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discover_queued_briefs_excludes_not_doing() {
+        let dir = std::env::temp_dir().join(format!(
+            "hive_queued_excl_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // normal queued brief
+        std::fs::write(dir.join("brief-010-normal.md"), "**Status:** queued\n").unwrap();
+        // not-doing brief — must be filtered out
+        std::fs::write(dir.join("brief-011-declined.md"), "**Status:** not-doing\n").unwrap();
+        // no status field — treated as queued (existing behaviour)
+        std::fs::write(dir.join("brief-012-nostatus.md"), "# Just a brief\n").unwrap();
+
+        let exclude = HashSet::new();
+        let goals = std::env::temp_dir().join("hive_goals_missing.md");
+        let result = discover_queued_briefs(&dir, &exclude, &goals);
+        let ids: Vec<&str> = result.iter().map(|b| b.brief.as_str()).collect();
+        assert!(ids.contains(&"brief-010-normal"), "normal queued brief must appear");
+        assert!(!ids.contains(&"brief-011-declined"), "not-doing brief must be excluded from queue");
+        assert!(ids.contains(&"brief-012-nostatus"), "brief without status field must appear");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
