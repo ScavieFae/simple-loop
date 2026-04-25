@@ -359,7 +359,7 @@ with open('$PROGRESS_FILE', 'w') as f:
 "
         git -C "$WORKTREE_DIR" add ".loop/state/progress.json"
         git -C "$WORKTREE_DIR" commit -m "Max iterations reached — marking blocked" -q 2>/dev/null
-        git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || true
+        git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || true
         return 0
     fi
 
@@ -406,7 +406,7 @@ with open('$PROGRESS_FILE', 'w') as f:
 
     # Push results from worktree
     if [ "$WORKER_EXIT" -eq 0 ]; then
-        git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "WORKER: push failed (non-fatal)"
+        git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "WORKER: push failed (non-fatal)"
         daemon_log "WORKER: iteration complete (${WORKER_DURATION}s), pushed to $branch"
         notify "$brief_id: iteration done (${WORKER_DURATION}s)"
         CONSECUTIVE_WORKER_FAILURES=0
@@ -570,7 +570,7 @@ EOF
         git -C "$WORKTREE_DIR" add "$REVIEW_REL"
         if ! git -C "$WORKTREE_DIR" diff --cached --quiet; then
             git -C "$WORKTREE_DIR" commit -m "[scav] validator: $brief_id cycle $cycle block (missing artifacts)" -q 2>/dev/null
-            git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "VALIDATOR: push failed on synthetic review (non-fatal)"
+            git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "VALIDATOR: push failed on synthetic review (non-fatal)"
         fi
         return 0
     fi
@@ -734,7 +734,7 @@ SYNTHEOF
         daemon_log "VALIDATOR: review file unchanged — skipping commit"
     else
         git -C "$WORKTREE_DIR" commit -m "[scav] validator: $brief_id cycle $cycle review" -q 2>/dev/null
-        git -C "$WORKTREE_DIR" push -u "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "VALIDATOR: push failed (non-fatal)"
+        git -C "$WORKTREE_DIR" push -u --force-with-lease "$GIT_REMOTE" "$branch" 2>&1 || daemon_log "VALIDATOR: push failed (non-fatal)"
         daemon_log "VALIDATOR: review committed for $brief_id cycle $cycle (${V_DURATION}s)"
         notify "$brief_id: validator review cycle $cycle"
     fi
