@@ -37,3 +37,14 @@
 ## Verification
 - Builds clean
 - [Project-specific checks]
+
+<!-- AVOID — sections like "what should feel if it lands right" with target-shape
+     numerical examples (e.g., "headline reads '38/50 (76.0%, [0.62, 0.86])'").
+     Workers pattern-match these as "deliver this content" and paste them into
+     review.md TL;DRs as if observed. Soft confabulation, same shape as brief-037's
+     visual confab. If you want vivid framing, use shape-only ("the headline reads
+     N/M with a Wilson CI") or describe the qualitative outcome ("the arm picks up
+     the block"). Numerical examples belong in test fixtures or completion criteria,
+     not in target-feel sections. See TROUBLESHOOTING.md (2026-04-25) for the
+     brief-055 incident that motivated this warning. -->
+

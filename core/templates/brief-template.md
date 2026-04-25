@@ -28,3 +28,9 @@
 
 - [Command to run, e.g. "npm test"]
 - [What to check, e.g. "No new lint warnings"]
+
+<!-- AVOID target-shape numerical examples in any "what should feel" / "what good
+     looks like" sections. Workers pattern-match the example and paste it into
+     review.md as if observed. Use shape-only or qualitative framing. See
+     TROUBLESHOOTING.md (2026-04-25) for the brief-055 incident. -->
+

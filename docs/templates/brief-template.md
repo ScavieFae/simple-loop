@@ -65,6 +65,15 @@ Two or three sentences. Why this, why now, what breaks if we skip it.
 - Don't touch [specific area] — that's a different brief
 - Don't add features not in scope
 
+<!-- BRIEF-AUTHORING ANTI-PATTERN — avoid target-shape numerical examples in
+     "what should feel if it lands right" or "what good looks like" sections.
+     Workers pattern-match the numbers and paste them into review.md TL;DRs as
+     if observed (the brief-037 confabulation pattern in narrative form). Use
+     shape-only framing ("headline reads N/M with a Wilson CI") or qualitative
+     outcomes ("the arm picks up the block"). Real numbers come from real runs,
+     committed alongside the artifact. See TROUBLESHOOTING.md (2026-04-25). -->
+
+
 ## Artifact
 
 What lands when this brief closes? Where does it live?
