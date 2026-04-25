@@ -25,7 +25,7 @@ _BRIEF_ID_RE = re.compile(r'\b((?:brief|audit|capture)-[a-zA-Z0-9][a-zA-Z0-9-]*)
 def dedup_active(running: dict) -> tuple:
     """Keep first occurrence of each brief ID in active[]. Return (repaired, actions).
 
-    Duplicate active entries cause the conductor to re-dispatch already-running
+    Duplicate active entries cause the queen to re-dispatch already-running
     briefs. This trims the array to first-seen per brief ID.
     """
     seen: set = set()

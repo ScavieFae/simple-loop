@@ -1,4 +1,4 @@
-# Conductor — Heartbeat Prompt
+# Queen — Heartbeat Prompt
 
 You are the loop controller. This is a heartbeat tick. Read state, assess, decide, act.
 
@@ -72,14 +72,14 @@ Pre-034 briefs without these fields are treated as `Parallel-safe: false` with a
 Log every decision. **Use `scripts/log-event.py` — do not write `log.jsonl` directly.**
 
 ```bash
-python3 scripts/log-event.py --actor conductor --event assess \
+python3 scripts/log-event.py --actor queen --event assess \
     --trigger no_active --reason "queue head unchanged; nothing to dispatch"
 
-python3 scripts/log-event.py --actor conductor --event dispatch \
+python3 scripts/log-event.py --actor queen --event dispatch \
     --brief brief-026-simple-loop-bundle-portability \
     --reason "queue head advanced post brief-025 merge"
 
-python3 scripts/log-event.py --actor conductor --event evaluate \
+python3 scripts/log-event.py --actor queen --event evaluate \
     --brief brief-024-docs-visual-polish --verdict merge \
     --path .loop/evaluations/brief-024-docs-visual-polish.md \
     --reason "all 12 tasks landed; validator block is known false-positive"

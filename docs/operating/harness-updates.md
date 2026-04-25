@@ -1,6 +1,6 @@
 # Harness updates — decision tree + restart protocols
 
-The simple-loop harness (daemon + conductor + worker + validator) is live infrastructure. Updating it while it's running is tricky because the thing running the update may be the thing being updated. This doc captures the decision tree we've worked out the hard way.
+The simple-loop harness (daemon + queen + worker + validator) is live infrastructure. Updating it while it's running is tricky because the thing running the update may be the thing being updated. This doc captures the decision tree we've worked out the hard way.
 
 **Status: living document.** Add entries from every harness-update session. This reflects what we've tripped on, not what we've imagined.
 
@@ -18,7 +18,7 @@ Three locations, different ownership semantics:
 
 **The propagation direction:** master → installed (via `loop update`) → project-local (copied on `loop init`, edited per project after).
 
-**Project-local takes precedence** for the daemon on THIS project. If you edit `.loop/prompts/conductor.md` here, the daemon reads your edit, not the installed template.
+**Project-local takes precedence** for the daemon on THIS project. If you edit `.loop/prompts/queen.md` here, the daemon reads your edit, not the installed template.
 
 ### 2. Brief vs manual?
 
@@ -47,15 +47,15 @@ The **"three-way sync"** pattern:
 
 ```bash
 # 1. Edit project-local (takes effect next tick)
-vi .loop/prompts/conductor.md
+vi .loop/prompts/queen.md
 git commit -m "..." && git push
 
 # 2. Sync to installed template (so `loop update` won't regress)
-cp .loop/prompts/conductor.md ~/.local/share/simple-loop/templates/prompts/conductor.md
+cp .loop/prompts/queen.md ~/.local/share/simple-loop/templates/prompts/queen.md
 
 # 3. Push to simple-loop master (durable across any fresh install)
 git clone https://github.com/ScavieFae/simple-loop /tmp/sl-$(date +%s)
-cp ~/.local/share/simple-loop/templates/prompts/conductor.md /tmp/sl-*/templates/prompts/conductor.md
+cp ~/.local/share/simple-loop/templates/prompts/queen.md /tmp/sl-*/templates/prompts/queen.md
 cd /tmp/sl-* && git add . && git commit -m "..." && git push
 ```
 
@@ -65,7 +65,7 @@ When does a restart take effect?
 
 | Edit target | Hot-reloaded | Needs daemon restart | Needs `loop update` |
 |---|---|---|---|
-| `.loop/prompts/*` (conductor, worker, validator) | ✅ next tick (~120s) | — | — |
+| `.loop/prompts/*` (queen, worker, validator) | ✅ next tick (~120s) | — | — |
 | `.loop/knowledge/*`, `.loop/state/goals.md` | ✅ next tick | — | — |
 | `~/.local/share/simple-loop/lib/daemon.sh` | — | ✅ `loop stop && loop start` | — |
 | `~/.local/share/simple-loop/lib/actions.py` | — | ✅ actions invoked fresh per command | — |
@@ -79,8 +79,8 @@ When does a restart take effect?
 
 - Daemon alive: `cat .loop/state/daemon.pid | xargs -I{} ps -p {} -o pid,etime,command`
 - Daemon ticking: heartbeat fresh — `cat .loop/state/heartbeat.json` shows `ts` within 2× tick interval
-- Conductor running: `tail -5 .loop/state/log.jsonl` — expect `heartbeat_noop` or `daemon:*` events recently
-- Queue moving: if something's queued, conductor writes pending-dispatch.json within a tick or two
+- Queen running: `tail -5 .loop/state/log.jsonl` — expect `heartbeat_noop` or `daemon:*` events recently
+- Queue moving: if something's queued, queen writes pending-dispatch.json within a tick or two
 - No stale signals: `ls .loop/state/signals/` returns clean or expected-live files only
 
 If any of these are wrong post-update, **roll back first, diagnose second.** Harness regressions compound.
@@ -96,7 +96,7 @@ If any of these are wrong post-update, **roll back first, diagnose second.** Har
 
 If the daemon's misbehaving but you need work to move:
 
-1. **Write `pending-dispatch.json` manually** to unblock a specific brief (conductor failed to dispatch it)
+1. **Write `pending-dispatch.json` manually** to unblock a specific brief (queen failed to dispatch it)
 2. **Write `pending-merge.json` manually** to approve a brief without daemon ceremony (or use `loop approve <brief-id>` which does the same thing — always prefer the CLI)
 3. **Hand-merge a brief on main** via `git merge --no-ff <branch>` when the daemon's stuck in a state-mismatch or other internal error (see [hand-merge-brief.md](hand-merge-brief.md))
 4. **Stop the daemon entirely** and run cycles by dispatching loop-coder agents directly from the main-thread session

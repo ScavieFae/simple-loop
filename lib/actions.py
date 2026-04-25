@@ -617,7 +617,7 @@ def dispatch(paths):
 
     Brief-034: enforces THROTTLE cap and Parallel-safe/Edit-surface checks before
     dispatching. When blocked, logs concurrency_skip / throttle_reached and
-    removes pending-dispatch.json (conductor will re-queue next tick if still
+    removes pending-dispatch.json (queen will re-queue next tick if still
     wanted). When clean, adds per-entry concurrency metadata to active[].
     """
     if not os.path.exists(paths["pending_dispatch"]):
@@ -865,7 +865,7 @@ def merge(paths):
     # 2026-04-22 keychain-lock scenario that left brief-013's merge unpushed
     # for ~14h), the redactor-aware push_with_escalate writes escalate.json
     # with reason=push_failed_on_auth and a token-redacted stderr. Raise
-    # after so the merge action is marked failed and the conductor escalates.
+    # after so the merge action is marked failed and the queen escalates.
     if not push_with_escalate(paths, remote=remote, branch=main_branch, brief=brief):
         raise RuntimeError(
             f"push_failed_on_auth: merge {brief} complete locally but push to "
@@ -875,7 +875,7 @@ def merge(paths):
     # Update running.json — prune from both active and completed_pending_eval.
     # A brief may reach merge via either path (direct pending-merge stamp from
     # active, or the regular complete → eval → merge flow). If we don't prune
-    # active, the conductor keeps seeing the merged brief as active, can't find
+    # active, the queen keeps seeing the merged brief as active, can't find
     # its branch (deleted above), and fires stale_brief every heartbeat forever.
     rc = load_running(paths)
     active = rc.get("active", [])

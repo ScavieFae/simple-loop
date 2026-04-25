@@ -18,6 +18,6 @@ Start an interactive session with the spec agent to write a build brief.
 
 ## Notes
 
-- The brief is not dispatched automatically. The user reviews and the conductor picks it up.
+- The brief is not dispatched automatically. The user reviews and the queen picks it up.
 - If the user provides a title as an argument, use it as the starting point.
 - Reference SPEC.md priorities when helping scope the work.

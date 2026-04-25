@@ -1267,7 +1267,7 @@ assert_eq "repeated tick after conflict: merge() returns False cleanly (no retry
 
 rm -rf "$MERGE_SCRATCH"
 
-# ── Tests 25-26: Conductor dedup — queue-head augmentation ───────────────────
+# ── Tests 25-26: Queen dedup — queue-head augmentation ───────────────────
 # The augmentation runs in daemon.sh after assess.py: when trigger is
 # CONDUCTOR:no_active, daemon reads goals.md and appends the first brief ID
 # from ## Queued next. We test the augmentation Python snippet directly.
@@ -1309,7 +1309,7 @@ GOALS_EOF
 HEAD_ID=$(queue_head_id "$DEDUP_SCRATCH/.loop/state")
 AUGMENTED_TRIGGER="CONDUCTOR:no_active"
 [ -n "$HEAD_ID" ] && AUGMENTED_TRIGGER="CONDUCTOR:no_active:$HEAD_ID"
-assert_eq "conductor dedup: no_active trigger augmented with queue head ID" \
+assert_eq "queen dedup: no_active trigger augmented with queue head ID" \
     "$AUGMENTED_TRIGGER" "CONDUCTOR:no_active:brief-099-test-brief"
 
 # Test 26: empty ## Queued next → no augmentation, trigger stays identity-less.
@@ -1325,7 +1325,7 @@ GOALS_EOF
 EMPTY_HEAD=$(queue_head_id "$DEDUP_SCRATCH/.loop/state")
 EMPTY_TRIGGER="CONDUCTOR:no_active"
 [ -n "$EMPTY_HEAD" ] && EMPTY_TRIGGER="CONDUCTOR:no_active:$EMPTY_HEAD"
-assert_eq "conductor dedup: empty queue keeps identity-less trigger (dedup holds)" \
+assert_eq "queen dedup: empty queue keeps identity-less trigger (dedup holds)" \
     "$EMPTY_TRIGGER" "CONDUCTOR:no_active"
 
 rm -rf "$DEDUP_SCRATCH"

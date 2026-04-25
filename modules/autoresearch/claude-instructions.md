@@ -6,13 +6,13 @@ This project has the simple-loop **autoresearch** module installed. It runs an a
 
 ### How it works
 
-The loop is a heartbeat — invoke `/conductor` to run one tick, or schedule it (e.g., `/loop 60m /conductor`). Each tick:
+The loop is a heartbeat — invoke `/queen` to run one tick, or schedule it (e.g., `/loop 60m /queen`). Each tick:
 
 1. Reads `running.json`, `budget.json`, `signals/`, recent decisions.
 2. Closes out any finished in-flight experiments (Director evaluates, updates `best.json` if kept).
 3. If slots and budget allow, runs a new cycle: Hypothesis proposes → Director approves/rejects → Executor implements on a branch → experiment launches.
 
-The full step-by-step lives in `.loop/modules/autoresearch/prompts/conductor.md`.
+The full step-by-step lives in `.loop/modules/autoresearch/prompts/queen.md`.
 
 ### Agent roles
 
@@ -24,7 +24,7 @@ The full step-by-step lives in `.loop/modules/autoresearch/prompts/conductor.md`
 
 ### Budget gate
 
-The conductor refuses to dispatch new work when `daily_spent + estimated_cost > daily_limit`. Limits live in `.loop/modules/autoresearch/config.json`. Experiments above `scale_tier_threshold` always escalate to the human.
+The queen refuses to dispatch new work when `daily_spent + estimated_cost > daily_limit`. Limits live in `.loop/modules/autoresearch/config.json`. Experiments above `scale_tier_threshold` always escalate to the human.
 
 ### State
 
@@ -44,6 +44,6 @@ Available as `/loop-autoresearch-consult-empirical`. Use it before proposing a n
 - `docs/decisions/` for hypothesis rejections and Director reasoning
 - A `RUNBOOK.md` (or similar) documenting how to launch an experiment in this project's stack
 
-If those don't exist yet, the conductor will still run but won't have much context to work from. Set them up before relying on autonomous cycles.
+If those don't exist yet, the queen will still run but won't have much context to work from. Set them up before relying on autonomous cycles.
 
 <!-- /simple-loop:autoresearch -->

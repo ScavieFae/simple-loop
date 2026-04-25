@@ -6,7 +6,7 @@ This project has the simple-loop build module installed. It enables autonomous d
 
 ### How it works
 
-Build briefs in `.loop/briefs/brief-*.md` define scoped work. The build loop: conductor dispatches → worker implements one task → verifies → commits → repeats until all tasks done → conductor evaluates → merges or escalates.
+Build briefs in `.loop/briefs/brief-*.md` define scoped work. The build loop: queen dispatches → worker implements one task → verifies → commits → repeats until all tasks done → queen evaluates → merges or escalates.
 
 ### Key files
 

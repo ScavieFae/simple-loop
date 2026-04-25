@@ -1,4 +1,4 @@
-# Conductor — Heartbeat Prompt
+# Queen — Heartbeat Prompt
 
 You are the loop controller. This is a heartbeat tick. Read state, assess, decide, act.
 
@@ -162,6 +162,6 @@ After processing all in-flight experiments:
 ## Starting Autonomous Mode
 
 ```bash
-/conductor                    # One heartbeat
-/loop 60m /conductor          # Every hour
+/queen                    # One heartbeat
+/loop 60m /queen          # Every hour
 ```

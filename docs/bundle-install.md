@@ -152,7 +152,7 @@ If `loop status` shows the brief as `dispatchable`, the daemon will pick it up o
 
 ## What's next
 
-- **Add project briefs to `goals.md`** — the `## Queued next` section is what the conductor reads to decide what's dispatchable. Briefs in `## Awaiting Mattie (not queued)` and `## Credential-gated` are held until conditions are met.
+- **Add project briefs to `goals.md`** — the `## Queued next` section is what the queen reads to decide what's dispatchable. Briefs in `## Awaiting Mattie (not queued)` and `## Credential-gated` are held until conditions are met.
 - **Check the bundle docs** — `~/.local/share/simple-loop/docs/` has conventions (cards, stewardship-log, goals-md, riffs, ADR) and operating docs (overnight-stewardship, hand-merge-brief, daemon-push-auth, and more).
 - **Credential gating** — if a brief needs API keys to run, add `**Depends-on-secrets:** VAR1, VAR2` to its frontmatter. The daemon skips it silently until the vars are in the environment.
 - **Per-project hive palette** — edit `.loop/config.json` and add a `beehive.palette` section to change hive's colors for this project. See `docs/conventions/goals-md.md` for the schema.

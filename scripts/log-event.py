@@ -42,12 +42,12 @@ from pathlib import Path
 # brief-034 cycle 6 observability events. Keep grep-able + explicit — the point
 # is that schema drift across emitters is visible in this file, not scattered.
 ALLOWED = {
-    "concurrency_skip",     # conductor declined to dispatch (edit-surface overlap)
-    "throttle_reached",     # conductor declined to dispatch (THROTTLE cap hit)
+    "concurrency_skip",     # queen declined to dispatch (edit-surface overlap)
+    "throttle_reached",     # queen declined to dispatch (THROTTLE cap hit)
     "scout_fire",           # specialist ran + wrote output to contract path
     "scout_noop",           # specialist ran + emitted noop sentinel
     "scout_failed",         # specialist exit != 0 OR contract rejected output
-    "rate_limit_429",       # worker/conductor 429'd by the API
+    "rate_limit_429",       # worker/queen 429'd by the API
 }
 
 

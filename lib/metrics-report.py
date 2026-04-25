@@ -116,8 +116,8 @@ def markdown_report(summary):
     lines.append(f"- **Total:** ${summary['total_cost']:.2f}")
     prod_pct = 100 - summary["overhead_pct"]
     lines.append(f"- **Worker (productive):** ${summary['worker_cost']:.2f} ({prod_pct:.0f}%)")
-    lines.append(f"- **Conductor (overhead):** ${summary['conductor_cost']:.2f} ({summary['overhead_pct']:.0f}%)")
-    lines.append(f"- **Conductor sessions:** {summary['conductor_count']}")
+    lines.append(f"- **Queen (overhead):** ${summary['conductor_cost']:.2f} ({summary['overhead_pct']:.0f}%)")
+    lines.append(f"- **Queen sessions:** {summary['conductor_count']}")
     lines.append(f"- **Worker iterations:** {summary['worker_count']}")
     lines.append("")
 
@@ -137,7 +137,7 @@ def markdown_report(summary):
 
     if summary["by_day"]:
         lines.append("## Daily Breakdown")
-        lines.append("| Date | Total | Conductors | Workers | Conductor $ | Worker $ |")
+        lines.append("| Date | Total | Queens | Workers | Queen $ | Worker $ |")
         lines.append("|------|-------|------------|---------|-------------|----------|")
         for day, data in sorted(summary["by_day"].items()):
             lines.append(

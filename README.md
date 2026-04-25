@@ -161,7 +161,7 @@ After `loop init`:
 ├── config.sh            # legacy shell-style config (kept for compatibility)
 ├── prompts/
 │   ├── worker.md        # per-iteration daemon worker prompt
-│   └── conductor.md     # heartbeat conductor prompt
+│   └── queen.md         # heartbeat queen prompt
 ├── briefs/              # brief markdown files
 ├── state/
 │   ├── running.json     # active / completed / history
@@ -235,7 +235,7 @@ Every Claude Code session logs cost, tokens, and duration to `.loop/state/metric
 ## Cost Summary
 - Total: $4.23
 - Worker (productive): $3.81 (90%)
-- Conductor (overhead): $0.42 (10%)
+- Queen (overhead): $0.42 (10%)
 - Worker iterations: 12
 ```
 
@@ -245,7 +245,7 @@ Simple Loop separates two things that often get conflated:
 
 **The workstation surface** — skills and subagents you reach for constantly. `/loop-push` at session boundaries. `subagent_type: loop-research` when you need a parallel investigation. `/loop-pull` to orient at the start of a session. These should be in your hand, in every project, at all times. One install, no per-project setup.
 
-**The orchestration loop** — opt-in heavy machinery for projects that warrant autonomous, multi-iteration work. The daemon, the briefs, the heartbeat conductor. Not every project needs this. Use it when work is well-scoped enough that the human can stay at the director level and let the agents grind.
+**The orchestration loop** — opt-in heavy machinery for projects that warrant autonomous, multi-iteration work. The daemon, the briefs, the heartbeat queen. Not every project needs this. Use it when work is well-scoped enough that the human can stay at the director level and let the agents grind.
 
 The kit ships with both. Install once, get the workstation surface forever. Run `loop init` only when a project actually needs the orchestration loop.
 

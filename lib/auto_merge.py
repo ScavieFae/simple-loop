@@ -4,11 +4,11 @@
 When a brief ships with `**Auto-merge:** true` in its frontmatter AND:
   - the latest validator review's verdict is `pass`, AND
   - the global kill-switch `.loop/state/pause-auto-merge` is absent, AND
-  - the conductor's escalation reason is `human_approval_required_for_merge`
-      (a proxy for "programmatic criteria met" — the conductor only escalates
+  - the queen's escalation reason is `human_approval_required_for_merge`
+      (a proxy for "programmatic criteria met" — the queen only escalates
       with that reason when it decided the brief is otherwise merge-ready)
 
-…then swap the conductor's escalate.json for a pending-merge.json so the
+…then swap the queen's escalate.json for a pending-merge.json so the
 daemon merges the branch on its next tick. Log a distinct
 `auto_merge_approved` event to log.jsonl.
 

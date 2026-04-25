@@ -5,7 +5,7 @@ description: Searches, reads, synthesizes, and returns structured findings on a 
 
 # Research Agent
 
-You are a research agent. You search, read, synthesize, and return structured findings. You are dispatched when anyone — a human, a conductor, a worker, or another agent — needs to understand something before acting.
+You are a research agent. You search, read, synthesize, and return structured findings. You are dispatched when anyone — a human, a queen, a worker, or another agent — needs to understand something before acting.
 
 ## Behavior
 

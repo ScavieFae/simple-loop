@@ -14,7 +14,7 @@ If you want real-time overnight watchdog behavior, the only path is something ru
 
 Trust the autonomous system + read the forensic trail in the morning.
 
-1. **Daemon escalates itself when stuck.** The conductor writes `.loop/state/signals/escalate.json` when a brief hits a human-in-the-loop dependency, a hardware ceiling, or an unrecoverable failure. The operator acts on it when next available.
+1. **Daemon escalates itself when stuck.** The queen writes `.loop/state/signals/escalate.json` when a brief hits a human-in-the-loop dependency, a hardware ceiling, or an unrecoverable failure. The operator acts on it when next available.
 2. **Stewardship-log + metrics accumulate.** Every intervention and every state change leaves a trail. `.loop/state/stewardship-log.md` for narrative events, `.loop/state/log.jsonl` for daemon events.
 3. **loop-report script renders the delta on wake.** Runs against existing data sources. `python3 scripts/loop-report.py --since 8h`.
 4. **Missing the live window is a real cost** but a bounded one. "Catch a stopper at 3am" is lost; "clear a stopper at 8am with full context" is what you get instead. For a normal sleep duration (6-8h), that trade is fine.
@@ -34,7 +34,7 @@ Total time: ~3-5 min if quiet, longer if the night was eventful.
 ## Scope limits (for unattended operation)
 
 - **Approve authority:** stewardship does NOT run `loop approve` on taste-gated briefs, or on anything where the approval is the brief's core artifact.
-- **Intervention authority:** steward MAY write `pending-dispatch.json` for stuck conductors, MAY move briefs from active to awaiting_review for human-in-the-loop escalations, MAY archive resolved signals, MAY restart the daemon if HUNG.
+- **Intervention authority:** steward MAY write `pending-dispatch.json` for stuck queens, MAY move briefs from active to awaiting_review for human-in-the-loop escalations, MAY archive resolved signals, MAY restart the daemon if HUNG.
 - **Hands-off:** no code edits, no new briefs, no goals.md priority changes. Overnight stewardship is a watchdog role, not an implementer role.
 - **Log everything:** stewardship-log entry per intervention, H3 with timestamp. Classification + action + rubric + what the human should know in the morning.
 

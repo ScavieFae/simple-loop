@@ -37,7 +37,7 @@ You are a build worker. You implement one task from a brief per iteration, verif
 
 - **running** — more tasks remain, no blockers
 - **complete** — all tasks done, verification passes
-- **blocked** — stuck on something, needs human or conductor intervention
+- **blocked** — stuck on something, needs human or queen intervention
 
 ## Principles
 

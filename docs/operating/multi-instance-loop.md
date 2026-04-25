@@ -8,13 +8,13 @@ Installing simple-loop in a second project surfaced a quiet shift: the thing bei
 
 ## What simple-loop is becoming
 
-Simple-loop started as the daemon — conductor, worker, validator loop. Over time, orbital tooling earned its way in:
+Simple-loop started as the daemon — queen, worker, validator loop. Over time, orbital tooling earned its way in:
 
 - **Zensical-backed wiki** with `briefs/cards/` + `operating-docs/` + `decisions/` + riffs + the CLAUDE.md director opening — the shape of the repo's own brain.
 - **Beehive** (`crates/hive/`) — the ratatui TUI for glancing at queue + active + pending briefs.
 - **The cards pattern** — each brief gets a directory with `index.md` + `plan.md` + `closeout.md` + any artifacts. Doubles as an observability surface and as a primitive (symlinked into `.loop/briefs/` for dispatch).
 - **Stewardship-log** — `.loop/state/stewardship-log.md` as the narrative log of non-automated interventions.
-- **Goals.md + Queued/Awaiting/Done sections** — the conductor's queue source + human-readable overview.
+- **Goals.md + Queued/Awaiting/Done sections** — the queen's queue source + human-readable overview.
 
 So: simple-loop-the-thing-we-install-in-a-new-project = daemon + beehive + cards convention + zensical wiki scaffold + stewardship-log + goals.md convention. Not all code, some of it is *conventions*. The conventions are as load-bearing as the code.
 
@@ -23,7 +23,7 @@ So: simple-loop-the-thing-we-install-in-a-new-project = daemon + beehive + cards
 Simple-loop itself isn't a workspace. Nobody runs sessions "in simple-loop" — improvements always come from inside a consuming project. A consumer project queues briefs that happen to target `ScavieFae/simple-loop` master.
 
 Implications:
-- **Simple-loop master never gets its own beehive or conductor** — those are the *deliverables* it ships to consumers, not the machinery it uses to receive updates.
+- **Simple-loop master never gets its own beehive or queen** — those are the *deliverables* it ships to consumers, not the machinery it uses to receive updates.
 - **The test harness has to be self-contained** so simple-loop master can verify changes without a consumer project's state. `scripts/test-flow-v2.sh` is shaped this way.
 
 ## Flow direction for improvements
@@ -42,7 +42,7 @@ Improvements land first in the consumer project that discovered the need. The br
 
 Beehive shows state from the *local* `.loop/state/` only — that's already how it works. Per-project customization (colors, column layouts, TUI preferences) uses `.loop/config.json` with a `beehive` section for palette + layout overrides. Code stays shared; palette stays local.
 
-Same principle extends to conductor prompts, validator prompts, stewardship-log format — the *mechanism* is shared, the *flavoring* (palette, voice, specific phrasing) is per-project.
+Same principle extends to queen prompts, validator prompts, stewardship-log format — the *mechanism* is shared, the *flavoring* (palette, voice, specific phrasing) is per-project.
 
 ## Open questions
 

@@ -23,8 +23,8 @@
 
 ## Queue semantics
 
-- **Queued next** — daemon-dispatchable. The conductor reads this section, picks the first unchecked item, and dispatches it. Order is priority order.
-- **Awaiting** — human-in-the-loop dependency. Not dispatchable until the dependency resolves. The conductor skips these.
+- **Queued next** — daemon-dispatchable. The queen reads this section, picks the first unchecked item, and dispatches it. Order is priority order.
+- **Awaiting** — human-in-the-loop dependency. Not dispatchable until the dependency resolves. The queen skips these.
 - **Credential-gated** — requires live credentials (OAuth, API keys, SSH) the daemon can't hold. Not dispatchable. These are work items waiting for a human to ungate them.
 
 ## The "not dispatchable" philosophy
@@ -33,6 +33,6 @@ Some work shouldn't be automated. Credential-gated briefs are an explicit acknow
 
 ## Updating the queue
 
-The conductor marks items complete (checks them off) when a brief merges. The human adds new items. Nothing else edits goals.md automatically.
+The queen marks items complete (checks them off) when a brief merges. The human adds new items. Nothing else edits goals.md automatically.
 
-When a brief completes: the conductor moves it from `## Queued next` → checked off. The human decides what comes next and moves it up the queue.
+When a brief completes: the queen moves it from `## Queued next` → checked off. The human decides what comes next and moves it up the queue.

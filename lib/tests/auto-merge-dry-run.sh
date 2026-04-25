@@ -114,7 +114,7 @@ EOF
     # Create a branch matching brief_id (auto_merge looks up branch ref)
     git -C "$dir" branch "$brief_id"
 
-    # Simulated escalate.json (written by conductor in real life)
+    # Simulated escalate.json (written by queen in real life)
     cat > "$dir/.loop/state/signals/escalate.json" <<EOF
 {"type": "human_approval",
  "reason": "$escalate_reason",

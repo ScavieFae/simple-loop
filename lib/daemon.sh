@@ -4,14 +4,14 @@
 # Usage: bash lib/daemon.sh <project_dir> [heartbeat_seconds]
 #
 # Architecture:
-#   Each tick: assess state → run conductor or worker → push → sleep.
-#   Conductor: reads state, decides what to do (evaluate, dispatch, idle).
+#   Each tick: assess state → run queen or worker → push → sleep.
+#   Queen: reads state, decides what to do (evaluate, dispatch, idle).
 #   Worker: does ONE task from the active brief, commits, exits.
 #   Both run as fresh Claude Code sessions. No long-lived processes.
 #
 # Model tier policy (2026-04-21, revised from brief-003 baseline):
 #   heartbeat = haiku  (reserved — no heartbeat Claude calls today; assess.py is pure Python)
-#   conductor = opus   (substantive state-transition reasoning, taste calls)
+#   queen     = opus   (substantive state-transition reasoning, taste calls)
 #   validator = sonnet (spec-fit review — Sonnet is sufficient; opt up per-brief if needed)
 #   worker    = per-brief from **Model:** frontmatter, default sonnet
 #                (set **Model:** opus in brief frontmatter for hard work)
@@ -36,7 +36,7 @@ LOG_DIR="$LOOP_DIR/logs"
 PID_FILE="$STATE_DIR/daemon.pid"
 METRICS_FILE="$STATE_DIR/metrics.jsonl"
 RUNNING_FILE="$STATE_DIR/running.json"
-CONDUCTOR_PROMPT="$LOOP_DIR/prompts/conductor.md"
+CONDUCTOR_PROMPT="$LOOP_DIR/prompts/queen.md"
 WORKER_PROMPT="$LOOP_DIR/prompts/worker.md"
 # Validator default agent spec (per-brief **Validator:** override lands in task 5).
 VALIDATOR_AGENT_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/core/agents/reviewer.md"
@@ -195,25 +195,25 @@ assess_state() {
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  Conductor Invocation                                           ║
+# ║  Queen Invocation                                               ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 invoke_conductor() {
     local reason="$1"
-    daemon_log "CONDUCTOR #$TURN: invoking ($reason)"
+    daemon_log "QUEEN #$TURN: invoking ($reason)"
 
     if [ ! -f "$CONDUCTOR_PROMPT" ]; then
-        daemon_log "ERROR: conductor prompt not found at $CONDUCTOR_PROMPT"
+        daemon_log "ERROR: queen prompt not found at $CONDUCTOR_PROMPT"
         return 1
     fi
 
-    local TURN_LOG="$LOG_DIR/conductor_${TURN}_$(date +%Y%m%d_%H%M%S).log"
+    local TURN_LOG="$LOG_DIR/queen_${TURN}_$(date +%Y%m%d_%H%M%S).log"
     local TURN_START=$(date +%s)
     local JSON_TMP=$(mktemp)
 
     cd "$PROJECT_DIR"
 
-    # Tier: conductor = opus (see top-of-file model tier policy).
+    # Tier: queen = opus (see top-of-file model tier policy).
     claude --model opus --dangerously-skip-permissions \
         --output-format json \
         -p "$(cat "$CONDUCTOR_PROMPT")
@@ -230,18 +230,18 @@ Trigger reason: $reason" \
     local TURN_DURATION=$((TURN_END - TURN_START))
 
     if [ "$EXIT_CODE" -ne 0 ]; then
-        daemon_log "CONDUCTOR #$TURN: FAILED (exit $EXIT_CODE, ${TURN_DURATION}s)"
-        notify "Conductor FAILED (exit $EXIT_CODE)"
+        daemon_log "QUEEN #$TURN: FAILED (exit $EXIT_CODE, ${TURN_DURATION}s)"
+        notify "Queen FAILED (exit $EXIT_CODE)"
 
         if [ "$TURN_DURATION" -le 10 ] && grep -q "out of extra usage" "$TURN_LOG" 2>/dev/null; then
             handle_rate_limit "$TURN_LOG"
             return 1
         fi
     else
-        daemon_log "CONDUCTOR #$TURN: complete (${TURN_DURATION}s)"
+        daemon_log "QUEEN #$TURN: complete (${TURN_DURATION}s)"
 
         # Brief-003 Thread 7: Auto-merge layer.
-        # If the conductor wrote an `escalate.json` with reason
+        # If the queen wrote an `escalate.json` with reason
         # `human_approval_required_for_merge`, check whether the brief opted in
         # via `**Auto-merge:** true` + validator verdict == `pass` + no
         # `.loop/state/pause-auto-merge` kill-switch. When all three hold, swap
@@ -256,7 +256,7 @@ Trigger reason: $reason" \
             fi
         fi
 
-        # Push after conductor (it may have committed state changes)
+        # Push after queen (it may have committed state changes)
         git -C "$PROJECT_DIR" push "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
     fi
 
@@ -643,9 +643,9 @@ reviewed_at: $NOW_ISO
 \`\`\`
 
 Verdict guide:
-- \`pass\` — no issues, clean spec-fit. Conductor proceeds as today.
-- \`issues\` — non-blocking concerns surfaced. Do NOT block merge; conductor reads at merge-time.
-- \`block\` — show-stopper bug or spec violation. The daemon preempts conductor on the next tick with \`validator_blocked\`.
+- \`pass\` — no issues, clean spec-fit. Queen proceeds as today.
+- \`issues\` — non-blocking concerns surfaced. Do NOT block merge; queen reads at merge-time.
+- \`block\` — show-stopper bug or spec violation. The daemon preempts the queen on the next tick with \`validator_blocked\`.
 
 ## Rules
 
@@ -809,7 +809,7 @@ fire_scout() {
     local exit_code=$?
     local duration_ms=$(( ( $(date +%s) - start ) * 1000 ))
 
-    # Parse metrics via the same helper workers/conductors use. Extra fields
+    # Parse metrics via the same helper workers/queens use. Extra fields
     # flag the scout lineage so loop-report can segregate.
     parse_metrics "$scout_json" "$scout_log" "scout" \
         "{'specialist': '$name', 'model': '$model', 'exit_code': $exit_code}"
@@ -956,9 +956,9 @@ while true; do
     VALIDATOR_FIRED_THIS_TICK=0
 
     # --- Escalate-resolved detection (breaks dedup on stale triggers) ---
-    # When the conductor writes escalate.json, subsequent ticks with the same
+    # When the queen writes escalate.json, subsequent ticks with the same
     # trigger de-dup and the daemon goes silent. If a human (or scav) clears
-    # the escalate, the daemon must re-run the conductor — otherwise it sits
+    # the escalate, the daemon must re-run the queen — otherwise it sits
     # deduped on a decision that no longer applies.  Track escalate presence
     # across ticks; on the tick where it disappears, reset the dedup marker.
     if [ -f "$SIGNALS_DIR/escalate.json" ]; then
@@ -967,7 +967,7 @@ while true; do
         CURRENT_ESCALATE_PRESENT=false
     fi
     if [ "$LAST_ESCALATE_PRESENT" = "true" ] && [ "$CURRENT_ESCALATE_PRESENT" = "false" ]; then
-        daemon_log "CONDUCTOR: escalate.json resolved — resetting dedup so next conductor re-evaluates"
+        daemon_log "QUEEN: escalate.json resolved — resetting dedup so next queen re-evaluates"
         LAST_CONDUCTOR_TRIGGER=""
     fi
     LAST_ESCALATE_PRESENT="$CURRENT_ESCALATE_PRESENT"
@@ -1005,7 +1005,7 @@ while true; do
     # ┌─────────────────────────────────────┐
     # │  Phase 1: Assess state              │
     # └─────────────────────────────────────┘
-    # assess.py prints three lines: conductor trigger, worker target, validator target.
+    # assess.py prints three lines: queen trigger, worker target, validator target.
     write_heartbeat "phase1_assess"
     ASSESS_OUTPUT=$(assess_state)
     CONDUCTOR_TRIGGER=$(echo "$ASSESS_OUTPUT" | sed -n 1p)
@@ -1013,7 +1013,7 @@ while true; do
     VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
 
     # ┌─────────────────────────────────────┐
-    # │  Phase 2: Conductor (if triggered)  │
+    # │  Phase 2: Queen (if triggered)      │
     # └─────────────────────────────────────┘
     case "$CONDUCTOR_TRIGGER" in
         CONDUCTOR:*)
@@ -1021,15 +1021,15 @@ while true; do
 
             # Dedup: skip if same trigger as last tick
             if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ]; then
-                daemon_log "CONDUCTOR: dedup — same trigger ($REASON), skipping"
+                daemon_log "QUEEN: dedup — same trigger ($REASON), skipping"
             else
-                write_heartbeat "phase2_conductor:$REASON"
+                write_heartbeat "phase2_queen:$REASON"
                 invoke_conductor "$REASON"
                 CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
                 LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
                 DID_WORK=true
 
-                # Re-assess after conductor
+                # Re-assess after queen
                 ASSESS_OUTPUT=$(assess_state)
                 WORKER_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 2p)
                 VALIDATOR_TARGET=$(echo "$ASSESS_OUTPUT" | sed -n 3p)
@@ -1250,9 +1250,9 @@ except: print(0)
             IFS=',' read -r BRIEF_ID BRIEF_BRANCH <<< "${WORKER_TARGET#WORKER:}"
 
             if [ "$CONSECUTIVE_WORKER_FAILURES" -ge 3 ]; then
-                daemon_log "WORKER: 3 consecutive failures — escalating to conductor"
+                daemon_log "WORKER: 3 consecutive failures — escalating to queen"
                 notify "3 worker failures on $BRIEF_ID — escalating"
-                write_heartbeat "phase3_conductor_escalate:$BRIEF_ID"
+                write_heartbeat "phase3_queen_escalate:$BRIEF_ID"
                 invoke_conductor "worker_failures_${BRIEF_ID}"
                 CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
                 CONSECUTIVE_WORKER_FAILURES=0

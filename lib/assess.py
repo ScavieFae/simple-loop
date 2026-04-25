@@ -2,12 +2,12 @@
 """Assess daemon state — what should happen this tick?
 
 Prints THREE lines:
-  Line 1 (conductor): CONDUCTOR:<reason> or NONE
+  Line 1 (queen):     CONDUCTOR:<reason> or NONE
   Line 2 (worker):    WORKER:<brief>,<branch> or NONE
   Line 3 (validator): VALIDATOR:<brief>,<branch>,<commit> or NONE
 
 Brief-003 Thread 1 added line 3: emits a VALIDATOR target when a builder
-cycle has committed and no corresponding review exists. Conductor trigger
+cycle has committed and no corresponding review exists. Queen trigger
 CONDUCTOR:validator_blocked:<brief> preempts brief_complete when the latest
 review's verdict is `block` (precedence 3 — ahead of brief_complete, behind
 pending_eval and active_signal).
@@ -234,7 +234,7 @@ def main():
                     remote = line.strip().split("=", 1)[1].strip('"').strip("'")
                     break
 
-    # --- Conductor triggers ---
+    # --- Queen triggers ---
 
     # Pending evaluation
     pending = rc.get("completed_pending_eval", [])
@@ -253,7 +253,7 @@ def main():
             except (json.JSONDecodeError, KeyError):
                 pass
 
-    # High-priority conductor triggers (pending_eval, active_signal) cannot be
+    # High-priority queen triggers (pending_eval, active_signal) cannot be
     # preempted by validator_blocked. Track so the later block check knows.
     high_priority = conductor in ("CONDUCTOR:pending_eval", "CONDUCTOR:active_signal")
 
@@ -264,7 +264,7 @@ def main():
 
     blocked_brief = ""  # populated below if any active brief has verdict: block
 
-    # --- Check active briefs for conductor triggers, worker targets, validator targets ---
+    # --- Check active briefs for queen triggers, worker targets, validator targets ---
     for brief_entry in active:
         brief_id = brief_entry.get("brief", "")
         branch = brief_entry.get("branch", "")
@@ -313,7 +313,7 @@ def main():
             if tip_sha:
                 validator = f"VALIDATOR:{brief_id},{branch},{tip_sha}"
 
-        # Block verdict on the most recent review preempts other conductor triggers.
+        # Block verdict on the most recent review preempts other queen triggers.
         if max_cycle > 0 and not blocked_brief:
             verdict = latest_review_verdict(project_dir, used_ref, brief_id, max_cycle)
             if verdict == "block":
