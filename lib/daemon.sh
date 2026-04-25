@@ -297,6 +297,25 @@ run_worker_iteration() {
     # Pull latest into worktree (doesn't touch main tree)
     git -C "$WORKTREE_DIR" pull --ff-only "$GIT_REMOTE" "$branch" -q 2>/dev/null || true
 
+    # ── Rebase onto main (cycle-start, Phase 1 of brief-061) ─────────────────
+    # Each cycle starts on current main so merge-time staleness is bounded to
+    # single-cycle wall-clock (~15 min). Conflict → abort + route to
+    # awaiting_review; don't continue the cycle with a broken state.
+    git -C "$WORKTREE_DIR" fetch "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+    COMMITS_BEHIND_BEFORE=$(git -C "$WORKTREE_DIR" rev-list --count HEAD.."${GIT_REMOTE}/${GIT_MAIN_BRANCH}" 2>/dev/null || echo "0")
+    if git -C "$WORKTREE_DIR" rebase "${GIT_REMOTE}/${GIT_MAIN_BRANCH}" -q 2>/dev/null; then
+        daemon_log "WORKER: rebased $branch onto ${GIT_REMOTE}/${GIT_MAIN_BRANCH} ($COMMITS_BEHIND_BEFORE commits)"
+    else
+        git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+        daemon_log "WORKER: rebase failed for $branch (conflicts) → routed to awaiting_review"
+        python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
+            "rebase conflict against main — human resolution required" \
+            2>>"$LOG_DIR/daemon.log" || true
+        notify "$brief_id: rebase conflict → routed to awaiting_review"
+        return 0
+    fi
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Initialize progress.json if missing (in worktree)
     local PROGRESS_FILE="$WORKTREE_DIR/.loop/state/progress.json"
     if [ ! -f "$PROGRESS_FILE" ]; then
