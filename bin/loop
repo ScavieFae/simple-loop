@@ -1661,6 +1661,18 @@ cmd_reject() {
     echo "Branch preserved for forensics. Worktree removed."
 }
 
+# ── lint ─────────────────────────────────────────────────────
+
+cmd_lint() {
+    local lint_script="$LIB_DIR/lint.py"
+    if [ ! -f "$lint_script" ]; then
+        lint_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/lint.py"
+    fi
+    [ -f "$lint_script" ] || die "lint.py not found. Is Simple Loop installed?"
+
+    python3 "$lint_script" "$@"
+}
+
 # ── cleanup ──────────────────────────────────────────────────
 
 cmd_cleanup() {
@@ -1715,6 +1727,10 @@ Signals:
                            for partial-approval with waiver record
   reject <brief-id> [why]  Reject a brief: mark in history, remove worktree
 
+Quality:
+  lint <path>              Lint a brief file or directory for format drift
+                           <path> = single file or wiki/briefs/cards/ dir
+
 Maintenance:
   cleanup                  Remove worktrees for completed/merged briefs
 
@@ -1747,6 +1763,7 @@ case "${1:-help}" in
     approve) shift; cmd_approve "$@" ;;
     reject)  shift; cmd_reject "$@" ;;
     metrics) shift; cmd_metrics "$@" ;;
+    lint)    shift; cmd_lint "$@" ;;
     cleanup) cmd_cleanup ;;
     help|--help|-h) cmd_help ;;
     *)       echo "Unknown command: $1"; cmd_help; exit 1 ;;
