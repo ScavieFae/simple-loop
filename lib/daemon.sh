@@ -50,6 +50,11 @@ GIT_MAIN_BRANCH="${GIT_MAIN_BRANCH:-main}"
 MAX_COMMITS_BEHIND="${MAX_COMMITS_BEHIND:-30}"
 MAX_CYCLE_WALL_TIME_SECS="${MAX_CYCLE_WALL_TIME_SECS:-5400}"
 WORKER_KILL_GRACE_SECS="${WORKER_KILL_GRACE_SECS:-10}"
+# TTL for conductor dedup cache entries. After this many seconds a cached
+# trigger is treated as fresh, allowing re-evaluation of persistent conditions
+# (e.g. stale_brief after a stuck worker exit). 30 min keeps dedup spam-free
+# within a normal scout/conductor cadence while bounding worst-case stuck time.
+CONDUCTOR_DEDUP_TTL_SECS="${CONDUCTOR_DEDUP_TTL_SECS:-1800}"
 
 # Tracking
 CONSECUTIVE_SKIPS=0
@@ -994,6 +999,7 @@ notify "Daemon started (PID $$)"
 
 TURN=0
 LAST_CONDUCTOR_TRIGGER=""
+LAST_CONDUCTOR_TRIGGER_TS=0
 LAST_ESCALATE_PRESENT=false
 HEARTBEAT_FILE="$STATE_DIR/heartbeat.json"
 
@@ -1036,6 +1042,7 @@ while true; do
     if [ "$LAST_ESCALATE_PRESENT" = "true" ] && [ "$CURRENT_ESCALATE_PRESENT" = "false" ]; then
         daemon_log "QUEEN: escalate.json resolved — resetting dedup so next queen re-evaluates"
         LAST_CONDUCTOR_TRIGGER=""
+        LAST_CONDUCTOR_TRIGGER_TS=0
     fi
     LAST_ESCALATE_PRESENT="$CURRENT_ESCALATE_PRESENT"
 
@@ -1086,14 +1093,22 @@ while true; do
         CONDUCTOR:*)
             REASON="${CONDUCTOR_TRIGGER#CONDUCTOR:}"
 
-            # Dedup: skip if same trigger as last tick
-            if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ]; then
-                daemon_log "QUEEN: dedup — same trigger ($REASON), skipping"
+            # Dedup: skip if same trigger as last tick AND the cache entry is
+            # within TTL. After CONDUCTOR_DEDUP_TTL_SECS the entry is stale and
+            # the trigger is re-evaluated from scratch (brief-076).
+            _NOW=$(date +%s)
+            _TRIGGER_AGE=$(( _NOW - LAST_CONDUCTOR_TRIGGER_TS ))
+            if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ] && [ "$_TRIGGER_AGE" -lt "$CONDUCTOR_DEDUP_TTL_SECS" ]; then
+                daemon_log "QUEEN: dedup — same trigger ($REASON), skipping (age ${_TRIGGER_AGE}s / ttl ${CONDUCTOR_DEDUP_TTL_SECS}s)"
             else
+                if [ "$CONDUCTOR_TRIGGER" = "$LAST_CONDUCTOR_TRIGGER" ]; then
+                    daemon_log "QUEEN: dedup TTL expired (age ${_TRIGGER_AGE}s) — re-evaluating trigger ($REASON)"
+                fi
                 write_heartbeat "phase2_queen:$REASON"
                 invoke_conductor "$REASON"
                 CONDUCTOR_FIRED_THIS_TICK=$((CONDUCTOR_FIRED_THIS_TICK + 1))
                 LAST_CONDUCTOR_TRIGGER="$CONDUCTOR_TRIGGER"
+                LAST_CONDUCTOR_TRIGGER_TS="$_NOW"
                 DID_WORK=true
 
                 # Re-assess after queen
@@ -1303,6 +1318,7 @@ except: print(0)
                 VALIDATOR_FIRED_THIS_TICK=$((VALIDATOR_FIRED_THIS_TICK + 1))
                 DID_WORK=true
                 LAST_CONDUCTOR_TRIGGER=""
+                LAST_CONDUCTOR_TRIGGER_TS=0
             else
                 daemon_log "VALIDATOR: malformed target '$VALIDATOR_TARGET' — skipping"
             fi
@@ -1329,6 +1345,7 @@ except: print(0)
                 WORKER_FIRED_THIS_TICK=$((WORKER_FIRED_THIS_TICK + 1))
                 DID_WORK=true
                 LAST_CONDUCTOR_TRIGGER=""
+                LAST_CONDUCTOR_TRIGGER_TS=0
             fi
             ;;
     esac
