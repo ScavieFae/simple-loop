@@ -1046,6 +1046,24 @@ while true; do
     fi
     LAST_ESCALATE_PRESENT="$CURRENT_ESCALATE_PRESENT"
 
+    # --- State-change dedup clear (brief-076) ---
+    # actions.py writes dedup-clear-<brief_id>.json after moving a brief out
+    # of active[]. If the cached trigger is for that brief, flush the entry so
+    # the queen re-evaluates on the next tick instead of sitting deduped on a
+    # resolved condition.  Always consume the file regardless of match.
+    for _CLEAR_FILE in "$SIGNALS_DIR"/dedup-clear-*.json; do
+        [ -f "$_CLEAR_FILE" ] || continue
+        _CLEAR_FNAME=$(basename "$_CLEAR_FILE")
+        _CLEAR_BRIEF="${_CLEAR_FNAME#dedup-clear-}"
+        _CLEAR_BRIEF="${_CLEAR_BRIEF%.json}"
+        if echo "$LAST_CONDUCTOR_TRIGGER" | grep -qF ":${_CLEAR_BRIEF}"; then
+            daemon_log "QUEEN: dedup cleared for ${_CLEAR_BRIEF} (state-change signal — brief moved out of active)"
+            LAST_CONDUCTOR_TRIGGER=""
+            LAST_CONDUCTOR_TRIGGER_TS=0
+        fi
+        rm -f "$_CLEAR_FILE"
+    done
+
     # --- Pause check ---
     if [ -f "$SIGNALS_DIR/pause.json" ]; then
         daemon_log "PAUSED: $(cat "$SIGNALS_DIR/pause.json")"

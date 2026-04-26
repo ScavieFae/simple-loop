@@ -47,10 +47,12 @@ def init_paths(project_dir):
     """Initialize paths from project directory."""
     loop_dir = os.path.join(project_dir, ".loop")
     state_dir = os.path.join(loop_dir, "state")
+    signals_dir = os.path.join(state_dir, "signals")
     return {
         "project_dir": project_dir,
         "loop_dir": loop_dir,
         "state_dir": state_dir,
+        "signals_dir": signals_dir,
         "worktrees_dir": os.path.join(loop_dir, "worktrees"),
         "running_file": os.path.join(state_dir, "running.json"),
         "pending_dispatch": os.path.join(state_dir, "pending-dispatch.json"),
@@ -89,6 +91,16 @@ def log_action(paths, action, details):
     }
     with open(paths["log_file"], "a") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+def signal_dedup_clear(paths, brief_id):
+    """Write a signal file so the daemon clears its dedup cache entry for this brief."""
+    signals_dir = paths.get("signals_dir", os.path.join(paths["state_dir"], "signals"))
+    os.makedirs(signals_dir, exist_ok=True)
+    signal_file = os.path.join(signals_dir, f"dedup-clear-{brief_id}.json")
+    with open(signal_file, "w") as f:
+        json.dump({"brief": brief_id}, f)
+        f.write("\n")
 
 
 def git(project_dir, *args, check=True):
@@ -465,6 +477,7 @@ def move_to_awaiting_review(paths, brief_id, reason=""):
     rc["awaiting_review"].append(moved)
     save_running(paths, rc)
 
+    signal_dedup_clear(paths, brief_id)
     log_action(paths, "move-to-awaiting-review", {"brief": brief_id, "reason": reason})
     print(f"Moved {brief_id} to awaiting_review")
     return True
@@ -564,6 +577,7 @@ def reject_brief(paths, brief_id, reason=""):
     rc.setdefault("history", []).append(moved)
     save_running(paths, rc)
 
+    signal_dedup_clear(paths, brief_id)
     log_action(paths, "reject-brief", {"brief": brief_id, "reason": reason})
     print(f"Rejected {brief_id}: moved to history")
     return True
@@ -894,6 +908,8 @@ def merge(paths):
         "evaluation": evaluation,
     })
     save_running(paths, rc)
+
+    signal_dedup_clear(paths, brief)
     git(project_dir, "push", remote, main_branch, check=False)
 
     # Remove queue file
