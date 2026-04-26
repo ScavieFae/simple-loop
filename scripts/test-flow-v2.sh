@@ -2617,6 +2617,123 @@ assert_eq "cwt-no-override: no Cycle-wall-time-secs → parser returns default 5
 
 rm -rf "$CWT_SCRATCH"
 
+# ── Tests 73-80: Conductor dedup cache TTL + clear-on-state-change (brief-076) ──
+
+echo ""
+echo "=== Tests 73-80: Conductor dedup cache TTL + clear-on-state-change ==="
+
+DEDUP_SCRATCH=$(mktemp -d)
+mkdir -p "$DEDUP_SCRATCH/.loop/briefs" "$DEDUP_SCRATCH/.loop/state/signals"
+git -C "$DEDUP_SCRATCH" init -q -b main
+git -C "$DEDUP_SCRATCH" config user.email "test@test"
+git -C "$DEDUP_SCRATCH" config user.name  "Test"
+
+cat > "$DEDUP_SCRATCH/.loop/briefs/brief-076-test.md" <<'DEOF'
+# Brief: dedup test
+**ID:** brief-076-test
+**Auto-merge:** false
+**Status:** queued
+DEOF
+
+touch "$DEDUP_SCRATCH/.loop/state/log.jsonl"
+git -C "$DEDUP_SCRATCH" add -A
+git -C "$DEDUP_SCRATCH" commit -q -m "test: init"
+
+# ── Test 73: signal_dedup_clear writes expected signal file ──────────────────
+# Brief lifecycle: signal_dedup_clear() is the primitive that the daemon consumes
+# to flush a stale cache entry. It must write dedup-clear-<brief_id>.json.
+
+python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, signal_dedup_clear
+paths = init_paths('$DEDUP_SCRATCH')
+signal_dedup_clear(paths, 'brief-076-test')
+"
+
+T73_FILE="$DEDUP_SCRATCH/.loop/state/signals/dedup-clear-brief-076-test.json"
+if [ -f "$T73_FILE" ]; then
+    pass "dedup-clear: signal_dedup_clear writes dedup-clear-<brief_id>.json"
+else
+    fail "dedup-clear: signal file missing — expected $T73_FILE"
+fi
+
+# Test 74: signal file contains correct brief id.
+T74_CONTENT=$(python3 -c "import json; d=json.load(open('$T73_FILE')); print(d['brief'])" 2>/dev/null || echo "ERROR")
+assert_eq "dedup-clear: signal file contains correct brief id" "$T74_CONTENT" "brief-076-test"
+
+# Clean up signal file before next test.
+rm -f "$T73_FILE"
+
+# ── Tests 75-77: move-to-awaiting-review emits dedup-clear signal ────────────
+
+python3 -c "import json; json.dump({
+    'active': [{'brief': 'brief-076-test', 'branch': 'brief-076-test', 'brief_file': '.loop/briefs/brief-076-test.md', 'auto_merge': False}],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [],
+    'queue': []
+}, open('$DEDUP_SCRATCH/.loop/state/running.json','w'), indent=2)"
+
+python3 "$ACTIONS" move-to-awaiting-review brief-076-test "$DEDUP_SCRATCH" \
+    "worker exited — stale_brief condition detected" > /dev/null 2>&1
+
+T75_SIGNAL="$DEDUP_SCRATCH/.loop/state/signals/dedup-clear-brief-076-test.json"
+
+# Test 75: move-to-awaiting-review emits dedup-clear signal file.
+if [ -f "$T75_SIGNAL" ]; then
+    pass "dedup-clear: move-to-awaiting-review writes dedup-clear signal"
+else
+    fail "dedup-clear: move-to-awaiting-review did not write dedup-clear signal — expected $T75_SIGNAL"
+fi
+
+DEDUP_RJ="$DEDUP_SCRATCH/.loop/state/running.json"
+
+# Test 76: active[] emptied (normal move-to-awaiting-review side-effect).
+assert_json "dedup-clear: active[] emptied after move-to-awaiting-review"   "$DEDUP_RJ" "len(d['active'])"         "0"
+
+# Test 77: brief is now in awaiting_review[] (normal move-to-awaiting-review side-effect).
+assert_json "dedup-clear: brief appears in awaiting_review[]"               "$DEDUP_RJ" "len(d['awaiting_review'])" "1"
+
+# ── Tests 78-80: dedup TTL — cache entry expires, re-fire is unblocked ───────
+#
+# The daemon's dedup check is pure bash (in-process variables), so we test
+# the actions.py side: signal emission is the mechanism that tells the daemon
+# "this entry is now stale, re-evaluate."  We also verify the TTL default is
+# set in daemon.sh so the env-var knob is wired correctly.
+
+# Test 78: CONDUCTOR_DEDUP_TTL_SECS default is 1800 in daemon.sh.
+DAEMON_SH="$LIB_DIR/daemon.sh"
+T78_DEFAULT=$(grep 'CONDUCTOR_DEDUP_TTL_SECS=' "$DAEMON_SH" 2>/dev/null | grep -o '[0-9]\+' | head -1)
+assert_eq "dedup-ttl: CONDUCTOR_DEDUP_TTL_SECS default is 1800 in daemon.sh" "$T78_DEFAULT" "1800"
+
+# Test 79: reject-brief also emits dedup-clear signal (clears cache on rejection).
+python3 -c "import json; json.dump({
+    'active': [],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [{'brief': 'brief-076-test', 'branch': 'brief-076-test', 'brief_file': '.loop/briefs/brief-076-test.md', 'auto_merge': False}],
+    'history': [],
+    'queue': []
+}, open('$DEDUP_SCRATCH/.loop/state/running.json','w'), indent=2)"
+
+rm -f "$DEDUP_SCRATCH/.loop/state/signals/dedup-clear-brief-076-test.json"
+
+python3 "$ACTIONS" reject-brief brief-076-test "$DEDUP_SCRATCH" "test rejection" > /dev/null 2>&1
+
+T79_SIGNAL="$DEDUP_SCRATCH/.loop/state/signals/dedup-clear-brief-076-test.json"
+if [ -f "$T79_SIGNAL" ]; then
+    pass "dedup-clear: reject-brief writes dedup-clear signal"
+else
+    fail "dedup-clear: reject-brief did not write dedup-clear signal — expected $T79_SIGNAL"
+fi
+
+# Test 80: brief moved to history[] after rejection (sanity check + state integrity).
+assert_json "dedup-clear: brief in history[] after rejection"   "$DEDUP_RJ" "len(d['history'])"         "1"
+
+rm -rf "$DEDUP_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
