@@ -225,7 +225,7 @@ Trigger reason: $reason" \
 
     local EXIT_CODE=$?
 
-    parse_metrics "$JSON_TMP" "$TURN_LOG" "conductor" "{'reason': '$reason', 'exit_code': $EXIT_CODE}"
+    parse_metrics "$JSON_TMP" "$TURN_LOG" "queen" "{'reason': '$reason', 'exit_code': $EXIT_CODE}"
     rm -f "$JSON_TMP"
 
     local TURN_END=$(date +%s)

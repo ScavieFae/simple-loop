@@ -794,7 +794,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn actor_color(actor: Option<&str>) -> Color {
     match actor {
-        Some("conductor") => LAVENDER,
+        Some("queen") | Some("conductor") => LAVENDER,
         Some("daemon") => AMBER,
         Some("worker") => POP_GREEN,
         Some("validator") => ORANGE,
@@ -1262,7 +1262,7 @@ fn render_help_modal<'a>() -> Text<'a> {
         blank(),
         section("  Color Legend"),
         blank(),
-        color_chip("conductor (dispatch/evaluate)", LAVENDER),
+        color_chip("queen (dispatch/evaluate)", LAVENDER),
         color_chip("daemon (heartbeat)", AMBER),
         color_chip("worker (nectar collector)", POP_GREEN),
         color_chip("validator (quality gate)", ORANGE),
