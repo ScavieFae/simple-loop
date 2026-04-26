@@ -2529,6 +2529,94 @@ assert_json "staleness-gate: reason contains staleness note"   "$RJ" "'staleness
 # used by hive and director tooling to display the specific block reason.
 assert_json "staleness-gate: conflict_note field set"          "$RJ" "'staleness gate triggered' in d['awaiting_review'][0].get('conflict_note','')" "True"
 
+# ── Tests 70-72: Cycle wall-time timeout routing (brief-073) ─────────────────
+
+echo ""
+echo "=== Tests 70-72: Cycle wall-time timeout — timeout fire → awaiting_review ==="
+
+CWT_SCRATCH=$(mktemp -d)
+mkdir -p "$CWT_SCRATCH/.loop/briefs" "$CWT_SCRATCH/.loop/state"
+git -C "$CWT_SCRATCH" init -q -b main
+git -C "$CWT_SCRATCH" config user.email "test@test"
+git -C "$CWT_SCRATCH" config user.name  "Test"
+
+cat > "$CWT_SCRATCH/.loop/briefs/brief-001-auto.md" <<'CWTEOF'
+# Brief: auto-merge test
+**ID:** brief-001-auto
+**Auto-merge:** true
+**Status:** queued
+CWTEOF
+
+touch "$CWT_SCRATCH/.loop/state/log.jsonl"
+git -C "$CWT_SCRATCH" add -A
+git -C "$CWT_SCRATCH" commit -q -m "test: init"
+
+# Test 70: cycle-wall-time timeout fire routes to awaiting_review with conflict_note.
+# Daemon kills worker and calls move-to-awaiting-review with the cycle wall-time reason.
+python3 -c "import json; json.dump({
+    'active': [{'brief': 'brief-001-auto', 'branch': 'brief-001-auto', 'brief_file': '.loop/briefs/brief-001-auto.md', 'auto_merge': True}],
+    'completed_pending_eval': [],
+    'pending_merges': [],
+    'awaiting_review': [],
+    'history': [],
+    'queue': []
+}, open('$CWT_SCRATCH/.loop/state/running.json','w'), indent=2)"
+
+python3 "$ACTIONS" move-to-awaiting-review brief-001-auto "$CWT_SCRATCH" \
+    "cycle wall-time exceeded — human investigation required" > /dev/null 2>&1
+
+CWT_RJ="$CWT_SCRATCH/.loop/state/running.json"
+
+assert_json "cwt-timeout: active[] emptied"                "$CWT_RJ" "len(d['active'])"                                   "0"
+assert_json "cwt-timeout: brief in awaiting_review[]"      "$CWT_RJ" "len(d['awaiting_review'])"                          "1"
+assert_json "cwt-timeout: correct brief id"                "$CWT_RJ" "d['awaiting_review'][0]['brief']"                   "brief-001-auto"
+assert_json "cwt-timeout: auto_merge forced False"         "$CWT_RJ" "str(d['awaiting_review'][0]['auto_merge'])"         "False"
+assert_json "cwt-timeout: conflict_note contains key text" "$CWT_RJ" "'cycle wall-time exceeded' in d['awaiting_review'][0].get('conflict_note','')" "True"
+assert_json "cwt-timeout: pending_merges[] unaffected"     "$CWT_RJ" "len(d['pending_merges'])"                          "0"
+
+# Test 71: parse-cycle-wall-time-secs returns brief override when Cycle-wall-time-secs present.
+cat > "$CWT_SCRATCH/.loop/briefs/brief-OVERRIDE.md" <<'OVEOF'
+# Brief: wall-time override test
+
+**ID:** brief-OVERRIDE
+**Status:** queued
+**Cycle-wall-time-secs:** 7200
+OVEOF
+
+cat > "$CWT_SCRATCH/.loop/state/pending-dispatch.json" <<PDEOF
+{
+  "brief": "brief-OVERRIDE",
+  "branch": "brief-OVERRIDE",
+  "brief_file": ".loop/briefs/brief-OVERRIDE.md"
+}
+PDEOF
+
+CWT71_OUTPUT=$(python3 "$ACTIONS" parse-cycle-wall-time-secs "$CWT_SCRATCH" 2>/dev/null)
+assert_eq "cwt-override: Cycle-wall-time-secs: 7200 → parser returns 7200" \
+    "$CWT71_OUTPUT" "7200"
+
+# Test 72: parse-cycle-wall-time-secs returns default (5400) when field absent.
+cat > "$CWT_SCRATCH/.loop/briefs/brief-NOOVERRIDE.md" <<'NOOVEOF'
+# Brief: no wall-time override
+
+**ID:** brief-NOOVERRIDE
+**Status:** queued
+NOOVEOF
+
+cat > "$CWT_SCRATCH/.loop/state/pending-dispatch.json" <<PDEOF2
+{
+  "brief": "brief-NOOVERRIDE",
+  "branch": "brief-NOOVERRIDE",
+  "brief_file": ".loop/briefs/brief-NOOVERRIDE.md"
+}
+PDEOF2
+
+CWT72_OUTPUT=$(python3 "$ACTIONS" parse-cycle-wall-time-secs "$CWT_SCRATCH" 2>/dev/null)
+assert_eq "cwt-no-override: no Cycle-wall-time-secs → parser returns default 5400" \
+    "$CWT72_OUTPUT" "5400"
+
+rm -rf "$CWT_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

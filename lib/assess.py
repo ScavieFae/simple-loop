@@ -29,6 +29,8 @@ AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECAS
 # Brief-014: capture everything after **Depends-on:** so comma-separated lists
 # parse. `(.+)` (not `(\S+)`) picks up the full value; splitting happens below.
 DEPENDS_ON_LINE_RE = re.compile(r"^\s*\*\*Depends-on:\*\*\s*(.+?)\s*$", re.IGNORECASE)
+DEPENDS_ON_SECRETS_LINE_RE = re.compile(r"^\s*\*\*Depends-on-secrets:\*\*\s*(.+?)\s*$", re.IGNORECASE)
+CYCLE_WALL_TIME_SECS_LINE_RE = re.compile(r"^\s*\*\*Cycle-wall-time-secs:\*\*\s*(\d+)\s*$", re.IGNORECASE)
 
 
 def parse_depends_on_value(raw):

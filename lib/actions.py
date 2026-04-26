@@ -1227,6 +1227,86 @@ def check_depends_on(paths):
         return True
 
 
+# ─── Action: check-depends-on-secrets ────────────────────────────────
+
+def check_depends_on_secrets(paths):
+    """Verify pending-dispatch brief's Depends-on-secrets env vars are set."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from assess import DEPENDS_ON_SECRETS_LINE_RE, parse_depends_on_value
+
+    brief_id = ""
+    secrets = []
+
+    try:
+        with open(paths["pending_dispatch"]) as f:
+            spec = json.load(f)
+        brief_id = spec.get("brief", "")
+        brief_file = spec.get("brief_file", "")
+        bf_path = os.path.join(paths["project_dir"], brief_file) if brief_file else ""
+
+        if bf_path and os.path.exists(bf_path):
+            with open(bf_path) as f:
+                for line in f:
+                    m = DEPENDS_ON_SECRETS_LINE_RE.match(line)
+                    if m:
+                        secrets = parse_depends_on_value(m.group(1))
+                        break
+
+        if not secrets:
+            print("allowed")
+            return True
+
+        for var in secrets:
+            if not os.environ.get(var):
+                print(f"blocked:{var}")
+                return True
+
+        print("allowed")
+        return True
+    except Exception as e:
+        print("allowed")
+        print(f"brief={brief_id} secrets=<error:{e}> match=allowed_on_error", file=sys.stderr)
+        return True
+
+
+# ─── Action: parse-cycle-wall-time-secs ──────────────────────────────
+
+# Default matches MAX_CYCLE_WALL_TIME_SECS in daemon.sh
+_DEFAULT_CYCLE_WALL_TIME_SECS = 5400
+
+
+def parse_cycle_wall_time_secs(paths):
+    """Read Cycle-wall-time-secs frontmatter from pending-dispatch brief.
+
+    Prints the integer value — brief override if present, daemon default otherwise.
+    Used by tests to confirm the parser; daemon.sh uses its own bash grep/sed
+    equivalent for the hot path.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from assess import CYCLE_WALL_TIME_SECS_LINE_RE
+
+    try:
+        with open(paths["pending_dispatch"]) as f:
+            spec = json.load(f)
+        brief_file = spec.get("brief_file", "")
+        bf_path = os.path.join(paths["project_dir"], brief_file) if brief_file else ""
+
+        if bf_path and os.path.exists(bf_path):
+            with open(bf_path) as f:
+                for line in f:
+                    m = CYCLE_WALL_TIME_SECS_LINE_RE.match(line)
+                    if m:
+                        print(int(m.group(1)))
+                        return True
+
+        print(_DEFAULT_CYCLE_WALL_TIME_SECS)
+        return True
+    except Exception as e:
+        print(_DEFAULT_CYCLE_WALL_TIME_SECS)
+        print(f"parse-cycle-wall-time-secs error: {e}", file=sys.stderr)
+        return True
+
+
 # ─── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -1286,6 +1366,10 @@ def main():
             success = cleanup_worktrees(paths)
         elif action == "check-depends-on":
             success = check_depends_on(paths)
+        elif action == "check-depends-on-secrets":
+            success = check_depends_on_secrets(paths)
+        elif action == "parse-cycle-wall-time-secs":
+            success = parse_cycle_wall_time_secs(paths)
         else:
             print(f"Unknown action: {action}", file=sys.stderr)
             sys.exit(1)
