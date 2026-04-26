@@ -32,7 +32,7 @@
   },
   "agents": [
     "agents/worker.md",
-    "agents/conductor.md",
+    "agents/queen.md",
     "agents/spec.md"
   ],
   "skills": [

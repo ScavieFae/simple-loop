@@ -34,7 +34,7 @@
   "loop": {
     "mode": "heartbeat",
     "default_interval": 3600,
-    "prompt": "prompts/conductor.md"
+    "prompt": "prompts/queen.md"
   },
   "agents": [
     "agents/hypothesis.md",
