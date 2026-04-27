@@ -31,10 +31,14 @@ AUTO_MERGE_LINE_RE = re.compile(r"^\s*\*\*Auto-merge:\*\*\s*(\S+)", re.IGNORECAS
 DEPENDS_ON_LINE_RE = re.compile(r"^\s*\*\*Depends-on:\*\*\s*(.+?)\s*$", re.IGNORECASE)
 DEPENDS_ON_SECRETS_LINE_RE = re.compile(r"^\s*\*\*Depends-on-secrets:\*\*\s*(.+?)\s*$", re.IGNORECASE)
 CYCLE_WALL_TIME_SECS_LINE_RE = re.compile(r"^\s*\*\*Cycle-wall-time-secs:\*\*\s*(\d+)\s*$", re.IGNORECASE)
+# Brief-id shape: `brief-NNN` or `brief-NNN-slug` (slug may itself contain hyphens).
+# Shared by lib/lint.py — the linter's check_depends_on imports this so the daemon's
+# parser and the author-time linter agree on what counts as a real brief id.
+BRIEF_ID_RE = re.compile(r"^brief-\d+(-[\w-]+)?$")
 
 
-def parse_depends_on_value(raw):
-    """Split a raw Depends-on value into a list of brief ids.
+def parse_depends_on_value(raw, validate_brief_id=True):
+    """Split a raw Depends-on value into a list of tokens.
 
     Accepts:
         "brief-010-foo"                     → ["brief-010-foo"]
@@ -42,16 +46,37 @@ def parse_depends_on_value(raw):
         "brief-010-foo,brief-011-bar"       → ["brief-010-foo", "brief-011-bar"]
         "brief-010-foo,"                    → ["brief-010-foo"]  (trailing comma tolerated)
 
-    Strips whitespace and trailing punctuation (commas, periods) from each id.
-    Empty tokens filtered. Returns [] if no valid ids survive.
+    Strips whitespace and trailing punctuation (commas, periods) from each token.
+    Empty tokens filtered.
+
+    Brief-082 hardening (validate_brief_id=True, default): tokens that don't
+    match `brief-NNN(-slug)?` are dropped with a stderr warning. Two empirical
+    wedges (brief-076 `none (daemon harness, simple-loop master)` and brief-082
+    `_(intentionally empty — see Why)_`) had nonsense tokens survive cleaning
+    and propagate to the deps history-check, where they never matched and
+    produced a permanent `dispatch_blocked` loop. Author-time linter catches
+    these shapes; the parser is the runtime backstop.
+
+    `validate_brief_id=False` is for callers parsing Depends-on-SECRETS values,
+    where tokens are env-var names (`FAKE_TOKEN_SL025`), not brief ids. Same
+    splitting, no shape validation.
+
+    Returns [] if no valid tokens survive (no deps → daemon dispatches normally).
     """
     if not raw:
         return []
     out = []
     for tok in raw.split(","):
         cleaned = tok.strip().strip(".,;")
-        if cleaned:
-            out.append(cleaned)
+        if not cleaned:
+            continue
+        if validate_brief_id and not BRIEF_ID_RE.match(cleaned):
+            print(
+                f"parse_depends_on_value: dropping non-brief-id token: {cleaned!r}",
+                file=sys.stderr,
+            )
+            continue
+        out.append(cleaned)
     return out
 
 

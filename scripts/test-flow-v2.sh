@@ -2734,6 +2734,135 @@ assert_json "dedup-clear: brief in history[] after rejection"   "$DEDUP_RJ" "len
 
 rm -rf "$DEDUP_SCRATCH"
 
+# ── Tests 81-87: Depends-on parser hardening + linter extension (brief-082) ──
+#
+# Empirical wedges:
+#   brief-076 (2026-04-26): `**Depends-on:** none (daemon harness, simple-loop master)`
+#                           split on the inner comma, both halves treated as brief ids.
+#   brief-082 (2026-04-27): `**Depends-on:** _(intentionally empty — see Why)_`
+#                           italics placeholder kept as one phantom dep.
+# Both produced permanent dispatch_blocked loops.
+#
+# Hardening:
+#   - parse_depends_on_value drops tokens that don't match BRIEF_ID_RE (with stderr warning).
+#   - check_depends_on ERRORs on parenthetical annotations and italics placeholders.
+
+echo ""
+echo "=== Tests 81-87: Depends-on parser hardening + linter extension (brief-082) ==="
+
+# Test 81: parser drops both phantom tokens from brief-076's annotation-as-value shape.
+T81_OUT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('none (daemon harness, simple-loop master)')))
+" 2>/dev/null)
+assert_eq "parse_depends_on_value drops 'none (annotation, more)' tokens" "$T81_OUT" ""
+
+# Test 82: parser drops brief-082's italics-placeholder shape.
+T82_OUT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('_(intentionally empty — see Why)_')))
+" 2>/dev/null)
+assert_eq "parse_depends_on_value drops italics placeholder" "$T82_OUT" ""
+
+# Test 83: regression — known-good comma-separated list still parses cleanly.
+T83_OUT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('brief-042-foo, brief-051-bar')))
+" 2>/dev/null)
+assert_eq "parse_depends_on_value keeps real brief ids" "$T83_OUT" "brief-042-foo,brief-051-bar"
+
+# Test 84: parser drops only the malformed token, keeps the real one.
+T84_OUT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('brief-042-foo, garbage-not-a-brief')))
+" 2>/dev/null)
+assert_eq "parse_depends_on_value drops only malformed tokens" "$T84_OUT" "brief-042-foo"
+
+# Test 85: linter ERRORs on `none (foo, bar)` pattern (was silent acceptance).
+LINT_SCRATCH=$(mktemp -d)
+mkdir -p "$LINT_SCRATCH/.loop"
+cat > "$LINT_SCRATCH/brief-test.md" <<'EOF'
+# Brief: linter test
+**ID:** brief-999-test
+**Branch:** brief-999-test
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** sonnet
+**Human-gate:** false
+**Depends-on:** none (foo, bar)
+
+## Budget
+**1 cycles sonnet.** test.
+
+## Completion criteria
+- [ ] x
+EOF
+LINT_OUT=$(python3 "$LIB_DIR/lint.py" "$LINT_SCRATCH/brief-test.md" 2>&1)
+LINT_RC=$?
+case "$LINT_OUT" in
+    *parenthetical*|*"permanent dispatch block"*) pass "lint flags 'none (foo, bar)' as ERROR (not silent)" ;;
+    *) fail "lint did not flag 'none (foo, bar)' — got: $LINT_OUT" ;;
+esac
+
+# Test 86: linter ERRORs on italics-wrapped placeholder.
+cat > "$LINT_SCRATCH/brief-test.md" <<'EOF'
+# Brief: linter test
+**ID:** brief-999-test
+**Branch:** brief-999-test
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** sonnet
+**Human-gate:** false
+**Depends-on:** _(intentionally empty)_
+
+## Budget
+**1 cycles sonnet.** test.
+
+## Completion criteria
+- [ ] x
+EOF
+LINT_OUT=$(python3 "$LIB_DIR/lint.py" "$LINT_SCRATCH/brief-test.md" 2>&1)
+case "$LINT_OUT" in
+    *italics*|*placeholder*) pass "lint flags italics-wrapped placeholder as ERROR" ;;
+    *) fail "lint did not flag italics placeholder — got: $LINT_OUT" ;;
+esac
+
+# Test 87: linter stays clean on legitimate Depends-on with real brief ids.
+cat > "$LINT_SCRATCH/brief-test.md" <<'EOF'
+# Brief: linter test
+**ID:** brief-999-test
+**Branch:** brief-999-test
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** sonnet
+**Human-gate:** false
+**Depends-on:** brief-042-foo, brief-051-bar
+
+## Budget
+**1 cycles sonnet.** test.
+
+## Completion criteria
+- [ ] x
+EOF
+LINT_OUT=$(python3 "$LIB_DIR/lint.py" "$LINT_SCRATCH/brief-test.md" 2>&1)
+case "$LINT_OUT" in
+    *Clean*) pass "lint clean on legitimate Depends-on with real brief ids" ;;
+    *) fail "lint flagged legitimate Depends-on — got: $LINT_OUT" ;;
+esac
+
+rm -rf "$LINT_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

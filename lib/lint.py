@@ -57,7 +57,11 @@ BUDGET_SECTION_RE = re.compile(r"^## Budget\s*$", re.MULTILINE)
 BUDGET_OPENER_RE = re.compile(r"^\*\*\d+\s+cycles?\s+\w+\.\*\*", re.MULTILINE)
 
 DEPENDS_ON_RE = re.compile(r"^\*\*Depends-on:\*\*\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
-BRIEF_ID_RE = re.compile(r"^brief-\d+(-[\w]+)*$")
+# Single source of truth for brief-id shape. assess.py owns the canonical regex
+# (the daemon's parser is the runtime path that wedges); lint.py imports it so
+# author-time and dispatch-time agree on what a brief id looks like.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from assess import BRIEF_ID_RE  # noqa: E402
 
 ADR_FIELD_RE = re.compile(r"^\*\*ADRs?:\*\*\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 ADR_NUMBER_RE = re.compile(r"\b(\d{3})\b")
@@ -131,7 +135,18 @@ def check_budget_section(content: str, brief_path: Path, project_root: Path) -> 
 # ── Check 4: Depends-on validity ────────────────────────────
 
 def check_depends_on(content: str, brief_path: Path, project_root: Path) -> List[Issue]:
-    """Depends-on must be absent, or a real brief-id — not 'none' or empty."""
+    """Depends-on must be absent, or a real brief-id — not 'none' or empty.
+
+    Brief-082: extended to catch the empirical wedge shapes:
+      - `none (annotation, more)` — author wrote 'none' with explanatory parens.
+      - `_(intentionally empty)_` — italics-wrapped placeholder.
+      - `none (...)` or any value with `(` before the first `,` — annotation-as-value.
+
+    Each of these previously survived the parser intact and produced a phantom
+    dep that never appeared in history → permanent `dispatch_blocked`. Both the
+    parser (assess.py) and the linter now reject them; the parser drops with a
+    warning at dispatch-time, the linter ERRORs at write-time.
+    """
     m = DEPENDS_ON_RE.search(content)
     if not m:
         return []  # absent is fine
@@ -145,19 +160,48 @@ def check_depends_on(content: str, brief_path: Path, project_root: Path) -> List
             fix="Remove `**Depends-on:**` entirely if there are no dependencies.",
         )]
 
-    # Split on commas
+    issues = []
+
+    # Annotation-as-value: a `(` appearing before the first `,` means the author
+    # wrote prose-with-parenthetical instead of a comma-separated id list. The
+    # daemon parser splits on the comma and treats both halves as brief ids,
+    # producing a permanent dispatch block. Ref: brief-076 (2026-04-26).
+    first_comma = raw.find(",")
+    first_paren = raw.find("(")
+    if first_paren >= 0 and (first_comma < 0 or first_paren < first_comma):
+        issues.append(Issue(
+            severity=ERROR,
+            message="`**Depends-on:**` value contains a parenthetical annotation. The daemon's parser splits on commas inside the parens and treats each half as a brief ID, causing a permanent dispatch block until human edits frontmatter.",
+            expected="List ONLY real brief IDs (e.g. `brief-042-slug`). Omit the field entirely when there are no dependencies.",
+            fix="Remove the parenthetical. If there are no real deps, delete the `**Depends-on:**` line.",
+        ))
+
+    # Split on commas (mirroring parse_depends_on_value's pre-validation cleaning)
     tokens = [t.strip().strip(".,;") for t in raw.split(",") if t.strip().strip(".,;")]
 
-    issues = []
     for tok in tokens:
-        if tok.lower() == "none":
+        low = tok.lower()
+        # Strip a parenthetical so `none (foo)` and `none(foo)` both surface.
+        low_no_paren = re.sub(r"\s*\(.*$", "", low).strip()
+        if low_no_paren == "none" or low.startswith("none "):
             issues.append(Issue(
                 severity=ERROR,
-                message=f"`**Depends-on:** none` — literal 'none' is treated as a brief ID by the daemon, causing a permanent dispatch block.",
+                message="`**Depends-on:** none` — literal 'none' is treated as a brief ID by the daemon, causing a permanent dispatch block until human edits frontmatter.",
                 expected="Omit the `**Depends-on:**` field entirely when there are no dependencies.",
                 fix="Remove the `**Depends-on:**` line.",
             ))
-        elif not BRIEF_ID_RE.match(tok):
+            continue
+        # Markdown italics-wrapped placeholders (`_..._`, `*...*`). Brief-082
+        # used `_(intentionally empty — see Why)_`; parser kept it as one token.
+        if tok.startswith(("_", "*")):
+            issues.append(Issue(
+                severity=ERROR,
+                message=f"`**Depends-on:**` value `{tok}` is a markdown-italics placeholder, not a brief ID. The daemon's parser keeps it intact and the deps history-check never matches, causing a permanent dispatch block until human edits frontmatter.",
+                expected="Either list real brief IDs or omit the `**Depends-on:**` field entirely.",
+                fix="Remove the `**Depends-on:**` line if there are no dependencies.",
+            ))
+            continue
+        if not BRIEF_ID_RE.match(tok):
             issues.append(Issue(
                 severity=WARNING,
                 message=f"`**Depends-on:**` value `{tok}` doesn't match `brief-NNN` or `brief-NNN-slug` format.",

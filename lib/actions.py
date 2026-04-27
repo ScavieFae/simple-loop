@@ -1265,7 +1265,11 @@ def check_depends_on_secrets(paths):
                 for line in f:
                     m = DEPENDS_ON_SECRETS_LINE_RE.match(line)
                     if m:
-                        secrets = parse_depends_on_value(m.group(1))
+                        # Secrets are env-var names (FAKE_TOKEN_SL025), not
+                        # brief ids — opt out of brief-082's id-shape validator.
+                        secrets = parse_depends_on_value(
+                            m.group(1), validate_brief_id=False
+                        )
                         break
 
         if not secrets:

@@ -13,6 +13,12 @@
      - Paths relative to repo root. Trailing / = directory + everything beneath it.
      - Glob * accepted (fnmatch-style). Empty or missing = claims the whole repo.
      - Trust-based in v0: declared at dispatch, not enforced at commit time. -->
+<!-- Depends-on: list real brief IDs only (e.g. `**Depends-on:** brief-042-foo, brief-051-bar`).
+     - Omit the line entirely if there are no dependencies.
+     - Don't write "none", italicized placeholders (_..._), or parentheticals.
+     - The daemon's parser drops non-brief-id tokens with a warning; the linter
+       ERRORs on these patterns. Catching at write-time is faster than waiting
+       for the daemon to wedge. (Brief-076 + brief-082 incidents, 2026-04-26/27.) -->
 
 ## Goal
 [What you're trying to accomplish. 1-2 sentences.]
