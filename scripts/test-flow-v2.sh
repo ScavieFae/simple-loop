@@ -3370,6 +3370,155 @@ assert_eq "human_queue_summary: kind=rebase-blocked → disposition=needs daemon
 
 rm -rf "$HQS_SCRATCH"
 
+# ── Tests 115-119: check_outputs artifact contract (brief-097) ───────────────
+#
+# Five cases matching the contract from check_outputs in lint.py:
+#   115 — Human-gate=review, status=awaiting_review, review.md present → clean
+#   116 — Human-gate=review, status=awaiting_review, review.md absent  → ERROR
+#   117 — Human-gate=none,   no review.md                              → clean
+#   118 — Human-gate=none,   review.md present                        → WARN
+#   119 — Both files exist, substantial overlap (identical H1)         → ERROR
+#
+# Each brief lives in its own card dir so brief_path.resolve().parent
+# gives the correct card dir to check_outputs.
+
+echo ""
+echo "=== Tests 115-119: check_outputs artifact contract (brief-097) ==="
+
+OUTPUTS_SCRATCH=$(mktemp -d)
+mkdir -p "$OUTPUTS_SCRATCH/.loop/state"
+
+# Minimal valid brief template reused across all five cases.
+# Card dir is the directory containing index.md (brief_path.resolve().parent).
+
+# ── Test 115: Human-gate=review, awaiting_review, review.md present → clean ──
+mkdir -p "$OUTPUTS_SCRATCH/card-115"
+cat > "$OUTPUTS_SCRATCH/card-115/index.md" <<'EOF'
+# Brief: outputs-test-115
+**ID:** brief-998-outputs-115
+**Branch:** brief-998-outputs-115
+**Status:** awaiting_review
+**Model:** sonnet
+**Auto-merge:** false
+**Validator:** core/agents/reviewer.md
+**Human-gate:** review
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+cat > "$OUTPUTS_SCRATCH/card-115/review.md" <<'EOF'
+# Review gate — outputs-test-115
+Gate-time runbook. See closeout.md for what shipped.
+EOF
+OUT115=$(python3 "$LIB_DIR/lint.py" "$OUTPUTS_SCRATCH/card-115/index.md" 2>&1)
+case "$OUT115" in
+    *Clean*) pass "check_outputs: gate=review + review.md present → clean" ;;
+    *) fail "check_outputs: gate=review + review.md present → expected clean, got: $OUT115" ;;
+esac
+
+# ── Test 116: Human-gate=review, awaiting_review, review.md absent → ERROR ───
+mkdir -p "$OUTPUTS_SCRATCH/card-116"
+cat > "$OUTPUTS_SCRATCH/card-116/index.md" <<'EOF'
+# Brief: outputs-test-116
+**ID:** brief-998-outputs-116
+**Branch:** brief-998-outputs-116
+**Status:** awaiting_review
+**Model:** sonnet
+**Auto-merge:** false
+**Validator:** core/agents/reviewer.md
+**Human-gate:** review
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+OUT116=$(python3 "$LIB_DIR/lint.py" "$OUTPUTS_SCRATCH/card-116/index.md" 2>&1)
+case "$OUT116" in
+    *"review.md"*"missing"*|*"review.md is missing"*|*"awaiting_review"*) pass "check_outputs: gate=review + review.md absent → ERROR" ;;
+    *) fail "check_outputs: gate=review + review.md absent → expected ERROR, got: $OUT116" ;;
+esac
+
+# ── Test 117: Human-gate=none, no review.md → clean ─────────────────────────
+mkdir -p "$OUTPUTS_SCRATCH/card-117"
+cat > "$OUTPUTS_SCRATCH/card-117/index.md" <<'EOF'
+# Brief: outputs-test-117
+**ID:** brief-998-outputs-117
+**Branch:** brief-998-outputs-117
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** none
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+OUT117=$(python3 "$LIB_DIR/lint.py" "$OUTPUTS_SCRATCH/card-117/index.md" 2>&1)
+case "$OUT117" in
+    *Clean*) pass "check_outputs: gate=none + no review.md → clean" ;;
+    *) fail "check_outputs: gate=none + no review.md → expected clean, got: $OUT117" ;;
+esac
+
+# ── Test 118: Human-gate=none, review.md present → WARN ─────────────────────
+mkdir -p "$OUTPUTS_SCRATCH/card-118"
+cat > "$OUTPUTS_SCRATCH/card-118/index.md" <<'EOF'
+# Brief: outputs-test-118
+**ID:** brief-998-outputs-118
+**Branch:** brief-998-outputs-118
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** none
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+cat > "$OUTPUTS_SCRATCH/card-118/review.md" <<'EOF'
+# Review — outputs-test-118
+Unnecessary review.md — gate is none.
+EOF
+OUT118=$(python3 "$LIB_DIR/lint.py" "$OUTPUTS_SCRATCH/card-118/index.md" 2>&1)
+case "$OUT118" in
+    *"unnecessary"*|*"Human-gate: none"*|*"unnecessary artifact"*) pass "check_outputs: gate=none + review.md present → WARN" ;;
+    *) fail "check_outputs: gate=none + review.md present → expected WARN, got: $OUT118" ;;
+esac
+
+# ── Test 119: Both files exist, identical H1 (overlap) → ERROR ───────────────
+mkdir -p "$OUTPUTS_SCRATCH/card-119"
+cat > "$OUTPUTS_SCRATCH/card-119/index.md" <<'EOF'
+# Brief: outputs-test-119
+**ID:** brief-998-outputs-119
+**Branch:** brief-998-outputs-119
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** false
+**Validator:** core/agents/reviewer.md
+**Human-gate:** review
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+# Both artifacts have the identical H1 — triggers overlap ERROR.
+cat > "$OUTPUTS_SCRATCH/card-119/review.md" <<'EOF'
+# Brief 119 closeout and review
+
+Gate runbook content here. What shipped: the thing.
+More words about what we delivered and how we tested it.
+EOF
+cat > "$OUTPUTS_SCRATCH/card-119/closeout.md" <<'EOF'
+# Brief 119 closeout and review
+
+Forensic record. Same H1 as review.md — this triggers the overlap check.
+More words about what we delivered and how we tested it.
+EOF
+OUT119=$(python3 "$LIB_DIR/lint.py" "$OUTPUTS_SCRATCH/card-119/index.md" 2>&1)
+case "$OUT119" in
+    *"overlap"*|*"identical H1"*|*"Substantial overlap"*) pass "check_outputs: identical H1 in review+closeout → ERROR" ;;
+    *) fail "check_outputs: identical H1 → expected overlap ERROR, got: $OUT119" ;;
+esac
+
+rm -rf "$OUTPUTS_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
