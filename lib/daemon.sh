@@ -1103,6 +1103,21 @@ while true; do
         daemon_log "GIT SYNC: main tree on '$CURRENT_BRANCH' (not $GIT_MAIN_BRANCH) — fetch only"
     fi
 
+    # ┌──────────────────────────────────────────────────────────┐
+    # │  Pre-tick sweep check (brief-077)                        │
+    # │  Runs sweep.py --quick before Phase 1 assess.            │
+    # │  O(N briefs), cheap operations, target <1s.              │
+    # │  Observational — no auto-route at daemon pre-tick.       │
+    # └──────────────────────────────────────────────────────────┘
+    _SWEEP_SCRIPT="$DAEMON_LIB_DIR/sweep.py"
+    if [ -f "$_SWEEP_SCRIPT" ]; then
+        _SWEEP_OUTPUT=$(python3 "$_SWEEP_SCRIPT" "$PROJECT_DIR" --quick 2>&1)
+        _SWEEP_RC=$?
+        if [ "$_SWEEP_RC" -ne 0 ]; then
+            daemon_log "SWEEP: pre-tick check found issues (exit=$_SWEEP_RC) — see stewardship-log for details"
+        fi
+    fi
+
     DID_WORK=false
 
     # ┌─────────────────────────────────────┐
