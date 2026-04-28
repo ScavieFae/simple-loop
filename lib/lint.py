@@ -450,6 +450,154 @@ def check_sibling_fields(content: str, brief_path: Path, project_root: Path) -> 
     return issues
 
 
+# ── Check 10: Output artifact contract ───────────────────────
+
+_JACCARD_OVERLAP_THRESHOLD = 0.60  # tunable; conservative default
+
+def _jaccard(tokens_a: set, tokens_b: set) -> float:
+    union = tokens_a | tokens_b
+    if not union:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(union)
+
+
+def _tokenize_body(text: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _extract_h1(text: str) -> str:
+    m = re.search(r"^#\s+(.+?)\s*$", text, re.MULTILINE)
+    return m.group(1).strip().lower() if m else ""
+
+
+def _first_paragraph(text: str) -> str:
+    """Return first non-empty, non-heading line (up to 200 chars, lowercased)."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped[:200].lower()
+    return ""
+
+
+def _check_artifact_overlap(review_path: Path, closeout_path: Path) -> Optional[Issue]:
+    """Detect substantial content overlap between review.md and closeout.md.
+
+    Three deterministic heuristics (any one triggers ERROR):
+      1. Identical H1 titles (after stripping `#` and whitespace).
+      2. Identical first non-empty, non-heading paragraph (first 200 chars).
+      3. Jaccard token overlap >= 60% on full body text.
+
+    Deterministic only — no LLM calls. Threshold is conservative to avoid
+    false positives from shared boilerplate tokens (e.g. the brief ID appearing
+    in both files). The Jaccard check at 60% means the majority of unique tokens
+    are shared, which signals duplicated prose rather than shared references.
+    """
+    try:
+        r_text = review_path.read_text(encoding="utf-8")
+        c_text = closeout_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    r_h1 = _extract_h1(r_text)
+    c_h1 = _extract_h1(c_text)
+    if r_h1 and c_h1 and r_h1 == c_h1:
+        return Issue(
+            severity=ERROR,
+            message="Substantial overlap between `review.md` and `closeout.md`: identical H1 titles.",
+            expected="Each artifact has one job. review.md is the gate-time runbook; closeout.md is the forensic record. They must have distinct titles.",
+            fix="Rename the H1 in review.md (e.g. `# Review gate — <brief-slug>`) and replace any duplicated 'what shipped' content with a link to closeout.md.",
+        )
+
+    r_para = _first_paragraph(r_text)
+    c_para = _first_paragraph(c_text)
+    if r_para and c_para and r_para == c_para:
+        return Issue(
+            severity=ERROR,
+            message="Substantial overlap between `review.md` and `closeout.md`: identical opening paragraphs.",
+            expected="review.md opens with the gate-time ask; closeout.md opens with the forensic TL;DR. They must differ.",
+            fix="Rewrite the review.md opener as the gate-time runbook (ask + recommendation + what-you-should-feel). Link to closeout.md for 'what shipped.'",
+        )
+
+    r_tokens = _tokenize_body(r_text)
+    c_tokens = _tokenize_body(c_text)
+    if r_tokens and c_tokens:
+        j = _jaccard(r_tokens, c_tokens)
+        if j >= _JACCARD_OVERLAP_THRESHOLD:
+            return Issue(
+                severity=ERROR,
+                message=f"Substantial overlap between `review.md` and `closeout.md`: {j:.0%} Jaccard token overlap (threshold: {_JACCARD_OVERLAP_THRESHOLD:.0%}).",
+                expected="review.md links to closeout.md for 'what shipped' rather than duplicating it. Overlap this high indicates copied prose.",
+                fix="Remove the duplicated 'what shipped' sections from review.md and replace with: `See [closeout.md](./closeout.md) for the forensic record.`",
+            )
+
+    return None
+
+
+def check_outputs(content: str, brief_path: Path, project_root: Path) -> List[Issue]:
+    """Enforce the closeout/review artifact contract at brief write time.
+
+    Contract:
+      - closeout.md: always required at brief close. Forensic record. (Presence
+        not enforced by this check — absence is a writer error, not pre-detectable
+        without knowing the brief is truly finished.)
+      - review.md: required IFF Human-gate ≠ none. Gate-time runbook for Mattie.
+      - No content overlap: review.md links to closeout.md for 'what shipped';
+        it does not duplicate it.
+
+    Rules:
+      ERROR — brief Status is `awaiting_review` AND Human-gate ≠ none AND
+              review.md absent from the card directory.
+      ERROR — both review.md and closeout.md exist AND substantial overlap
+              detected (identical H1, identical first paragraph, or ≥60% Jaccard).
+      WARN  — Human-gate = none AND review.md exists (unnecessary artifact).
+
+    Card directory: resolved via brief_path.resolve().parent so symlinked brief
+    paths (e.g. .loop/briefs/brief-NNN.md → wiki/briefs/cards/.../index.md)
+    land in the correct directory.
+    """
+    gate_m = _HUMAN_GATE_RE.search(content)
+    gate_val = gate_m.group(1).strip().lower() if gate_m else "none"
+    gate_none = (gate_val == "none" or not gate_m)
+
+    status_m = _STATUS_FIELD_RE.search(content)
+    brief_status = status_m.group(1).strip().lower() if status_m else ""
+
+    # Card dir via symlink resolution so .loop/briefs/ symlinks land correctly.
+    card_dir = brief_path.resolve().parent
+    if not card_dir.is_dir():
+        return []
+
+    review_path = card_dir / "review.md"
+    closeout_path = card_dir / "closeout.md"
+    review_exists = review_path.exists()
+    closeout_exists = closeout_path.exists()
+
+    issues: List[Issue] = []
+
+    if brief_status == "awaiting_review" and not gate_none and not review_exists:
+        issues.append(Issue(
+            severity=ERROR,
+            message=f"Brief is `awaiting_review` with `Human-gate: {gate_val}` but `review.md` is missing from the card directory.",
+            expected="A `review.md` in the card directory: gate-time runbook + scav recommendation + what-you-should-feel. Links to closeout.md for 'what shipped.'",
+            fix=f"Create `{card_dir.name}/review.md` using the human-gate artifact template.",
+        ))
+
+    if gate_none and review_exists:
+        issues.append(Issue(
+            severity=WARNING,
+            message="`Human-gate: none` but `review.md` exists in the card directory — unnecessary artifact.",
+            expected="No `review.md` when Human-gate is none (brief closes without a human gate).",
+            fix=f"Remove `{card_dir.name}/review.md` or change `**Human-gate:**` to a non-none value if a gate was intended.",
+        ))
+
+    if review_exists and closeout_exists:
+        overlap = _check_artifact_overlap(review_path, closeout_path)
+        if overlap:
+            issues.append(overlap)
+
+    return issues
+
+
 # ── Check registry ────────────────────────────────────────────
 
 CHECKS: List[Tuple[str, Callable]] = [
@@ -462,6 +610,7 @@ CHECKS: List[Tuple[str, Callable]] = [
     ("adr-resolution", check_adr_resolution),
     ("mandatory-reading-links", check_mandatory_reading_links),
     ("status-consistency", check_status_consistency),
+    ("outputs", check_outputs),
 ]
 
 
