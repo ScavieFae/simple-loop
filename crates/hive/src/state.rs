@@ -245,6 +245,9 @@ pub struct HiveState {
     /// When the current daemon process started, approximated via the
     /// mtime of `.loop/state/daemon.pid`. None if the file is absent.
     pub daemon_started_at: Option<DateTime<Utc>>,
+    /// Briefs waiting to re-dispatch once a precondition clears.
+    /// Parsed from goals.md `**Blocked-on:**` markers. Empty = section hidden.
+    pub requeued_briefs: Vec<ReQueuedBrief>,
 }
 
 impl HiveState {
@@ -324,6 +327,22 @@ impl HiveState {
 
         let daemon_started_at = read_daemon_started_at();
 
+        // Re-queued briefs — read merged set from running.json, then parse goals.md.
+        let running_path = Path::new(".loop/state/running.json");
+        let merged_briefs: std::collections::HashSet<String> = fs::read_to_string(running_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<RunningJson>(&s).ok())
+            .map(|rj| {
+                rj.history
+                    .iter()
+                    .filter(|e| e.merge_sha.as_deref().map(|s| !s.is_empty()).unwrap_or(false))
+                    .map(|e| e.brief.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let goals_path = Path::new(".loop/state/goals.md");
+        let requeued_briefs = parse_requeued_goals_md(goals_path, &merged_briefs);
+
         HiveState {
             pid,
             pid_alive,
@@ -331,6 +350,7 @@ impl HiveState {
             last_heartbeat_ts,
             interval_mode,
             daemon_started_at,
+            requeued_briefs,
         }
     }
 }
@@ -370,7 +390,24 @@ pub struct HistoryEntryRaw {
     #[serde(default)]
     pub merged_at: Option<String>,
     #[serde(default)]
+    pub merge_sha: Option<String>,
+    #[serde(default)]
     pub approved_at: Option<String>,
+}
+
+/// A brief that has been rejected + re-queued behind a blocking precondition.
+///
+/// Parsed from `## Queued next` entries in goals.md that carry a
+/// `**Blocked-on:** brief-NNN` line. Parser is deterministic regex — no
+/// inference at runtime.
+#[derive(Debug, Clone)]
+pub struct ReQueuedBrief {
+    pub brief_id: String,
+    pub blocked_on: String,
+    pub description: String,
+    /// True when the blocking brief appears in running.json history[] with a
+    /// merge_sha (precondition cleared; ready to re-dispatch).
+    pub ready_to_dispatch: bool,
 }
 
 pub struct ActiveBrief {
@@ -735,6 +772,111 @@ pub fn parse_goals_priority(goals_path: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// Parse goals.md for re-queued briefs with a `**Blocked-on:** brief-NNN` marker.
+///
+/// Returns a vec of [`ReQueuedBrief`] — one per goals.md numbered-list entry
+/// that contains a `**Blocked-on:**` continuation line. Entries without the
+/// marker are ignored (omit-when-empty contract: callers suppress the section).
+///
+/// Mirrors `parse_requeued_briefs()` in `lib/actions.py` — deterministic
+/// regex, no inference at runtime.
+///
+/// `merged_briefs` is the set of brief IDs that appear in running.json
+/// `history[]` with a non-empty `merge_sha` — used to set `ready_to_dispatch`.
+pub fn parse_requeued_goals_md(goals_path: &Path, merged_briefs: &std::collections::HashSet<String>) -> Vec<ReQueuedBrief> {
+    let Ok(contents) = fs::read_to_string(goals_path) else {
+        return vec![];
+    };
+
+    // Numbered top-level list item whose first token is a brief-NNN id.
+    // Mirrors Python: r"^\s{0,3}\d+\.\s+\*{0,2}(brief-\d+[\w-]*)"
+    let is_brief_list_item = |line: &str| -> Option<(String, String)> {
+        let trimmed = line.trim_start();
+        let leading_ws = line.len() - trimmed.len();
+        if leading_ws > 3 {
+            return None;
+        }
+        // Must start with a digit + period list marker.
+        let rest = {
+            let mut chars = trimmed.chars();
+            let mut saw_digit = false;
+            let mut saw_dot = false;
+            let mut idx = 0;
+            for ch in chars.by_ref() {
+                if ch.is_ascii_digit() {
+                    saw_digit = true;
+                    idx += ch.len_utf8();
+                } else if ch == '.' && saw_digit {
+                    saw_dot = true;
+                    idx += ch.len_utf8();
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if !saw_dot {
+                return None;
+            }
+            &trimmed[idx..]
+        };
+        // Strip leading whitespace + optional ** emphasis wrapping.
+        let rest = rest.trim_start();
+        let rest = rest.trim_start_matches('*');
+        // Must start with "brief-NNN".
+        if !rest.starts_with("brief-") {
+            return None;
+        }
+        // Extract the brief id — stop at whitespace or non-id chars.
+        let id_end = rest.find(|c: char| !c.is_alphanumeric() && c != '-').unwrap_or(rest.len());
+        let brief_id = &rest[..id_end];
+        if brief_id.len() <= "brief-".len() {
+            return None;
+        }
+        // Build a one-line description by stripping numbering + emphasis.
+        let desc = {
+            let s = trimmed.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ');
+            let s = s.trim_start_matches('*').trim();
+            if s.len() > 80 { format!("{}…", &s[..77]) } else { s.to_string() }
+        };
+        Some((brief_id.to_string(), desc))
+    };
+
+    // `**Blocked-on:** brief-NNN(-slug)?` on a continuation line (any indent).
+    // Mirrors Python: r"^\s*\*\*Blocked-on:\*\*\s+(brief-\d+(?:-[\w-]+)?)"
+    let extract_blocked_on = |line: &str| -> Option<String> {
+        let trimmed = line.trim();
+        let marker = "**Blocked-on:**";
+        let rest = trimmed.strip_prefix(marker)?.trim_start();
+        if !rest.starts_with("brief-") {
+            return None;
+        }
+        let id_end = rest.find(|c: char| !c.is_alphanumeric() && c != '-').unwrap_or(rest.len());
+        let id = &rest[..id_end];
+        if id.len() <= "brief-".len() {
+            return None;
+        }
+        Some(id.to_string())
+    };
+
+    let mut results: Vec<ReQueuedBrief> = Vec::new();
+    let mut current_entry: Option<(String, String)> = None; // (brief_id, desc)
+
+    for line in contents.lines() {
+        if let Some(entry) = is_brief_list_item(line) {
+            current_entry = Some(entry);
+            continue;
+        }
+        if let Some(blocked_on) = extract_blocked_on(line) {
+            if let Some((brief_id, desc)) = current_entry.take() {
+                let ready = merged_briefs.contains(&blocked_on);
+                results.push(ReQueuedBrief { brief_id, blocked_on, description: desc, ready_to_dispatch: ready });
+            }
+        }
+    }
+
+    results
 }
 
 /// Pull the first work-unit id token off a line.
@@ -2477,6 +2619,7 @@ mod tests {
             last_heartbeat_ts: Some(Utc::now() - chrono::Duration::seconds(30)),
             interval_mode: IntervalMode::Idle,
             daemon_started_at: None,
+            requeued_briefs: vec![],
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert!(c.starts_with("next ~"), "got: {}", c);
@@ -2493,6 +2636,7 @@ mod tests {
             last_heartbeat_ts: Some(Utc::now() - chrono::Duration::seconds(1000)),
             interval_mode: IntervalMode::Idle,
             daemon_started_at: None,
+            requeued_briefs: vec![],
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert!(c.starts_with("overdue"), "got: {}", c);
@@ -2509,6 +2653,7 @@ mod tests {
             last_heartbeat_ts: Some(Utc::now() - chrono::Duration::seconds(300)),
             interval_mode: IntervalMode::Active,
             daemon_started_at: None,
+            requeued_briefs: vec![],
         };
         let c = hs.heartbeat_countdown().expect("should produce countdown");
         assert_eq!(c, "busy cycling");
@@ -2523,6 +2668,7 @@ mod tests {
             last_heartbeat_ts: Some(Utc::now()),
             interval_mode: IntervalMode::Unknown,
             daemon_started_at: None,
+            requeued_briefs: vec![],
         };
         assert!(hs.heartbeat_countdown().is_none());
     }
@@ -2947,21 +3093,25 @@ some non-bracket junk line
             HistoryEntryRaw {
                 brief: "brief-001".into(),
                 merged_at: None,
+                merge_sha: None,
                 approved_at: Some("2026-04-20T22:23:00Z".into()),
             },
             HistoryEntryRaw {
                 brief: "brief-001".into(),
                 merged_at: Some("2026-04-20T22:26:54Z".into()),
+                merge_sha: None,
                 approved_at: None,
             },
             HistoryEntryRaw {
                 brief: "brief-012".into(),
                 merged_at: Some("2026-04-22T18:10:00Z".into()),
+                merge_sha: None,
                 approved_at: None,
             },
             HistoryEntryRaw {
                 brief: "brief-013".into(),
                 merged_at: Some("2026-04-22T14:23:30Z".into()),
+                merge_sha: None,
                 approved_at: None,
             },
         ];
@@ -2986,6 +3136,7 @@ some non-bracket junk line
                     "2026-04-22T{:02}:00:00Z",
                     i.min(23)
                 )),
+                merge_sha: None,
                 approved_at: None,
             })
             .collect();
@@ -3798,5 +3949,93 @@ some non-bracket junk line
         for q in &queued {
             eprintln!("  rank={:?}  brief={}", q.priority_rank, q.brief);
         }
+    }
+
+    // ── parse_requeued_goals_md tests (brief-102) ─────────────────────────────
+
+    fn write_goals(content: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "goals_{}_{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{}", content).unwrap();
+        path
+    }
+
+    #[test]
+    fn requeued_parse_returns_empty_when_no_marker() {
+        let path = write_goals(
+            "## Queued next\n\
+             1. brief-010-foo — normal queued brief.\n\
+             2. brief-011-bar — another one.\n",
+        );
+        let merged = HashSet::new();
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert!(result.is_empty(), "expected empty, got: {:?}", result);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn requeued_parse_finds_single_blocked_entry() {
+        let path = write_goals(
+            "## Queued next\n\
+             1. brief-099-some-brief — re-queued after reject.\n\
+               **Blocked-on:** brief-100\n\
+             2. brief-010-other — normal.\n",
+        );
+        let merged = HashSet::new();
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert_eq!(result.len(), 1, "expected 1 entry");
+        assert_eq!(result[0].brief_id, "brief-099-some-brief");
+        assert_eq!(result[0].blocked_on, "brief-100");
+        assert!(!result[0].ready_to_dispatch);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn requeued_parse_finds_multiple_blocked_entries() {
+        let path = write_goals(
+            "## Queued next\n\
+             1. brief-099-foo — blocked entry one.\n\
+               **Blocked-on:** brief-100\n\
+             2. brief-088-bar — blocked entry two.\n\
+               **Blocked-on:** brief-095\n\
+             3. brief-010-other — normal.\n",
+        );
+        let merged = HashSet::new();
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].brief_id, "brief-099-foo");
+        assert_eq!(result[1].brief_id, "brief-088-bar");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn requeued_parse_flags_ready_when_blocker_merged() {
+        let path = write_goals(
+            "## Queued next\n\
+             1. brief-099-foo — waiting for brief-100.\n\
+               **Blocked-on:** brief-100\n",
+        );
+        let mut merged = HashSet::new();
+        merged.insert("brief-100".to_string());
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ready_to_dispatch, "blocker merged → should be ready");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn requeued_parse_returns_empty_on_missing_file() {
+        let path = std::path::PathBuf::from("/nonexistent/goals.md");
+        let merged = HashSet::new();
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert!(result.is_empty());
     }
 }

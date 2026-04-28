@@ -348,6 +348,32 @@ fn render_hive<'a>(app: &App) -> Text<'a> {
     ]);
     lines.push(mode_line);
 
+    // Re-queued (pending precondition) — brief-102.
+    // Omitted entirely when empty (no noisy empty-state line).
+    if !h.requeued_briefs.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("Re-queued ({}):", h.requeued_briefs.len()),
+                Style::default().fg(AMBER),
+            ),
+        ]));
+        for rb in &h.requeued_briefs {
+            let (tag, tag_color) = if rb.ready_to_dispatch {
+                ("★ ready to re-dispatch", STAMP_GREEN)
+            } else {
+                ("waiting", MUTED)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(rb.brief_id.clone(), Style::default().fg(GOLD)),
+                Span::styled("  blocked-on: ", Style::default().fg(MUTED)),
+                Span::styled(rb.blocked_on.clone(), Style::default().fg(INDIGO)),
+                Span::styled("  ", Style::default()),
+                Span::styled(tag, Style::default().fg(tag_color)),
+            ]));
+        }
+    }
+
     Text::from(lines)
 }
 
