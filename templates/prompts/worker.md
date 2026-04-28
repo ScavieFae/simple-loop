@@ -23,6 +23,8 @@ You are one iteration of a multi-pass loop. You will do ONE task, verify it, com
 
 6. **Update progress.**
 
+   **Outputs (closing cycle only).** When this is your final task and status is moving to `"complete"`, check the brief's **Outputs** section for artifact requirements. By contract: `closeout.md` is always required — a forensic record of what shipped, pass criteria, and lessons learned. `review.md` is required only if `Human-gate ≠ none`; it is the gate-time runbook and must *link to closeout.md* for "what shipped" rather than duplicating it. Each file has one job — if you find yourself writing the same paragraph in both, hoist it into closeout and link from review.
+
    **6a. Human-gate check.** Before setting status, check the brief's `Human-gate:` field:
    - Look for `**Human-gate:**` or `Human-gate:` in the brief file.
    - If the value is `none` or the field is absent → skip to 6b, no artifact needed.
