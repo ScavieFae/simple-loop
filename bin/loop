@@ -1704,6 +1704,20 @@ cmd_lint() {
     python3 "$lint_script" "$@"
 }
 
+# ── sweep ────────────────────────────────────────────────────
+
+cmd_sweep() {
+    require_loop_dir
+
+    local sweep_script="$LIB_DIR/sweep.py"
+    if [ ! -f "$sweep_script" ]; then
+        sweep_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/sweep.py"
+    fi
+    [ -f "$sweep_script" ] || die "sweep.py not found. Is Simple Loop installed?"
+
+    python3 "$sweep_script" "$PROJECT_DIR" "$@"
+}
+
 # ── cleanup ──────────────────────────────────────────────────
 
 cmd_cleanup() {
@@ -1761,6 +1775,8 @@ Signals:
 Quality:
   lint <path>              Lint a brief file or directory for format drift
                            <path> = single file or wiki/briefs/cards/ dir
+  sweep [--quick]          Deterministic state validator — 4 structural predicates
+  sweep [--auto-route]     Also move orphaned active[] entries to awaiting_review
 
 Maintenance:
   cleanup                  Remove worktrees for completed/merged briefs
@@ -1795,6 +1811,7 @@ case "${1:-help}" in
     reject)  shift; cmd_reject "$@" ;;
     metrics) shift; cmd_metrics "$@" ;;
     lint)    shift; cmd_lint "$@" ;;
+    sweep)   shift; cmd_sweep "$@" ;;
     cleanup) cmd_cleanup ;;
     help|--help|-h) cmd_help ;;
     *)       echo "Unknown command: $1"; cmd_help; exit 1 ;;
