@@ -142,7 +142,7 @@ write_running "{
     'queue': []
 }"
 
-python3 "$ACTIONS" move-to-awaiting-review brief-002-human "$SCRATCH" "validator requested human review" > /dev/null 2>&1
+python3 "$ACTIONS" move-to-awaiting-review brief-002-human "$SCRATCH" complete "validator requested human review" > /dev/null 2>&1
 
 assert_json "active[] empty after move-to-awaiting-review"  "$RJ" "len(d['active'])"              "0"
 assert_json "awaiting_review[] has one entry"               "$RJ" "len(d['awaiting_review'])"     "1"
@@ -2482,7 +2482,7 @@ write_running "{
 }"
 
 python3 "$ACTIONS" move-to-awaiting-review brief-001-auto "$SCRATCH" \
-    "rebase conflict against main — human resolution required" > /dev/null 2>&1
+    rebase-blocked "rebase conflict against main — human resolution required" > /dev/null 2>&1
 
 assert_json "rebase-conflict: active[] emptied"                "$RJ" "len(d['active'])"                                   "0"
 assert_json "rebase-conflict: brief in awaiting_review[]"      "$RJ" "len(d['awaiting_review'])"                          "1"
@@ -2512,7 +2512,7 @@ write_running "{
 }"
 
 python3 "$ACTIONS" move-to-awaiting-review brief-001-auto "$SCRATCH" \
-    "branch is 45 commits behind main — staleness gate triggered, hand-merge required (see wiki/operating-docs/incidents/2026-04-24-brief-049-050-merge-watchlist.md)" > /dev/null 2>&1
+    staleness-gated "branch is 45 commits behind main — staleness gate triggered, hand-merge required (see wiki/operating-docs/incidents/2026-04-24-brief-049-050-merge-watchlist.md)" > /dev/null 2>&1
 
 assert_json "staleness-gate: active[] emptied"                 "$RJ" "len(d['active'])"                                   "0"
 assert_json "staleness-gate: brief in awaiting_review[]"       "$RJ" "len(d['awaiting_review'])"                          "1"
@@ -2563,7 +2563,7 @@ python3 -c "import json; json.dump({
 }, open('$CWT_SCRATCH/.loop/state/running.json','w'), indent=2)"
 
 python3 "$ACTIONS" move-to-awaiting-review brief-001-auto "$CWT_SCRATCH" \
-    "cycle wall-time exceeded — human investigation required" > /dev/null 2>&1
+    watchdog-timed-out "cycle wall-time exceeded — human investigation required" > /dev/null 2>&1
 
 CWT_RJ="$CWT_SCRATCH/.loop/state/running.json"
 
@@ -2677,7 +2677,7 @@ python3 -c "import json; json.dump({
 }, open('$DEDUP_SCRATCH/.loop/state/running.json','w'), indent=2)"
 
 python3 "$ACTIONS" move-to-awaiting-review brief-076-test "$DEDUP_SCRATCH" \
-    "worker exited — stale_brief condition detected" > /dev/null 2>&1
+    manual-recovery "worker exited — stale_brief condition detected" > /dev/null 2>&1
 
 T75_SIGNAL="$DEDUP_SCRATCH/.loop/state/signals/dedup-clear-brief-076-test.json"
 
@@ -3103,6 +3103,106 @@ case "$LINT103" in
 esac
 
 rm -rf "$SIB_SCRATCH"
+
+# ── Tests 104-108: Promotion-path classification + cycle-completion gate ──────
+#
+# brief-100: kind field on every promotion, cycle-completion gate on kind=complete.
+
+echo ""
+echo "=== Tests 104-108: Promotion-path classification + cycle-completion gate (brief-100) ==="
+
+GATE_SCRATCH=$(mktemp -d)
+mkdir -p "$GATE_SCRATCH/.loop/state/signals"
+mkdir -p "$GATE_SCRATCH/.loop/briefs"
+mkdir -p "$GATE_SCRATCH/.loop/worktrees"
+touch "$GATE_SCRATCH/.loop/state/log.jsonl"
+
+cat > "$GATE_SCRATCH/.loop/config.sh" <<'GATEEOF'
+PROJECT_NAME="test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+GATEEOF
+
+git -C "$GATE_SCRATCH" init -q -b main
+git -C "$GATE_SCRATCH" config user.email "test@test"
+git -C "$GATE_SCRATCH" config user.name  "Test"
+git -C "$GATE_SCRATCH" commit -q --allow-empty -m "init"
+
+GATE_RJ="$GATE_SCRATCH/.loop/state/running.json"
+
+write_gate_running() {
+    python3 -c "import json; json.dump($1, open('$GATE_RJ','w'), indent=2)"
+}
+
+# Test 104: kind field persisted for rebase-blocked path.
+write_gate_running "{
+    'active': [{'brief': 'brief-G104', 'branch': 'brief-G104', 'brief_file': '.loop/briefs/brief-G104.md'}],
+    'completed_pending_eval': [], 'pending_merges': [], 'awaiting_review': [], 'history': [], 'queue': []
+}"
+python3 "$ACTIONS" move-to-awaiting-review brief-G104 "$GATE_SCRATCH" \
+    rebase-blocked "rebase conflict" > /dev/null 2>&1
+assert_json "kind=rebase-blocked persisted in awaiting_review entry" \
+    "$GATE_RJ" "d['awaiting_review'][0]['kind']" "rebase-blocked"
+
+# Test 105: kind field persisted for watchdog-timed-out path.
+write_gate_running "{
+    'active': [{'brief': 'brief-G105', 'branch': 'brief-G105', 'brief_file': '.loop/briefs/brief-G105.md'}],
+    'completed_pending_eval': [], 'pending_merges': [], 'awaiting_review': [], 'history': [], 'queue': []
+}"
+python3 "$ACTIONS" move-to-awaiting-review brief-G105 "$GATE_SCRATCH" \
+    watchdog-timed-out "cycle wall-time exceeded" > /dev/null 2>&1
+assert_json "kind=watchdog-timed-out persisted in awaiting_review entry" \
+    "$GATE_RJ" "d['awaiting_review'][0]['kind']" "watchdog-timed-out"
+
+# Test 106: kind=complete path with no worktree skips gate and promotes.
+write_gate_running "{
+    'active': [{'brief': 'brief-G106', 'branch': 'brief-G106', 'brief_file': '.loop/briefs/brief-G106.md'}],
+    'completed_pending_eval': [], 'pending_merges': [], 'awaiting_review': [], 'history': [], 'queue': []
+}"
+python3 "$ACTIONS" move-to-awaiting-review brief-G106 "$GATE_SCRATCH" \
+    complete > /dev/null 2>&1
+assert_json "kind=complete: no-worktree gate skips, brief promoted" \
+    "$GATE_RJ" "len(d['awaiting_review'])" "1"
+assert_json "kind=complete: kind field set on promoted entry" \
+    "$GATE_RJ" "d['awaiting_review'][0]['kind']" "complete"
+
+# Test 107: cycle-completion gate refuses kind=complete when iteration=0.
+write_gate_running "{
+    'active': [{'brief': 'brief-G107', 'branch': 'brief-G107', 'brief_file': '.loop/briefs/brief-G107.md'}],
+    'completed_pending_eval': [], 'pending_merges': [], 'awaiting_review': [], 'history': [], 'queue': []
+}"
+# Seed a worktree with iteration=0 (no cycles ran).
+mkdir -p "$GATE_SCRATCH/.loop/worktrees/brief-G107/.loop/state"
+python3 -c "import json; json.dump(
+    {'brief': 'brief-G107', 'iteration': 0, 'status': 'complete', 'tasks_remaining': [], 'tasks_completed': []},
+    open('$GATE_SCRATCH/.loop/worktrees/brief-G107/.loop/state/progress.json', 'w'), indent=2)"
+python3 "$ACTIONS" move-to-awaiting-review brief-G107 "$GATE_SCRATCH" \
+    complete > /dev/null 2>&1
+GATE107_EXIT=$?
+assert_eq "cycle-gate: iteration=0 → gate refuses (exit non-zero)" "$GATE107_EXIT" "1"
+assert_json "cycle-gate: refused brief stays in active[]" \
+    "$GATE_RJ" "len(d['active'])" "1"
+assert_json "cycle-gate: awaiting_review[] untouched after refusal" \
+    "$GATE_RJ" "len(d['awaiting_review'])" "0"
+
+# Test 108: cycle-completion gate passes when iteration=1 and tasks_remaining=[].
+write_gate_running "{
+    'active': [{'brief': 'brief-G108', 'branch': 'brief-G108', 'brief_file': '.loop/briefs/brief-G108.md'}],
+    'completed_pending_eval': [], 'pending_merges': [], 'awaiting_review': [], 'history': [], 'queue': []
+}"
+mkdir -p "$GATE_SCRATCH/.loop/worktrees/brief-G108/.loop/state"
+python3 -c "import json; json.dump(
+    {'brief': 'brief-G108', 'iteration': 1, 'status': 'complete', 'tasks_remaining': [], 'tasks_completed': ['cycle 1']},
+    open('$GATE_SCRATCH/.loop/worktrees/brief-G108/.loop/state/progress.json', 'w'), indent=2)"
+# Git commit count check will fail gracefully (no remote configured) and proceed.
+python3 "$ACTIONS" move-to-awaiting-review brief-G108 "$GATE_SCRATCH" \
+    complete > /dev/null 2>&1
+assert_json "cycle-gate: iteration=1, tasks_done → gate passes, brief promoted" \
+    "$GATE_RJ" "len(d['awaiting_review'])" "1"
+assert_json "cycle-gate: promoted entry has kind=complete" \
+    "$GATE_RJ" "d['awaiting_review'][0]['kind']" "complete"
+
+rm -rf "$GATE_SCRATCH"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

@@ -451,8 +451,77 @@ def move_to_pending_merges(paths, brief_id):
 
 # ─── Action: move-to-awaiting-review ────────────────────────────────
 
-def move_to_awaiting_review(paths, brief_id, reason=""):
-    """Move a brief from active[] to awaiting_review[] (human approval path)."""
+def move_to_awaiting_review(paths, brief_id, kind, reason=""):
+    """Move a brief from active[] to awaiting_review[] (human approval path).
+
+    kind: one of 'complete', 'rebase-blocked', 'watchdog-timed-out',
+          'manual-recovery', 'staleness-gated', 'merge-conflict'.
+          Persisted in the awaiting_review[] entry so callers can distinguish
+          taste-gate entries (kind=complete) from structural failures.
+    """
+    # Cycle-completion gate: refuse kind=complete promotions where no cycles ran.
+    # Closes the phantom-completion class (brief-067, brief-099).
+    if kind == "complete":
+        wt_progress = os.path.join(
+            paths["worktrees_dir"], brief_id, ".loop", "state", "progress.json"
+        )
+        if os.path.exists(wt_progress):
+            try:
+                with open(wt_progress) as f:
+                    prog = json.load(f)
+                status = prog.get("status", "")
+                remaining = prog.get("tasks_remaining", [])
+                iteration = prog.get("iteration", 0)
+                if status != "complete":
+                    print(
+                        f"cycle-gate: REFUSED — {brief_id} progress status={status!r} (expected 'complete')",
+                        file=sys.stderr,
+                    )
+                    return False
+                if remaining:
+                    print(
+                        f"cycle-gate: REFUSED — {brief_id} tasks_remaining non-empty ({len(remaining)} tasks)",
+                        file=sys.stderr,
+                    )
+                    return False
+                if iteration == 0:
+                    print(
+                        f"cycle-gate: REFUSED — {brief_id} iteration=0 (no cycles completed)",
+                        file=sys.stderr,
+                    )
+                    return False
+                # Belt-and-suspenders: verify ≥1 cycle commit beyond Initialize brief.
+                try:
+                    rc_check = load_running(paths)
+                    branch = next(
+                        (b["branch"] for b in rc_check.get("active", []) if b.get("brief") == brief_id),
+                        None,
+                    )
+                    if branch:
+                        config = read_config(paths["loop_dir"])
+                        remote = config.get("GIT_REMOTE", "origin")
+                        main_br = config.get("GIT_MAIN_BRANCH", "main")
+                        r = subprocess.run(
+                            ["git", "-C", paths["project_dir"], "rev-list", "--count",
+                             f"{remote}/{main_br}..{branch}"],
+                            capture_output=True, text=True, check=False, timeout=10,
+                        )
+                        if r.returncode == 0:
+                            n = int(r.stdout.strip() or "0")
+                            if n <= 1:
+                                print(
+                                    f"cycle-gate: REFUSED — {brief_id} has {n} commit(s) beyond "
+                                    f"{remote}/{main_br} (no cycle work)",
+                                    file=sys.stderr,
+                                )
+                                return False
+                except Exception as git_err:
+                    print(f"cycle-gate: git commit check skipped for {brief_id}: {git_err}", file=sys.stderr)
+            except Exception as e:
+                print(f"cycle-gate: failed to read progress for {brief_id}: {e} — skipping gate", file=sys.stderr)
+        else:
+            print(f"cycle-gate: worktree not found for {brief_id} — skipping gate", file=sys.stderr)
+
     rc = load_running(paths)
     active = rc.get("active", [])
 
@@ -470,6 +539,7 @@ def move_to_awaiting_review(paths, brief_id, reason=""):
 
     moved["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     moved["auto_merge"] = False
+    moved["kind"] = kind
     if reason:
         moved["reason"] = reason
         moved["conflict_note"] = reason
@@ -478,8 +548,8 @@ def move_to_awaiting_review(paths, brief_id, reason=""):
     save_running(paths, rc)
 
     signal_dedup_clear(paths, brief_id)
-    log_action(paths, "move-to-awaiting-review", {"brief": brief_id, "reason": reason})
-    print(f"Moved {brief_id} to awaiting_review")
+    log_action(paths, "move-to-awaiting-review", {"brief": brief_id, "kind": kind, "reason": reason})
+    print(f"Moved {brief_id} to awaiting_review (kind={kind})")
     return True
 
 
@@ -853,6 +923,7 @@ def merge(paths):
                 {"brief": brief, "branch": branch},
             )
             entry["conflict_note"] = "merge conflict — human resolution required"
+            entry["kind"] = "merge-conflict"
             rc["pending_merges"] = [e for e in rc.get("pending_merges", []) if e.get("brief") != brief]
             rc.setdefault("awaiting_review", []).append(entry)
             save_running(paths, rc)
@@ -1337,7 +1408,7 @@ def main():
         print(f"Usage: {sys.argv[0]} <action> <project_dir> [args]", file=sys.stderr)
         print("Actions: move-to-eval <brief_id> <project_dir>", file=sys.stderr)
         print("         move-to-pending-merges <brief_id> <project_dir>", file=sys.stderr)
-        print("         move-to-awaiting-review <brief_id> <project_dir> [reason]", file=sys.stderr)
+        print("         move-to-awaiting-review <brief_id> <project_dir> <kind> [reason]", file=sys.stderr)
         print("         process-pending-merges <project_dir>", file=sys.stderr)
         print("         approve-brief <brief_id> <project_dir>", file=sys.stderr)
         print("         reject-brief <brief_id> <project_dir> [reason]", file=sys.stderr)
@@ -1369,8 +1440,12 @@ def main():
         elif action == "move-to-pending-merges":
             success = move_to_pending_merges(paths, brief_id)
         elif action == "move-to-awaiting-review":
-            reason = " ".join(extra) if extra else ""
-            success = move_to_awaiting_review(paths, brief_id, reason)
+            if not extra:
+                print("move-to-awaiting-review requires <kind> [reason...]", file=sys.stderr)
+                sys.exit(1)
+            kind = extra[0]
+            reason = " ".join(extra[1:]) if len(extra) > 1 else ""
+            success = move_to_awaiting_review(paths, brief_id, kind, reason)
         elif action == "process-pending-merges":
             success = process_pending_merges(paths)
         elif action == "approve-brief":

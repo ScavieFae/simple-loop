@@ -317,7 +317,7 @@ run_worker_iteration() {
         git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
         daemon_log "WORKER: rebase failed for $branch (conflicts) → routed to awaiting_review"
         python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
-            "rebase conflict against main — human resolution required" \
+            rebase-blocked "rebase conflict against main — human resolution required" \
             2>>"$LOG_DIR/daemon.log" || true
         notify "$brief_id: rebase conflict → routed to awaiting_review"
         return 0
@@ -466,7 +466,7 @@ with open('$PROGRESS_FILE', 'w') as f:
         parse_metrics "$WORKER_JSON" "$WORKER_LOG" "worker" "{'brief': '$brief_id', 'model': '$WORKER_MODEL', 'exit_code': $WORKER_EXIT, 'timed_out': True}"
         rm -f "$WORKER_JSON"
         python3 "$DAEMON_LIB_DIR/actions.py" move-to-awaiting-review "$brief_id" "$PROJECT_DIR" \
-            "cycle wall-time exceeded — human investigation required" \
+            watchdog-timed-out "cycle wall-time exceeded — human investigation required" \
             2>>"$LOG_DIR/daemon.log" || true
         return 0
     fi
@@ -1219,7 +1219,7 @@ print('')
                     STALENESS_GATED=true
                     daemon_log "DAEMON ACTION: merge refused — $active_entry is $CB commits behind main (>$MAX_COMMITS_BEHIND threshold)"
                     python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" \
-                        "branch is $CB commits behind main — staleness gate triggered, hand-merge required (see wiki/operating-docs/incidents/2026-04-24-brief-049-050-merge-watchlist.md)" \
+                        staleness-gated "branch is $CB commits behind main — staleness gate triggered, hand-merge required (see wiki/operating-docs/incidents/2026-04-24-brief-049-050-merge-watchlist.md)" \
                         2>>"$LOG_DIR/daemon.log" && DID_WORK=true
                     notify "$active_entry merge refused: $CB commits behind main (staleness gate)"
                 fi
@@ -1232,7 +1232,8 @@ print('')
                     notify "$active_entry complete → queued for auto-merge"
                 else
                     daemon_log "DAEMON ACTION: move-to-awaiting-review $active_entry (human approval required)"
-                    python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
+                    python3 "$DAEMON_ACTIONS" move-to-awaiting-review "$active_entry" "$PROJECT_DIR" \
+                        complete 2>>"$LOG_DIR/daemon.log" && DID_WORK=true
                     notify "$active_entry complete → awaiting human review (run: loop approve $active_entry)"
                 fi
             fi
