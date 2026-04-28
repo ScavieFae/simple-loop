@@ -246,6 +246,74 @@ def save_running(paths, data):
     git(paths["project_dir"], "commit", "-m", "loop: update running.json", check=False)
 
 
+# ─── Re-queued briefs (brief-102) ───────────────────────────────────
+
+_BLOCKED_ON_RE = re.compile(r"^\s*\*\*Blocked-on:\*\*\s+(brief-\d+(?:-[\w-]+)?)", re.MULTILINE)
+_LIST_ITEM_BRIEF_RE = re.compile(r"^\s{0,3}\d+\.\s+\*{0,2}(brief-\d+[\w-]*)")
+
+
+def parse_requeued_briefs(goals_path, running_path=None):
+    """Parse goals.md for re-queued entries with a **Blocked-on:** marker.
+
+    Returns a list of dicts:
+      { brief_id, blocked_on, description, ready_to_dispatch }
+
+    ready_to_dispatch is True when the blocking brief appears in
+    running.json#history[] with a merge_sha (precondition cleared).
+    """
+    try:
+        with open(goals_path) as f:
+            contents = f.read()
+    except OSError:
+        return []
+
+    # Build set of merged brief IDs from running.json history.
+    merged_briefs = set()
+    if running_path:
+        try:
+            with open(running_path) as f:
+                rc = json.load(f)
+            for entry in rc.get("history", []):
+                if entry.get("merge_sha"):
+                    bid = entry.get("brief", "")
+                    if bid:
+                        merged_briefs.add(bid)
+        except Exception:
+            pass
+
+    results = []
+    lines = contents.splitlines()
+    current_entry = None  # (brief_id, description)
+
+    for line in lines:
+        # Top-level numbered list items introduce a new brief entry.
+        lm = _LIST_ITEM_BRIEF_RE.match(line)
+        if lm:
+            current_entry = (lm.group(1), line.strip())
+            continue
+
+        # Look for **Blocked-on:** on continuation lines (indented).
+        bm = _BLOCKED_ON_RE.match(line)
+        if bm and current_entry:
+            blocked_on = bm.group(1)
+            brief_id, raw_desc = current_entry
+            # Extract one-line description: strip numbering + markdown emphasis.
+            desc = re.sub(r"^\d+\.\s+", "", raw_desc)
+            desc = re.sub(r"\*+", "", desc)
+            desc = re.sub(r"\s+", " ", desc).strip()
+            if len(desc) > 80:
+                desc = desc[:77] + "..."
+            results.append({
+                "brief_id": brief_id,
+                "blocked_on": blocked_on,
+                "description": desc,
+                "ready_to_dispatch": blocked_on in merged_briefs,
+            })
+            current_entry = None  # consume — don't double-emit
+
+    return results
+
+
 # ─── Human queue summary (brief-021) ────────────────────────────────
 
 _CREDENTIAL_GATE_RE = re.compile(r"\*\*Requires\b", re.IGNORECASE)

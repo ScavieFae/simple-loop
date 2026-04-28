@@ -1084,6 +1084,28 @@ if items:
 " 2>/dev/null
     fi
 
+    # Re-queued (pending precondition) — brief-102: deterministic regex parse
+    if [ -f "$actions_script" ] && [ -f "$STATE_DIR/goals.md" ]; then
+        python3 -c "
+import sys, os
+sys.path.insert(0, '$(dirname "$actions_script")')
+from actions import parse_requeued_briefs
+items = parse_requeued_briefs('$STATE_DIR/goals.md', '$STATE_DIR/running.json')
+if items:
+    print(f'  Re-queued — pending precondition ({len(items)}):')
+    for item in items:
+        bid = item['brief_id']
+        blocker = item['blocked_on']
+        desc = item['description']
+        if item['ready_to_dispatch']:
+            status_tag = '  ★ ready to re-dispatch (precondition cleared)'
+        else:
+            status_tag = f'  blocked on {blocker}'
+        print(f'    {bid}{status_tag}')
+        print(f'      {desc}')
+" 2>/dev/null
+    fi
+
     echo ""
 
     # Recent logs
