@@ -44,6 +44,24 @@
 - Builds clean
 - [Project-specific checks]
 
+## Outputs
+
+<!-- Which artifact(s) to produce when this brief closes. Contract defined in brief-097.
+
+**closeout.md** (always required):
+Forensic record for future spelunkers. Write at the end of every brief regardless
+of Human-gate. Captures: what shipped, pass criteria met, lessons learned,
+cross-references to prior work.
+
+**review.md** (required if Human-gate ≠ none):
+Gate-time runbook for Mattie. Required when Human-gate is `review` or `smoke`.
+Captures: TL;DR of gate decision, prereqs, phase-tagged runbook, scav recommendation,
+what Mattie should feel if it landed right. Link to closeout.md for "what shipped" —
+do not duplicate that content here. Each artifact has one job.
+
+If you find yourself writing the same paragraph in both files, hoist it into
+closeout.md and link from review.md. -->
+
 <!-- AVOID — sections like "what should feel if it lands right" with target-shape
      numerical examples (e.g., "headline reads '38/50 (76.0%, [0.62, 0.86])'").
      Workers pattern-match these as "deliver this content" and paste them into
