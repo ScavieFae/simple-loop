@@ -3204,6 +3204,57 @@ assert_json "cycle-gate: promoted entry has kind=complete" \
 
 rm -rf "$GATE_SCRATCH"
 
+# ── Tests 109-111: Stale-local-branch refuse-or-recreate (brief-100, cycle 3) ─
+
+echo ""
+echo "=== Tests 109-111: Stale-local-branch refuse-or-recreate (brief-100) ==="
+
+SB_SCRATCH=$(mktemp -d)
+git -C "$SB_SCRATCH" init -q -b main
+git -C "$SB_SCRATCH" config user.email "test@test"
+git -C "$SB_SCRATCH" config user.name  "Test"
+git -C "$SB_SCRATCH" commit -q --allow-empty -m "init"
+
+git init --bare -q "$SB_SCRATCH/origin.git"
+git -C "$SB_SCRATCH" remote add origin "$SB_SCRATCH/origin.git"
+git -C "$SB_SCRATCH" push -q origin main
+
+# Create brief branch at current main tip (before advancing main)
+git -C "$SB_SCRATCH" checkout -q -b brief-SB-test
+git -C "$SB_SCRATCH" checkout -q main
+
+# Advance remote/main 40 commits ahead of brief-SB-test
+for i in $(seq 1 40); do
+    git -C "$SB_SCRATCH" commit -q --allow-empty -m "main: advance $i"
+done
+git -C "$SB_SCRATCH" push -q origin main
+git -C "$SB_SCRATCH" fetch -q origin main
+
+# Test 109: stale branch (40 commits behind) count is correctly computed.
+SB_STALE_COUNT=$(git -C "$SB_SCRATCH" rev-list --count "brief-SB-test".."origin/main" 2>/dev/null || echo "0")
+assert_eq "stale-branch: 40-commit-behind branch reports correct stale count" \
+    "$SB_STALE_COUNT" "40"
+
+# Test 110: stale branch (≥ threshold=30) triggers delete + recreate from main.
+SB_WORKTREE_DIR="$SB_SCRATCH/.loop/worktrees/brief-SB-test"
+mkdir -p "$SB_SCRATCH/.loop/worktrees"
+SB_MAX_COMMITS_BEHIND=30
+SB_RECREATED="no"
+if [ "$SB_STALE_COUNT" -ge "$SB_MAX_COMMITS_BEHIND" ]; then
+    git -C "$SB_SCRATCH" branch -D "brief-SB-test" -q 2>/dev/null || true
+    git -C "$SB_SCRATCH" worktree add -b "brief-SB-test" "$SB_WORKTREE_DIR" "origin/main" -q 2>/dev/null
+    SB_RECREATED="yes"
+fi
+assert_eq "stale-branch: ≥30 commits behind → recreate fires" "$SB_RECREATED" "yes"
+
+# Test 111: recreated branch tip equals origin/main (not the original stale tip).
+SB_BRANCH_TIP=$(git -C "$SB_SCRATCH" rev-parse "brief-SB-test" 2>/dev/null)
+SB_MAIN_TIP=$(git -C "$SB_SCRATCH" rev-parse "origin/main" 2>/dev/null)
+assert_eq "stale-branch: recreated branch tip matches origin/main" \
+    "$SB_BRANCH_TIP" "$SB_MAIN_TIP"
+
+rm -rf "$SB_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

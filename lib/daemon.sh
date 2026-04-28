@@ -286,7 +286,18 @@ run_worker_iteration() {
         mkdir -p "$PROJECT_DIR/.loop/worktrees"
 
         if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
-            git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch" -q 2>/dev/null
+            # Brief-100: stale-branch guard. If the local branch is ≥ MAX_COMMITS_BEHIND
+            # commits behind origin/main, it's the brief-067 phantom root cause — delete
+            # and recreate from main so the worker starts from current state.
+            git -C "$PROJECT_DIR" fetch "$GIT_REMOTE" "$GIT_MAIN_BRANCH" -q 2>/dev/null || true
+            STALE_COUNT=$(git -C "$PROJECT_DIR" rev-list --count "$branch".."${GIT_REMOTE}/${GIT_MAIN_BRANCH}" 2>/dev/null || echo "0")
+            if [ "$STALE_COUNT" -ge "$MAX_COMMITS_BEHIND" ]; then
+                daemon_log "WORKER: stale-branch refused — $branch is $STALE_COUNT commits behind ${GIT_REMOTE}/${GIT_MAIN_BRANCH} (threshold $MAX_COMMITS_BEHIND) — deleting and recreating from main"
+                git -C "$PROJECT_DIR" branch -D "$branch" -q 2>/dev/null || true
+                git -C "$PROJECT_DIR" worktree add -b "$branch" "$WORKTREE_DIR" "${GIT_REMOTE}/${GIT_MAIN_BRANCH}" -q 2>/dev/null
+            else
+                git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch" -q 2>/dev/null
+            fi
         elif git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/remotes/${GIT_REMOTE}/$branch" 2>/dev/null; then
             git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch" -q 2>/dev/null
         else
