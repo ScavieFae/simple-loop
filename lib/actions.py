@@ -300,10 +300,18 @@ def human_queue_summary(paths):
             if not brief_id:
                 continue
             reason = entry.get("reason", "human approval needed")
+            # Backfill: entries written before brief-100 carry no kind field.
+            kind = entry.get("kind", "unknown")
+            if kind == "complete":
+                disposition = "ready for review"
+            else:
+                disposition = "needs daemon-side disposition"
             artifact_url, artifact_missing = _find_handoff_artifact(project_dir, brief_id, wiki_port)
             items.append({
                 "source": "awaiting_review",
                 "brief_id": brief_id,
+                "kind": kind,
+                "queue_steward_disposition": disposition,
                 "summary": reason[:60],
                 "action_hint": f"loop approve {brief_id}",
                 "artifact_url": artifact_url,

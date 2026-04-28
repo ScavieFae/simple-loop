@@ -3255,6 +3255,121 @@ assert_eq "stale-branch: recreated branch tip matches origin/main" \
 
 rm -rf "$SB_SCRATCH"
 
+# ── Tests 112-114: kind visibility + backfill in human_queue_summary (brief-100, cycle 4) ─
+
+echo ""
+echo "=== Tests 112-114: kind field + backfill in human_queue_summary (brief-100) ==="
+
+HQS_SCRATCH=$(mktemp -d)
+mkdir -p "$HQS_SCRATCH/.loop/state" "$HQS_SCRATCH/.loop/state/signals"
+
+# Test 112: kind=complete entry → disposition=ready for review.
+cat > "$HQS_SCRATCH/.loop/state/running.json" <<'ENDJSON'
+{"active":[],"completed_pending_eval":[],"pending_merges":[],"awaiting_review":[{"brief":"brief-HQS-complete","branch":"brief-HQS-complete","brief_file":".loop/briefs/brief-HQS-complete.md","auto_merge":false,"kind":"complete","reason":"worker done"}],"history":[]}
+ENDJSON
+
+HQS112=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$LIB_DIR')
+from actions import human_queue_summary
+paths = {
+    'running_file': '$HQS_SCRATCH/.loop/state/running.json',
+    'state_dir': '$HQS_SCRATCH/.loop/state',
+    'project_dir': '$HQS_SCRATCH',
+    'loop_dir': '$HQS_SCRATCH/.loop',
+    'worktrees_dir': '$HQS_SCRATCH/.loop/worktrees',
+}
+items = human_queue_summary(paths)
+it = next((i for i in items if i['brief_id'] == 'brief-HQS-complete'), None)
+print(it['kind'] if it else 'MISSING')
+")
+assert_eq "human_queue_summary: kind=complete entry returns kind=complete" \
+    "$HQS112" "complete"
+
+HQS112B=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$LIB_DIR')
+from actions import human_queue_summary
+paths = {
+    'running_file': '$HQS_SCRATCH/.loop/state/running.json',
+    'state_dir': '$HQS_SCRATCH/.loop/state',
+    'project_dir': '$HQS_SCRATCH',
+    'loop_dir': '$HQS_SCRATCH/.loop',
+    'worktrees_dir': '$HQS_SCRATCH/.loop/worktrees',
+}
+items = human_queue_summary(paths)
+it = next((i for i in items if i['brief_id'] == 'brief-HQS-complete'), None)
+print(it['queue_steward_disposition'] if it else 'MISSING')
+")
+assert_eq "human_queue_summary: kind=complete → disposition=ready for review" \
+    "$HQS112B" "ready for review"
+
+# Test 113: entry with no kind field → backfill to kind=unknown + disposition=needs daemon-side disposition.
+cat > "$HQS_SCRATCH/.loop/state/running.json" <<'ENDJSON'
+{"active":[],"completed_pending_eval":[],"pending_merges":[],"awaiting_review":[{"brief":"brief-HQS-legacy","branch":"brief-HQS-legacy","brief_file":".loop/briefs/brief-HQS-legacy.md","auto_merge":false,"reason":"pre-100 entry without kind"}],"history":[]}
+ENDJSON
+
+HQS113=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$LIB_DIR')
+from actions import human_queue_summary
+paths = {
+    'running_file': '$HQS_SCRATCH/.loop/state/running.json',
+    'state_dir': '$HQS_SCRATCH/.loop/state',
+    'project_dir': '$HQS_SCRATCH',
+    'loop_dir': '$HQS_SCRATCH/.loop',
+    'worktrees_dir': '$HQS_SCRATCH/.loop/worktrees',
+}
+items = human_queue_summary(paths)
+it = next((i for i in items if i['brief_id'] == 'brief-HQS-legacy'), None)
+print(it['kind'] if it else 'MISSING')
+")
+assert_eq "human_queue_summary: entry without kind → backfill kind=unknown" \
+    "$HQS113" "unknown"
+
+HQS113B=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$LIB_DIR')
+from actions import human_queue_summary
+paths = {
+    'running_file': '$HQS_SCRATCH/.loop/state/running.json',
+    'state_dir': '$HQS_SCRATCH/.loop/state',
+    'project_dir': '$HQS_SCRATCH',
+    'loop_dir': '$HQS_SCRATCH/.loop',
+    'worktrees_dir': '$HQS_SCRATCH/.loop/worktrees',
+}
+items = human_queue_summary(paths)
+it = next((i for i in items if i['brief_id'] == 'brief-HQS-legacy'), None)
+print(it['queue_steward_disposition'] if it else 'MISSING')
+")
+assert_eq "human_queue_summary: kind=unknown → disposition=needs daemon-side disposition" \
+    "$HQS113B" "needs daemon-side disposition"
+
+# Test 114: kind=rebase-blocked → disposition=needs daemon-side disposition.
+cat > "$HQS_SCRATCH/.loop/state/running.json" <<'ENDJSON'
+{"active":[],"completed_pending_eval":[],"pending_merges":[],"awaiting_review":[{"brief":"brief-HQS-rebase","branch":"brief-HQS-rebase","brief_file":".loop/briefs/brief-HQS-rebase.md","auto_merge":false,"kind":"rebase-blocked","reason":"rebase conflict"}],"history":[]}
+ENDJSON
+
+HQS114=$(python3 -c "
+import sys, os
+sys.path.insert(0, '$LIB_DIR')
+from actions import human_queue_summary
+paths = {
+    'running_file': '$HQS_SCRATCH/.loop/state/running.json',
+    'state_dir': '$HQS_SCRATCH/.loop/state',
+    'project_dir': '$HQS_SCRATCH',
+    'loop_dir': '$HQS_SCRATCH/.loop',
+    'worktrees_dir': '$HQS_SCRATCH/.loop/worktrees',
+}
+items = human_queue_summary(paths)
+it = next((i for i in items if i['brief_id'] == 'brief-HQS-rebase'), None)
+print(it['queue_steward_disposition'] if it else 'MISSING')
+")
+assert_eq "human_queue_summary: kind=rebase-blocked → disposition=needs daemon-side disposition" \
+    "$HQS114" "needs daemon-side disposition"
+
+rm -rf "$HQS_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

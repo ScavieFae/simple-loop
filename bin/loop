@@ -1068,7 +1068,16 @@ if items:
         src = item['source'].ljust(16)
         bid = item['brief_id']
         summary = item['summary']
-        print(f'    {src}  {bid}   {summary}')
+        kind = item.get('kind', '')
+        kind_str = f'  [kind={kind}]' if kind else ''
+        print(f'    {src}  {bid}{kind_str}   {summary}')
+        disposition = item.get('queue_steward_disposition', '')
+        if disposition:
+            if kind == 'complete':
+                disp_label = '★ ready for review (Mattie\'s gate)'
+            else:
+                disp_label = '⚠ needs daemon-side disposition'
+            print(f'                       {disp_label}')
         hint = item.get('action_hint')
         if hint:
             print(f'                       → {hint}')
