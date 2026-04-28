@@ -71,6 +71,18 @@ MANDATORY_LINK_RE = re.compile(r"\[.*?\]\(((?!https?://)[^)]+\.md[^)]*)\)", re.M
 YAML_FRONTMATTER_RE = re.compile(r"^---\s*$", re.MULTILINE)
 MD_FIELD_RE = re.compile(r"^\*\*\w", re.MULTILINE)
 
+# ── Sibling-field regexes (for check_sibling_fields) ─────────────────────────
+_AUTO_MERGE_RE = re.compile(r"^\*\*Auto-merge:\*\*\s*(.+?)\s*$", re.MULTILINE)
+_HUMAN_GATE_RE = re.compile(r"^\*\*Human-gate:\*\*\s*(.+?)\s*$", re.MULTILINE)
+_BRANCH_FIELD_RE = re.compile(r"^\*\*Branch:\*\*\s*(.+?)\s*$", re.MULTILINE)
+_VALIDATOR_FIELD_RE = re.compile(r"^\*\*Validator:\*\*\s*(.+?)\s*$", re.MULTILINE)
+_STATUS_FIELD_RE = re.compile(r"^\*\*Status:\*\*\s*(.+?)\s*$", re.MULTILINE)
+_MODEL_FIELD_RE = re.compile(r"^\*\*Model:\*\*\s*(.+?)\s*$", re.MULTILINE)
+_TARGET_REPO_RE = re.compile(r"^\*\*Target repo:\*\*\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
+_FIELD_PAREN_RE = re.compile(r"\(")
+_FIELD_ITALIC_RE = re.compile(r"^[_*]")
+_ILLEGAL_PLACEHOLDERS = frozenset(("none", "empty", "n/a", "tbd"))
+
 
 # ── Check 1: Frontmatter style ───────────────────────────────
 
@@ -358,6 +370,86 @@ def check_status_consistency(content: str, brief_path: Path, project_root: Path)
     return issues
 
 
+# ── Check 9: Sibling-field format (parser-permissive, linter-strict) ─────────
+
+def _check_sibling_field(
+    content: str,
+    field_name: str,
+    pattern: "re.Pattern[str]",
+    none_is_valid: bool = False,
+) -> List[Issue]:
+    """Enforce the parser-permissive + linter-strict discipline on a single-token field.
+
+    Three pollution shapes caught:
+      1. Parenthetical annotation  — `opus (comment)`, `true (rationale)`
+      2. Italic-wrapped placeholder — `_intentionally empty_`
+      3. Illegal literal            — `none`/`empty`/`n/a`/`tbd` where not valid
+
+    `none_is_valid=True` exempts Human-gate from check #3 (`none` = explicit opt-out).
+    Missing fields are caught upstream by check_required_fields — not repeated here.
+    """
+    m = pattern.search(content)
+    if not m:
+        return []
+
+    raw = m.group(1).strip()
+    if not raw:
+        return []
+
+    issues: List[Issue] = []
+
+    if _FIELD_PAREN_RE.search(raw):
+        bare = raw.split("(")[0].strip().rstrip(",;")
+        issues.append(Issue(
+            severity=ERROR,
+            message=f"`**{field_name}:**` value contains a parenthetical annotation: `{raw[:80]}`. The daemon extracts the first token; parens-as-prose make the field unparseable by tools.",
+            expected=f"A bare value with no parenthetical, e.g. `**{field_name}:** {bare}`. Move explanatory notes into a prose section of the brief.",
+            fix=f"Remove the parenthetical: `**{field_name}:** {bare}`",
+        ))
+
+    if _FIELD_ITALIC_RE.match(raw):
+        issues.append(Issue(
+            severity=ERROR,
+            message=f"`**{field_name}:**` value `{raw[:80]}` is an italic-wrapped placeholder, not a real value.",
+            expected=f"A concrete value, or remove the `**{field_name}:**` line if the field is optional.",
+            fix=f"Replace `{raw}` with the actual value, or remove the `**{field_name}:**` line.",
+        ))
+
+    if not none_is_valid:
+        first_word = raw.lower().split()[0].rstrip(".,;") if raw.split() else ""
+        if first_word in _ILLEGAL_PLACEHOLDERS:
+            issues.append(Issue(
+                severity=ERROR,
+                message=f"`**{field_name}:** {raw}` — `{first_word}` is not a valid value for this field.",
+                expected=f"A real value for `**{field_name}:**`, or omit the line entirely if the field is optional.",
+                fix=f"Replace `{first_word}` with the actual value, or remove the `**{field_name}:**` line.",
+            ))
+
+    return issues
+
+
+def check_sibling_fields(content: str, brief_path: Path, project_root: Path) -> List[Issue]:
+    """Sibling frontmatter fields: parens-as-annotation, italic placeholders, illegal literals.
+
+    Mirrors the graduated discipline from check_depends_on across the seven fields
+    most likely to carry prose-pollution next: Auto-merge, Human-gate, Branch,
+    Validator, Status, Model, Target-repo.
+
+    Human-gate is the one exception: `none` IS a legitimate value (explicit opt-out).
+    All other fields treat `none`/`empty`/`n/a`/`tbd` as illegal placeholders —
+    canonical empty form is to omit the field entirely.
+    """
+    issues: List[Issue] = []
+    issues.extend(_check_sibling_field(content, "Auto-merge",  _AUTO_MERGE_RE,    none_is_valid=False))
+    issues.extend(_check_sibling_field(content, "Human-gate",  _HUMAN_GATE_RE,    none_is_valid=True))
+    issues.extend(_check_sibling_field(content, "Branch",      _BRANCH_FIELD_RE,  none_is_valid=False))
+    issues.extend(_check_sibling_field(content, "Validator",   _VALIDATOR_FIELD_RE, none_is_valid=False))
+    issues.extend(_check_sibling_field(content, "Status",      _STATUS_FIELD_RE,  none_is_valid=False))
+    issues.extend(_check_sibling_field(content, "Model",       _MODEL_FIELD_RE,   none_is_valid=False))
+    issues.extend(_check_sibling_field(content, "Target repo", _TARGET_REPO_RE,   none_is_valid=False))
+    return issues
+
+
 # ── Check registry ────────────────────────────────────────────
 
 CHECKS: List[Tuple[str, Callable]] = [
@@ -366,6 +458,7 @@ CHECKS: List[Tuple[str, Callable]] = [
     ("budget-section", check_budget_section),
     ("depends-on", check_depends_on),
     ("dep-id-format", check_dep_id_format),
+    ("sibling-fields", check_sibling_fields),
     ("adr-resolution", check_adr_resolution),
     ("mandatory-reading-links", check_mandatory_reading_links),
     ("status-consistency", check_status_consistency),
