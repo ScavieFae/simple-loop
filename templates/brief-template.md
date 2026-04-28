@@ -60,7 +60,17 @@ what Mattie should feel if it landed right. Link to closeout.md for "what shippe
 do not duplicate that content here. Each artifact has one job.
 
 If you find yourself writing the same paragraph in both files, hoist it into
-closeout.md and link from review.md. -->
+closeout.md and link from review.md.
+
+**Review surface for code-change briefs** (`Edit-surface` lists paths under `apps/`, `web/`, `tools/`, `crates/`, or `packages/`):
+
+review.md must contain all three sections — enforced by the linter (brief-101):
+
+1. **What was broken** — plain-words failure mode. No diff references.
+2. **How we know it's fixed (live, observable now)** — table of observables (log lines, healthz fields, behavior changes). Each row cites where to verify.
+3. **How we'd know if it recurred** — regression detector. Name the same observables explicitly as "stops firing → regression."
+
+Diff link belongs in a References section, not the gate. Mattie reads observables; the validator skims the diff. -->
 
 <!-- AVOID — sections like "what should feel if it lands right" with target-shape
      numerical examples (e.g., "headline reads '38/50 (76.0%, [0.62, 0.86])'").

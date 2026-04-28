@@ -3519,6 +3519,164 @@ esac
 
 rm -rf "$OUTPUTS_SCRATCH"
 
+# ── Tests 120-123 (brief-101): check_review_md_shape — outcome sections ──────
+#
+# Four cases for the code-change review.md outcome contract:
+#   120 — code-change brief, all three sections present           → clean
+#   121 — code-change brief, "skim the diff" (no observable sect) → ERROR
+#   122 — code-change brief, missing recurrence-detector section  → ERROR
+#   123 — non-code-change brief (wiki-only Edit-surface)          → ignored
+#
+# Each brief lives in its own card dir so brief_path.resolve().parent
+# gives the correct card dir to check_review_md_shape.
+
+echo ""
+echo "=== Tests 120-123: check_review_md_shape — code-change review.md outcome sections ==="
+
+RMS_SCRATCH=$(mktemp -d)
+mkdir -p "$RMS_SCRATCH/.loop/state"
+
+# ── Test 120: code-change brief, all three sections → clean ──────────────────
+mkdir -p "$RMS_SCRATCH/card-120"
+cat > "$RMS_SCRATCH/card-120/index.md" <<'EOF'
+# Brief: review-shape-120
+**ID:** brief-999-rms-120
+**Branch:** brief-999-rms-120
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** review
+**Edit-surface:**
+  - apps/api/worker/
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+cat > "$RMS_SCRATCH/card-120/review.md" <<'EOF'
+# Review gate — brief-999-rms-120
+
+## What was broken
+
+The worker failed to start due to a missing dependency pin.
+
+## How we know it's fixed (live, observable now)
+
+| Observable | Status | Where to verify |
+|---|---|---|
+| Worker starts cleanly | ✅ | `loop logs` — "worker ready" in last 5 lines |
+
+## How we'd know if it recurred
+
+If the "worker ready" log line stops appearing after dispatch → regression.
+EOF
+OUT120=$(python3 "$LIB_DIR/lint.py" "$RMS_SCRATCH/card-120/index.md" 2>&1)
+case "$OUT120" in
+    *"What was broken"*|*"How we know it"*|*"recurred"*)
+        fail "check_review_md_shape: all three sections present → expected no shape errors, got: $OUT120" ;;
+    *) pass "check_review_md_shape: all three sections present → clean" ;;
+esac
+
+# ── Test 121: code-change, missing observable section ("skim the diff") → ERROR
+mkdir -p "$RMS_SCRATCH/card-121"
+cat > "$RMS_SCRATCH/card-121/index.md" <<'EOF'
+# Brief: review-shape-121
+**ID:** brief-999-rms-121
+**Branch:** brief-999-rms-121
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** review
+**Edit-surface:**
+  - apps/api/worker/
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+cat > "$RMS_SCRATCH/card-121/review.md" <<'EOF'
+# Review gate — brief-999-rms-121
+
+## What was broken
+
+The worker was not resilient to dependency failures.
+
+Please skim the diff at the PR link to verify the changes look right.
+EOF
+OUT121=$(python3 "$LIB_DIR/lint.py" "$RMS_SCRATCH/card-121/index.md" 2>&1)
+case "$OUT121" in
+    *"How we know it"*) pass "check_review_md_shape: missing observable section → ERROR" ;;
+    *) fail "check_review_md_shape: missing observable section → expected ERROR about 'How we know it', got: $OUT121" ;;
+esac
+
+# ── Test 122: code-change, missing recurrence-detector section → ERROR ────────
+mkdir -p "$RMS_SCRATCH/card-122"
+cat > "$RMS_SCRATCH/card-122/index.md" <<'EOF'
+# Brief: review-shape-122
+**ID:** brief-999-rms-122
+**Branch:** brief-999-rms-122
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** review
+**Edit-surface:**
+  - apps/api/worker/
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+cat > "$RMS_SCRATCH/card-122/review.md" <<'EOF'
+# Review gate — brief-999-rms-122
+
+## What was broken
+
+The worker crashed on startup due to a stale lerobot pin.
+
+## How we know it's fixed (live, observable now)
+
+| Observable | Status | Where to verify |
+|---|---|---|
+| lerobot pinned to 0.4.0 | ✅ | `pip show lerobot` in worker env → Version: 0.4.0 |
+EOF
+OUT122=$(python3 "$LIB_DIR/lint.py" "$RMS_SCRATCH/card-122/index.md" 2>&1)
+case "$OUT122" in
+    *"recurred"*) pass "check_review_md_shape: missing recurrence section → ERROR" ;;
+    *) fail "check_review_md_shape: missing recurrence section → expected ERROR about 'recurred', got: $OUT122" ;;
+esac
+
+# ── Test 123: non-code-change brief (wiki-only Edit-surface) → ignored ────────
+mkdir -p "$RMS_SCRATCH/card-123"
+cat > "$RMS_SCRATCH/card-123/index.md" <<'EOF'
+# Brief: review-shape-123
+**ID:** brief-999-rms-123
+**Branch:** brief-999-rms-123
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** review
+**Edit-surface:**
+  - wiki/research-notes/
+
+## Budget
+**1 cycles sonnet.** test.
+EOF
+cat > "$RMS_SCRATCH/card-123/review.md" <<'EOF'
+# Review gate — brief-999-rms-123
+
+No outcome sections — this is a research brief, not a code-change brief.
+The linter should ignore the review.md shape for this one.
+EOF
+OUT123=$(python3 "$LIB_DIR/lint.py" "$RMS_SCRATCH/card-123/index.md" 2>&1)
+case "$OUT123" in
+    *"What was broken"*|*"How we know it"*|*"recurred"*)
+        fail "check_review_md_shape: non-code-change brief → expected no shape errors, got: $OUT123" ;;
+    *) pass "check_review_md_shape: non-code-change brief (wiki-only Edit-surface) → shape check ignored" ;;
+esac
+
+rm -rf "$RMS_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

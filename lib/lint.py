@@ -598,6 +598,104 @@ def check_outputs(content: str, brief_path: Path, project_root: Path) -> List[Is
     return issues
 
 
+# ── Check 11: Code-change review.md outcome shape ─────────────
+
+_EDIT_SURFACE_FIELD_RE = re.compile(
+    r"^\*\*Edit-surface:\*\*\s*(.*?)$", re.MULTILINE | re.IGNORECASE
+)
+_CODE_CHANGE_PREFIXES = frozenset(("apps/", "web/", "tools/", "crates/", "packages/"))
+
+_REVIEW_WHAT_BROKEN_RE = re.compile(
+    r"^#+\s+What was broken", re.MULTILINE | re.IGNORECASE
+)
+_REVIEW_HOW_FIXED_RE = re.compile(
+    r"^#+\s+How we know it.s fixed", re.MULTILINE | re.IGNORECASE
+)
+_REVIEW_RECURRENCE_RE = re.compile(
+    r"^#+\s+How we.d know if it recurred", re.MULTILINE | re.IGNORECASE
+)
+
+
+def _classify_edit_surface(content: str) -> str:
+    """Return "code-change", "no-field", or "not-code-change".
+
+    Code-change: Edit-surface has paths under apps/, web/, tools/, crates/, packages/.
+    Fail-permissive: field absent → "no-field" (caller warns, does not error).
+    """
+    field_m = _EDIT_SURFACE_FIELD_RE.search(content)
+    if not field_m:
+        return "no-field"
+
+    # Collect the field's same-line value + any following indented list items,
+    # stopping at the next **Bold:** field or ## section header.
+    block = field_m.group(0)
+    for line in content[field_m.end():].split("\n"):
+        if re.match(r"^\*\*\w", line) or re.match(r"^##", line):
+            break
+        block += "\n" + line
+
+    for prefix in _CODE_CHANGE_PREFIXES:
+        if prefix in block:
+            return "code-change"
+
+    return "not-code-change"
+
+
+def check_review_md_shape(content: str, brief_path: Path, project_root: Path) -> List[Issue]:
+    """Code-change briefs: review.md must have all three outcome sections.
+
+    Contract (brief-101): outcome-surface, not diff-skim.
+    Code-change classified by Edit-surface paths under apps/, web/, tools/, crates/, packages/.
+    Fail-permissive on missing Edit-surface field — warns, does not error.
+    Deterministic: section-header presence via regex only; no LLM calls.
+    """
+    classification = _classify_edit_surface(content)
+    card_dir = brief_path.resolve().parent
+    review_path = card_dir / "review.md"
+
+    if classification == "no-field":
+        return []  # Fail-permissive: can't classify without field; skip silently.
+
+    if classification != "code-change":
+        return []  # Non-code-change brief — this rule does not apply.
+
+    if not review_path.exists():
+        return []  # review.md absent — check_outputs handles the presence gate.
+
+    try:
+        review_text = review_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return [Issue(severity=ERROR, message=f"Cannot read review.md: {e}")]
+
+    issues: List[Issue] = []
+
+    if not _REVIEW_WHAT_BROKEN_RE.search(review_text):
+        issues.append(Issue(
+            severity=ERROR,
+            message="Code-change `review.md` missing `## What was broken` section.",
+            expected="Plain-words failure mode description — no diff references.",
+            fix="Add `## What was broken\\n\\n[Describe the failure in plain words, no diff references.]`",
+        ))
+
+    if not _REVIEW_HOW_FIXED_RE.search(review_text):
+        issues.append(Issue(
+            severity=ERROR,
+            message="Code-change `review.md` missing `## How we know it's fixed (live, observable now)` section.",
+            expected="Table of observables: log lines, healthz fields, behavior changes — each with a 'where to verify' citation.",
+            fix="Add `## How we know it's fixed (live, observable now)\\n\\n| Observable | Status | Where to verify |\\n|---|---|---|`",
+        ))
+
+    if not _REVIEW_RECURRENCE_RE.search(review_text):
+        issues.append(Issue(
+            severity=ERROR,
+            message="Code-change `review.md` missing `## How we'd know if it recurred` section.",
+            expected="Regression detector: name the same observables as 'stops firing → regression'.",
+            fix="Add `## How we'd know if it recurred\\n\\n[Name the observables that stop firing if this regresses.]`",
+        ))
+
+    return issues
+
+
 # ── Check registry ────────────────────────────────────────────
 
 CHECKS: List[Tuple[str, Callable]] = [
@@ -611,6 +709,7 @@ CHECKS: List[Tuple[str, Callable]] = [
     ("mandatory-reading-links", check_mandatory_reading_links),
     ("status-consistency", check_status_consistency),
     ("outputs", check_outputs),
+    ("review-md-shape", check_review_md_shape),
 ]
 
 
