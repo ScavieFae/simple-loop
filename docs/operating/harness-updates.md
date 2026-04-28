@@ -135,3 +135,43 @@ Current scripts in simple-loop:
 ## Contribution rule
 
 **Add an entry here after any harness-update session.** Include: what you changed, where it lived, what propagation you did, what broke along the way, how you recovered. Running log of earned knowledge.
+
+---
+
+## Session log
+
+### 2026-04-28 — brief-100: promotion-path classification (phantom-completion fix)
+
+**Trigger:** Two phantom completions in two days — brief-067 and brief-099 routed to `awaiting_review[]` with zero cycles completed. `awaiting_review[]` was a lossy mailbox: legitimate completions and exception-routed failures landed in the same bucket with no label distinguishing them.
+
+**What changed (simple-loop master, commits `c4bb9f5`→`18a343c`):**
+
+| Cycle | Commit | What |
+|---|---|---|
+| 2 | `c4bb9f5` | `kind` field on `move_to_awaiting_review()` in `lib/actions.py` (required, `Literal[...]`). Cycle-completion gate on the `complete` path: refuses if `iteration==0`, `tasks_remaining` non-empty, or no commits beyond `Initialize brief`. All 4 `daemon.sh` call sites updated to pass explicit `kind`. `actions.py:857` merge-conflict bypass patched with `entry["kind"] = "merge-conflict"` directly. |
+| 3 | `c94713b` | Stale-local-branch refuse-or-recreate in `lib/daemon.sh` worktree creation (~lines 288–294). Before reusing an existing local branch, fetch `origin/main` and count commits behind. If ≥ `MAX_COMMITS_BEHIND` (default 30), delete + recreate from main. Closes the brief-067 upstream cause (110 commits stale, rebase failed, phantom routed). |
+| 4 | `18a343c` | `human_queue_summary()` in `lib/actions.py` surfaces `kind` per entry in `loop status` output. Queue-steward classification: `kind=complete` → "ready for review (Mattie's gate)"; any other kind → "needs daemon-side disposition." Backfill: `entry.get('kind', 'unknown')` on read — no schema migration, old entries show as `kind=unknown`. |
+
+**Files edited (simple-loop master):**
+- `lib/actions.py` — `move_to_awaiting_review` signature + cycle-completion gate + merge bypass + `human_queue_summary` kind surfacing
+- `lib/daemon.sh` — 4 call sites updated; stale-branch refuse-or-recreate at worktree creation
+- `scripts/test-flow-v2.sh` — tests 105–114 (cycle-completion gate, stale-branch recreate, kind backfill + queue-steward)
+
+**Test count:** 197 pass, 3 fail (pre-existing presence-check canonical-root failures; not caused by brief-100).
+
+**Propagation required (install-loop discipline):**
+```bash
+cd ~/claude-projects/simple-loop && git pull && ./install.sh && loop stop && loop start
+```
+Without this: daemon runs the old `lib/daemon.sh` and `lib/actions.py`. New `kind` field won't appear on promotions. Stale-branch check won't fire.
+
+**What broke along the way:**
+- `actions.py:857` — a 5th unlabeled promotion path (direct `awaiting_review[]` append in `merge()`) was not a call to `move_to_awaiting_review()` and thus didn't inherit the `kind` parameter. Required a separate direct `entry["kind"] = "merge-conflict"` patch. Documented in cycle-1-audit.md.
+- Cycle-completion git check: used `subprocess.run` with `check=False`. On fetch failure, stdout is empty, which parses as n=0 — would incorrectly refuse legitimate promotions. Guarded with `returncode==0` before parsing.
+- Stale-branch fetch must happen before counting — without `git fetch origin main` first, the count uses a stale `origin/main` ref and misses recently-committed commits.
+
+**Pattern crystallized — promotion-path classification:**
+
+Every queue destination (`awaiting_review[]`, `rejected[]`, `history[]`) should carry a `kind` label at write time. "Why is this entry here?" is a question that comes up every time scav reads queue state. The `kind` field answers it structurally — no string-parsing of `reason` fields needed. When a new exception path is added to the daemon, add a new `kind` literal first.
+
+**Companion discipline (install-loop):** Every harness brief approval is paired with `git pull && ./install.sh && loop stop && loop start` before verifying receipt-claims. The install step is not optional — the daemon runs from `~/.local/share/simple-loop/`, not from the master clone. Skipping the install means you're verifying against the prior version.
