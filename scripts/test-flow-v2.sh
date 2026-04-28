@@ -2863,6 +2863,247 @@ esac
 
 rm -rf "$LINT_SCRATCH"
 
+# ── Test 88: annotated dep form — parser strips paren suffix ─────────────────
+# Validates the parser-permissive side of the discipline: author writes
+# `brief-078 (hard), brief-079 (hard)` in Depends-on; the linter ERRORs at
+# write time, but the parser extracts the real IDs rather than wedging.
+
+echo ""
+echo "=== Test 88: parse_depends_on_value annotated dep form (brief-078 (hard), brief-079 (hard)) ==="
+
+T88_OUT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+print(','.join(parse_depends_on_value('brief-078 (hard), brief-079 (hard)')))
+" 2>/dev/null)
+assert_eq "parse_depends_on_value annotated form extracts clean ids" \
+    "$T88_OUT" "brief-078,brief-079"
+
+# Confirm none (annotation) still drops (not a real brief id even after strip)
+T88B_OUT=$(python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from assess import parse_depends_on_value
+result = parse_depends_on_value('none (daemon harness, simple-loop master)')
+print(','.join(result) if result else 'empty')
+" 2>/dev/null)
+assert_eq "parse_depends_on_value none-with-annotation drops to empty" \
+    "$T88B_OUT" "empty"
+
+# ── Tests 89-102: sibling-field linter (positive + negative per field) ────────
+# Brief-084 pass criterion 2b: one positive case (clean → no error) and one
+# negative case (pollution → ERROR) per sibling field covered by check_sibling_fields.
+
+echo ""
+echo "=== Tests 89-102: sibling-field linter — positive + negative per field ==="
+
+SIB_SCRATCH=$(mktemp -d)
+mkdir -p "$SIB_SCRATCH/.loop"
+
+# Helper: write a minimal brief and run the linter, return stdout+stderr
+sib_lint() {
+    python3 "$LIB_DIR/lint.py" "$SIB_SCRATCH/brief-test.md" 2>&1
+}
+
+# Minimal valid brief body (no Target-repo — it's optional)
+write_sib_brief() {
+    cat > "$SIB_SCRATCH/brief-test.md" <<EOF
+# Brief: sibling-field test
+
+**ID:** brief-999-test
+**Branch:** $1
+**Status:** $2
+**Model:** $3
+**Auto-merge:** $4
+**Validator:** $5
+**Human-gate:** $6
+
+## Budget
+**1 cycles sonnet.** test.
+
+## Completion criteria
+- [ ] x
+EOF
+}
+
+# ── Auto-merge ────────────────────────────────────────────────
+
+# Test 89 (negative): Auto-merge with parenthetical → ERROR
+write_sib_brief "brief-999-test" "queued" "sonnet" "true (rationale here)" "core/agents/reviewer.md" "none"
+LINT89=$(sib_lint)
+case "$LINT89" in
+    *parenthetical*|*"Auto-merge"*) pass "sibling-field: Auto-merge paren annotation → ERROR" ;;
+    *) fail "sibling-field: Auto-merge paren annotation not flagged — got: $LINT89" ;;
+esac
+
+# Test 90 (positive): Auto-merge: true → clean
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT90=$(sib_lint)
+case "$LINT90" in
+    *Clean*) pass "sibling-field: Auto-merge clean value → no error" ;;
+    *"Auto-merge"*ERROR*|*ERROR*"Auto-merge"*) fail "sibling-field: Auto-merge clean value got error — $LINT90" ;;
+    *) pass "sibling-field: Auto-merge clean value → no sibling error" ;;
+esac
+
+# ── Human-gate ────────────────────────────────────────────────
+
+# Test 91 (negative): Human-gate with parenthetical → ERROR
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md" "smoke (manual run only)"
+LINT91=$(sib_lint)
+case "$LINT91" in
+    *parenthetical*|*"Human-gate"*) pass "sibling-field: Human-gate paren annotation → ERROR" ;;
+    *) fail "sibling-field: Human-gate paren annotation not flagged — got: $LINT91" ;;
+esac
+
+# Test 92 (positive): Human-gate: none → clean (none IS valid for Human-gate)
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT92=$(sib_lint)
+case "$LINT92" in
+    *Clean*) pass "sibling-field: Human-gate: none → clean (legitimate opt-out)" ;;
+    *"Human-gate"*ERROR*|*ERROR*"Human-gate"*) fail "sibling-field: Human-gate: none got unexpected error — $LINT92" ;;
+    *) pass "sibling-field: Human-gate: none → no sibling error" ;;
+esac
+
+# ── Branch ───────────────────────────────────────────────────
+
+# Test 93 (negative): Branch with parenthetical → ERROR
+write_sib_brief "brief-999-test (legacy)" "queued" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT93=$(sib_lint)
+case "$LINT93" in
+    *parenthetical*|*"Branch"*) pass "sibling-field: Branch paren annotation → ERROR" ;;
+    *) fail "sibling-field: Branch paren annotation not flagged — got: $LINT93" ;;
+esac
+
+# Test 94 (positive): Branch: clean slug → no sibling error
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT94=$(sib_lint)
+case "$LINT94" in
+    *Clean*) pass "sibling-field: Branch clean slug → no error" ;;
+    *"Branch"*ERROR*|*ERROR*"Branch"*) fail "sibling-field: Branch clean slug got error — $LINT94" ;;
+    *) pass "sibling-field: Branch clean slug → no sibling error" ;;
+esac
+
+# ── Validator ────────────────────────────────────────────────
+
+# Test 95 (negative): Validator with parenthetical → ERROR
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md (v2)" "none"
+LINT95=$(sib_lint)
+case "$LINT95" in
+    *parenthetical*|*"Validator"*) pass "sibling-field: Validator paren annotation → ERROR" ;;
+    *) fail "sibling-field: Validator paren annotation not flagged — got: $LINT95" ;;
+esac
+
+# Test 96 (positive): Validator: clean path → no sibling error
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT96=$(sib_lint)
+case "$LINT96" in
+    *Clean*) pass "sibling-field: Validator clean path → no error" ;;
+    *"Validator"*ERROR*|*ERROR*"Validator"*) fail "sibling-field: Validator clean path got error — $LINT96" ;;
+    *) pass "sibling-field: Validator clean path → no sibling error" ;;
+esac
+
+# ── Status ───────────────────────────────────────────────────
+
+# Test 97 (negative): Status with parenthetical → ERROR
+write_sib_brief "brief-999-test" "queued (deferred — see notes)" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT97=$(sib_lint)
+case "$LINT97" in
+    *parenthetical*|*"Status"*) pass "sibling-field: Status paren annotation → ERROR" ;;
+    *) fail "sibling-field: Status paren annotation not flagged — got: $LINT97" ;;
+esac
+
+# Test 98 (positive): Status: queued → no sibling error
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT98=$(sib_lint)
+case "$LINT98" in
+    *Clean*) pass "sibling-field: Status: queued → no error" ;;
+    *"Status"*ERROR*|*ERROR*"Status"*) fail "sibling-field: Status: queued got error — $LINT98" ;;
+    *) pass "sibling-field: Status: queued → no sibling error" ;;
+esac
+
+# ── Model ────────────────────────────────────────────────────
+
+# Test 99 (negative): Model with parenthetical → ERROR
+write_sib_brief "brief-999-test" "queued" "opus (research phase)" "true" "core/agents/reviewer.md" "none"
+LINT99=$(sib_lint)
+case "$LINT99" in
+    *parenthetical*|*"Model"*) pass "sibling-field: Model paren annotation → ERROR" ;;
+    *) fail "sibling-field: Model paren annotation not flagged — got: $LINT99" ;;
+esac
+
+# Test 100 (positive): Model: sonnet → no sibling error
+write_sib_brief "brief-999-test" "queued" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT100=$(sib_lint)
+case "$LINT100" in
+    *Clean*) pass "sibling-field: Model: sonnet → no error" ;;
+    *"Model"*ERROR*|*ERROR*"Model"*) fail "sibling-field: Model: sonnet got error — $LINT100" ;;
+    *) pass "sibling-field: Model: sonnet → no sibling error" ;;
+esac
+
+# ── Target repo ──────────────────────────────────────────────
+
+# Test 101 (negative): Target repo with parenthetical → ERROR
+cat > "$SIB_SCRATCH/brief-test.md" <<'EOF'
+# Brief: target-repo paren test
+
+**ID:** brief-999-test
+**Branch:** brief-999-test
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** none
+**Target repo:** new-theory-research/portal (panda only)
+
+## Budget
+**1 cycles sonnet.** test.
+
+## Completion criteria
+- [ ] x
+EOF
+LINT101=$(sib_lint)
+case "$LINT101" in
+    *parenthetical*|*"Target repo"*) pass "sibling-field: Target-repo paren annotation → ERROR" ;;
+    *) fail "sibling-field: Target-repo paren annotation not flagged — got: $LINT101" ;;
+esac
+
+# Test 102 (positive): Target repo: clean slug → no sibling error
+cat > "$SIB_SCRATCH/brief-test.md" <<'EOF'
+# Brief: target-repo clean test
+
+**ID:** brief-999-test
+**Branch:** brief-999-test
+**Status:** queued
+**Model:** sonnet
+**Auto-merge:** true
+**Validator:** core/agents/reviewer.md
+**Human-gate:** none
+**Target repo:** new-theory-research/portal
+
+## Budget
+**1 cycles sonnet.** test.
+
+## Completion criteria
+- [ ] x
+EOF
+LINT102=$(sib_lint)
+case "$LINT102" in
+    *Clean*) pass "sibling-field: Target-repo clean slug → no error" ;;
+    *"Target repo"*ERROR*|*ERROR*"Target repo"*) fail "sibling-field: Target-repo clean slug got error — $LINT102" ;;
+    *) pass "sibling-field: Target-repo clean slug → no sibling error" ;;
+esac
+
+# Test 103 (negative): Status: none → ERROR (none is NOT valid for Status)
+write_sib_brief "brief-999-test" "none" "sonnet" "true" "core/agents/reviewer.md" "none"
+LINT103=$(sib_lint)
+case "$LINT103" in
+    *"Status"*|*"none"*) pass "sibling-field: Status: none → ERROR (illegal placeholder)" ;;
+    *) fail "sibling-field: Status: none not flagged — got: $LINT103" ;;
+esac
+
+rm -rf "$SIB_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

@@ -70,13 +70,20 @@ def parse_depends_on_value(raw, validate_brief_id=True):
         cleaned = tok.strip().strip(".,;")
         if not cleaned:
             continue
-        if validate_brief_id and not BRIEF_ID_RE.match(cleaned):
-            print(
-                f"parse_depends_on_value: dropping non-brief-id token: {cleaned!r}",
-                file=sys.stderr,
-            )
-            continue
-        out.append(cleaned)
+        if validate_brief_id:
+            # Strip trailing parenthetical annotation before matching, e.g.
+            # "brief-078 (hard)" → "brief-078". Allows the annotated dep form
+            # at runtime while the linter still ERRORs on it at write time.
+            stripped = cleaned.split("(")[0].strip().strip(".,;")
+            if BRIEF_ID_RE.match(stripped):
+                out.append(stripped)
+            else:
+                print(
+                    f"parse_depends_on_value: dropping non-brief-id token: {cleaned!r}",
+                    file=sys.stderr,
+                )
+        else:
+            out.append(cleaned)
     return out
 
 
