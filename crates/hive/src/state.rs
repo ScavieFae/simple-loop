@@ -392,19 +392,24 @@ impl HiveState {
 
         let daemon_started_at = read_daemon_started_at();
 
-        // Re-queued briefs — read merged set from running.json, then parse goals.md.
-        let running_path = Path::new(".loop/state/running.json");
-        let merged_briefs: std::collections::HashSet<String> = fs::read_to_string(running_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<RunningJson>(&s).ok())
-            .map(|rj| {
-                rj.history
-                    .iter()
-                    .filter(|e| e.merge_sha.as_deref().map(|s| !s.is_empty()).unwrap_or(false))
-                    .map(|e| e.brief.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Re-queued briefs — scan cards for merged set, then parse goals.md.
+        let cards_dir = Path::new("wiki/briefs/cards");
+        let merged_briefs: std::collections::HashSet<String> = {
+            let mut set = HashSet::new();
+            if let Ok(entries) = fs::read_dir(cards_dir) {
+                for entry in entries.flatten() {
+                    let card_dir = entry.path();
+                    if !card_dir.is_dir() { continue; }
+                    let Some(brief_id) = card_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else { continue; };
+                    if brief_id.starts_with('.') { continue; }
+                    let index_path = card_dir.join("index.md");
+                    if parse_brief_status(&index_path).as_deref() == Some("merged") {
+                        set.insert(brief_id);
+                    }
+                }
+            }
+            set
+        };
         let goals_path = Path::new(".loop/state/goals.md");
         let requeued_briefs = parse_requeued_goals_md(goals_path, &merged_briefs);
 
@@ -572,7 +577,7 @@ fn scan_reviews_dir(reviews_dir: &Path, brief_id: &str) -> Option<usize> {
 fn pending_cycle_and_budget(
     brief_id: &str,
     main_reviews_dir: &Path,
-    briefs_dir: &Path,
+    cards_dir: &Path,
 ) -> (Option<usize>, Option<usize>) {
     let worktree = {
         let p = format!(".loop/worktrees/{}", brief_id);
@@ -587,7 +592,7 @@ fn pending_cycle_and_budget(
         worktree.as_deref().map(Path::new),
         brief_id,
     );
-    let budget = parse_cycle_budget(&briefs_dir.join(format!("{}.md", brief_id)));
+    let budget = parse_cycle_budget(&cards_dir.join(brief_id).join("index.md"));
     (cycle, budget)
 }
 
@@ -1092,21 +1097,49 @@ fn normalize_status(s: &str) -> String {
     s.trim().to_ascii_lowercase().replace('_', "-")
 }
 
-/// Parse `**Status:**` from a brief markdown file. Returns the normalized
-/// value, or None if absent or unreadable.
+/// Parse `Status:` from a brief card file.
+///
+/// Handles two formats:
+///   YAML frontmatter — `Status: queued` between `---` delimiters (new cards,
+///     written by `_set_card_status.py`).
+///   Bold markdown — `**Status:** queued` anywhere in the body (legacy cards).
+///
+/// YAML frontmatter is checked first; bold markdown is the fallback so old
+/// cards continue to work without migration.
 fn parse_brief_status(brief_path: &Path) -> Option<String> {
     let content = fs::read_to_string(brief_path).ok()?;
-    for line in content.lines() {
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("**status:**") {
-            let pos = lower.find("**status:**")?;
-            let after = &line[pos + "**status:**".len()..];
-            let value = after.trim().trim_matches(|c: char| ".,;".contains(c));
-            if !value.is_empty() {
-                return Some(normalize_status(value));
+    let lines: Vec<&str> = content.lines().collect();
+
+    // YAML frontmatter: between opening and closing `---`
+    if lines.first().map(|l| l.trim()) == Some("---") {
+        for i in 1..lines.len() {
+            if lines[i].trim() == "---" {
+                break;
+            }
+            let lower = lines[i].to_ascii_lowercase();
+            if lower.starts_with("status:") {
+                let value = lines[i]["status:".len()..].trim().trim_matches(|c: char| ".,;".contains(c));
+                if !value.is_empty() {
+                    return Some(normalize_status(value));
+                }
             }
         }
     }
+
+    // Bold markdown fallback: `**Status:** value`
+    for line in &lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("**status:**") {
+            if let Some(pos) = lower.find("**status:**") {
+                let after = &line[pos + "**status:**".len()..];
+                let value = after.trim().trim_matches(|c: char| ".,;".contains(c));
+                if !value.is_empty() {
+                    return Some(normalize_status(value));
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -1128,30 +1161,31 @@ fn parse_not_doing_reason(brief_path: &Path) -> Option<String> {
     None
 }
 
-/// Scan `.loop/briefs/*.md` and return entries whose `Status:` is `not-doing`.
-/// Symlinks are followed automatically. `declared_at` falls back to file mtime.
+/// Scan `wiki/briefs/cards/*/index.md` and return entries whose `Status:` is
+/// `not-doing`. `declared_at` falls back to file mtime.
 /// Results are sorted newest-first; ties broken by brief id descending.
-pub fn discover_not_doing_briefs(briefs_dir: &Path) -> Vec<NotDoingBrief> {
-    let Ok(entries) = fs::read_dir(briefs_dir) else {
+pub fn discover_not_doing_briefs(cards_dir: &Path) -> Vec<NotDoingBrief> {
+    let Ok(entries) = fs::read_dir(cards_dir) else {
         return vec![];
     };
     let mut out: Vec<NotDoingBrief> = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let card_dir = entry.path();
+        if !card_dir.is_dir() {
+            continue;
+        }
+        let Some(brief_id) = card_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
             continue;
         };
-        if !name.ends_with(".md") || name.starts_with('.') || name == "_template.md" {
+        if brief_id.starts_with('.') {
             continue;
         }
-        if parse_brief_status(&path).as_deref() != Some("not-doing") {
+        let index_path = card_dir.join("index.md");
+        if parse_brief_status(&index_path).as_deref() != Some("not-doing") {
             continue;
         }
-        let brief_id = name.trim_end_matches(".md").to_string();
-        let reason = parse_not_doing_reason(&path);
-        // fs::metadata follows symlinks — returns target mtime, which is what
-        // we want: when the brief card itself was last touched.
-        let declared_at = fs::metadata(&path)
+        let reason = parse_not_doing_reason(&index_path);
+        let declared_at = fs::metadata(&index_path)
             .ok()
             .and_then(|m| m.modified().ok())
             .map(DateTime::<Utc>::from);
@@ -1231,6 +1265,53 @@ pub fn discover_queued_briefs(
     out
 }
 
+/// Scan `wiki/briefs/cards/*/index.md` and return entries whose `Status:` is
+/// `queued`. Ordered by priority (from `goals_path` `## Queued next`) first,
+/// then by `brief_sort_key` for unranked entries.
+///
+/// No exclude set — card `Status:` is the single source of truth.
+pub fn discover_queued_from_cards(
+    cards_dir: &Path,
+    goals_path: &Path,
+) -> Vec<QueuedBrief> {
+    let Ok(entries) = fs::read_dir(cards_dir) else {
+        return vec![];
+    };
+    let priority = parse_goals_priority(goals_path);
+    let mut out: Vec<QueuedBrief> = Vec::new();
+    for entry in entries.flatten() {
+        let card_dir = entry.path();
+        if !card_dir.is_dir() {
+            continue;
+        }
+        let Some(brief_id) = card_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            continue;
+        };
+        if brief_id.starts_with('.') {
+            continue;
+        }
+        let index_path = card_dir.join("index.md");
+        if parse_brief_status(&index_path).as_deref() != Some("queued") {
+            continue;
+        }
+        let priority_rank = priority.iter().position(|p| priority_matches(p, &brief_id));
+        let depends_on_secrets = parse_depends_on_secrets(&index_path);
+        out.push(QueuedBrief {
+            brief: brief_id,
+            priority_rank,
+            depends_on_secrets,
+        });
+    }
+    out.sort_by(|a, b| {
+        let rank_a = a.priority_rank.unwrap_or(usize::MAX);
+        let rank_b = b.priority_rank.unwrap_or(usize::MAX);
+        rank_a
+            .cmp(&rank_b)
+            .then_with(|| brief_sort_key(&a.brief).cmp(&brief_sort_key(&b.brief)))
+    });
+    out
+}
+
 /// Build the "Recently Finished" list from `running.json.history`, deduped
 /// by brief id (the history often carries two entries per brief — a
 /// dispatch-record with `approved_at` and a merge-record with `merged_at`).
@@ -1263,6 +1344,46 @@ pub fn recent_finished(history: &[HistoryEntryRaw]) -> Vec<RecentlyFinishedBrief
         .map(|(brief, finished_at)| RecentlyFinishedBrief { brief, finished_at })
         .collect();
     // Most recent first. Entries with no timestamp sort to the bottom.
+    out.sort_by(|a, b| match (a.finished_at, b.finished_at) {
+        (Some(a_ts), Some(b_ts)) => b_ts.cmp(&a_ts),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.brief.cmp(&b.brief),
+    });
+    out.truncate(RECENTLY_FINISHED_LIMIT);
+    out
+}
+
+/// Scan `wiki/briefs/cards/*/index.md` and return entries whose `Status:` is
+/// `merged`. `finished_at` uses the index.md file mtime — the daemon writes
+/// `Status: merged` at merge time, so mtime is a faithful proxy.
+/// Returns up to `RECENTLY_FINISHED_LIMIT` entries, sorted newest-first.
+pub fn discover_recently_finished_from_cards(cards_dir: &Path) -> Vec<RecentlyFinishedBrief> {
+    let Ok(entries) = fs::read_dir(cards_dir) else {
+        return vec![];
+    };
+    let mut out: Vec<RecentlyFinishedBrief> = Vec::new();
+    for entry in entries.flatten() {
+        let card_dir = entry.path();
+        if !card_dir.is_dir() {
+            continue;
+        }
+        let Some(brief_id) = card_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            continue;
+        };
+        if brief_id.starts_with('.') {
+            continue;
+        }
+        let index_path = card_dir.join("index.md");
+        if parse_brief_status(&index_path).as_deref() != Some("merged") {
+            continue;
+        }
+        let finished_at = fs::metadata(&index_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from);
+        out.push(RecentlyFinishedBrief { brief: brief_id, finished_at });
+    }
     out.sort_by(|a, b| match (a.finished_at, b.finished_at) {
         (Some(a_ts), Some(b_ts)) => b_ts.cmp(&a_ts),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -1427,7 +1548,6 @@ impl CellsState {
         let running_path = Path::new(".loop/state/running.json");
         let log_path = Path::new(".loop/state/log.jsonl");
         let signals_dir = Path::new(".loop/state/signals");
-        let briefs_dir = Path::new(".loop/briefs");
         let goals_path = Path::new(".loop/state/goals.md");
 
         let raw: RunningJson = fs::read_to_string(running_path)
@@ -1436,7 +1556,7 @@ impl CellsState {
             .unwrap_or_default();
 
         let reviews_dir = Path::new(".loop/modules/validator/state/reviews");
-        let briefs_dir_local = Path::new(".loop/briefs");
+        let cards_dir = Path::new("wiki/briefs/cards");
         let active: Vec<ActiveBrief> = raw
             .active
             .iter()
@@ -1446,7 +1566,7 @@ impl CellsState {
                     .as_deref()
                     .and_then(parse_log_ts);
                 let cycle_budget = {
-                    let brief_file = briefs_dir_local.join(format!("{}.md", r.brief));
+                    let brief_file = cards_dir.join(&r.brief).join("index.md");
                     parse_cycle_budget(&brief_file)
                 };
                 let worktree_path = {
@@ -1534,7 +1654,7 @@ impl CellsState {
                         pending_cycle_and_budget(
                             &label,
                             reviews_dir,
-                            briefs_dir_local,
+                            cards_dir,
                         )
                     } else {
                         (None, None)
@@ -1578,7 +1698,7 @@ impl CellsState {
                 let (cycle, budget) = pending_cycle_and_budget(
                     &pe.brief,
                     reviews_dir,
-                    briefs_dir_local,
+                    cards_dir,
                 );
                 pending.push(PendingBrief {
                     brief: pe.brief.clone(),
@@ -1600,7 +1720,7 @@ impl CellsState {
                 let (cycle, budget) = pending_cycle_and_budget(
                     &ar.brief,
                     reviews_dir,
-                    briefs_dir_local,
+                    cards_dir,
                 );
                 pending.push(PendingBrief {
                     brief: ar.brief.clone(),
@@ -1615,7 +1735,7 @@ impl CellsState {
 
         pending.sort_by_key(|p| brief_sort_key(&p.brief));
 
-        // Queued = .loop/briefs/*.md minus everything already accounted for
+        // Queued = cards with Status: queued, minus active/pending
         let mut exclude: HashSet<String> = HashSet::new();
         for a in &active {
             exclude.insert(a.brief.clone());
@@ -1623,20 +1743,35 @@ impl CellsState {
         for p in &pending {
             exclude.insert(p.brief.clone());
         }
-        for h in &raw.history {
-            exclude.insert(h.brief.clone());
-        }
-        let queued = discover_queued_briefs(briefs_dir, &exclude, goals_path);
+        let queued = discover_queued_from_cards(cards_dir, goals_path);
         for q in &queued {
             exclude.insert(q.brief.clone());
         }
 
-        let cards_dir = Path::new("wiki/briefs/cards");
+        let recently_finished = discover_recently_finished_from_cards(cards_dir);
+        let not_doing = discover_not_doing_briefs(cards_dir);
+
+        // Build exclude set for drafts: active, pending, queued, recently_finished, not_doing, rejected
+        for rf in &recently_finished {
+            exclude.insert(rf.brief.clone());
+        }
+        for nd in &not_doing {
+            exclude.insert(nd.brief.clone());
+        }
+        // Also exclude rejected cards
+        if let Ok(entries) = fs::read_dir(cards_dir) {
+            for entry in entries.flatten() {
+                let card_dir = entry.path();
+                if !card_dir.is_dir() { continue; }
+                let Some(bid) = card_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else { continue; };
+                if bid.starts_with('.') { continue; }
+                if parse_brief_status(&card_dir.join("index.md")).as_deref() == Some("rejected") {
+                    exclude.insert(bid);
+                }
+            }
+        }
+
         let drafts = discover_draft_briefs(cards_dir, &exclude);
-
-        let recently_finished = recent_finished(&raw.history);
-
-        let not_doing = discover_not_doing_briefs(briefs_dir);
 
         let specialists_dir = Path::new(".loop/specialists");
         let scouts = discover_scouts(specialists_dir, log_path);
@@ -2469,18 +2604,24 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         // not-doing brief with reason
+        let b019 = dir.join("brief-019-daemon-state-repair");
+        std::fs::create_dir_all(&b019).unwrap();
         std::fs::write(
-            dir.join("brief-019-daemon-state-repair.md"),
-            "**Status:** not-doing\n**Not-doing-reason:** superseded by brief-061 worker-rebase\n",
+            b019.join("index.md"),
+            "---\nStatus: not-doing\n---\n**Not-doing-reason:** superseded by brief-061 worker-rebase\n",
         ).unwrap();
         // queued brief — should not appear
-        std::fs::write(dir.join("brief-020-foo.md"), "**Status:** queued\n").unwrap();
-        // not-doing with underscore variant
-        std::fs::write(dir.join("brief-021-bar.md"), "**Status:** not_doing\n").unwrap();
-        // not-doing with mixed case
-        std::fs::write(dir.join("brief-022-baz.md"), "**Status:** Not-Doing\n").unwrap();
-        // _template.md — must be skipped
-        std::fs::write(dir.join("_template.md"), "**Status:** not-doing\n").unwrap();
+        let b020 = dir.join("brief-020-foo");
+        std::fs::create_dir_all(&b020).unwrap();
+        std::fs::write(b020.join("index.md"), "---\nStatus: queued\n---\n").unwrap();
+        // not-doing with underscore variant (bold markdown format)
+        let b021 = dir.join("brief-021-bar");
+        std::fs::create_dir_all(&b021).unwrap();
+        std::fs::write(b021.join("index.md"), "**Status:** not_doing\n").unwrap();
+        // not-doing with mixed case (bold markdown format)
+        let b022 = dir.join("brief-022-baz");
+        std::fs::create_dir_all(&b022).unwrap();
+        std::fs::write(b022.join("index.md"), "**Status:** Not-Doing\n").unwrap();
 
         let result = discover_not_doing_briefs(&dir);
         let ids: Vec<&str> = result.iter().map(|b| b.brief.as_str()).collect();
@@ -2488,7 +2629,6 @@ mod tests {
         assert!(!ids.contains(&"brief-020-foo"), "queued brief must not appear");
         assert!(ids.contains(&"brief-021-bar"), "not_doing variant should match");
         assert!(ids.contains(&"brief-022-baz"), "Not-Doing variant should match");
-        assert!(!ids.contains(&"_template"), "_template must be excluded");
 
         // reason parsed correctly
         let entry_019 = result.iter().find(|b| b.brief == "brief-019-daemon-state-repair").unwrap();
@@ -4268,5 +4408,116 @@ some non-bracket junk line
             "iteration=2026 must trigger fail-safe (None), not render '2026 cycles'"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn discover_queued_from_cards_returns_only_queued_status() {
+        let dir = std::env::temp_dir().join(format!(
+            "hive_cards_queued_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        for (id, status) in &[
+            ("brief-010-queued-a", "queued"),
+            ("brief-011-queued-b", "queued"),
+            ("brief-012-active", "active"),
+            ("brief-013-merged", "merged"),
+            ("brief-014-rejected", "rejected"),
+            ("brief-015-not-doing", "not-doing"),
+        ] {
+            let card_dir = dir.join(id);
+            std::fs::create_dir_all(&card_dir).unwrap();
+            std::fs::write(
+                card_dir.join("index.md"),
+                format!("---\nStatus: {status}\n---\n# {id}\n"),
+            ).unwrap();
+        }
+        let missing_goals = dir.join("nonexistent.md");
+        let result = discover_queued_from_cards(&dir, &missing_goals);
+        let ids: Vec<&str> = result.iter().map(|q| q.brief.as_str()).collect();
+        assert_eq!(ids, vec!["brief-010-queued-a", "brief-011-queued-b"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discover_queued_from_cards_orders_by_goals_priority() {
+        let dir = std::env::temp_dir().join(format!(
+            "hive_cards_priority_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        for id in &["brief-108-z", "brief-109-a", "brief-075-b"] {
+            let card_dir = dir.join(id);
+            std::fs::create_dir_all(&card_dir).unwrap();
+            std::fs::write(card_dir.join("index.md"), "---\nStatus: queued\n---\n").unwrap();
+        }
+        // goals: 109 first, 075 second, 108 third
+        let goals = dir.join("goals.md");
+        std::fs::write(
+            &goals,
+            "## Queued next\n\n1. brief-109-a\n2. brief-075-b\n3. brief-108-z\n",
+        ).unwrap();
+        let result = discover_queued_from_cards(&dir, &goals);
+        let ids: Vec<&str> = result.iter().map(|q| q.brief.as_str()).collect();
+        assert_eq!(ids, vec!["brief-109-a", "brief-075-b", "brief-108-z"]);
+        assert_eq!(result[0].priority_rank, Some(0));
+        assert_eq!(result[1].priority_rank, Some(1));
+        assert_eq!(result[2].priority_rank, Some(2));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discover_recently_finished_from_cards_returns_only_merged() {
+        let dir = std::env::temp_dir().join(format!(
+            "hive_cards_merged_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        for (id, status) in &[
+            ("brief-020-merged-a", "merged"),
+            ("brief-021-merged-b", "merged"),
+            ("brief-022-queued", "queued"),
+            ("brief-023-rejected", "rejected"),
+        ] {
+            let card_dir = dir.join(id);
+            std::fs::create_dir_all(&card_dir).unwrap();
+            std::fs::write(
+                card_dir.join("index.md"),
+                format!("---\nStatus: {status}\n---\n"),
+            ).unwrap();
+        }
+        let result = discover_recently_finished_from_cards(&dir);
+        let ids: Vec<&str> = result.iter().map(|r| r.brief.as_str()).collect();
+        assert!(ids.contains(&"brief-020-merged-a"), "merged brief must appear");
+        assert!(ids.contains(&"brief-021-merged-b"), "merged brief must appear");
+        assert!(!ids.contains(&"brief-022-queued"), "queued brief must not appear");
+        assert!(!ids.contains(&"brief-023-rejected"), "rejected brief must not appear");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discover_recently_finished_from_cards_caps_at_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "hive_cards_merged_cap_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        for i in 0..10 {
+            let id = format!("brief-0{:02}-merged", i);
+            let card_dir = dir.join(&id);
+            std::fs::create_dir_all(&card_dir).unwrap();
+            std::fs::write(card_dir.join("index.md"), "---\nStatus: merged\n---\n").unwrap();
+        }
+        let result = discover_recently_finished_from_cards(&dir);
+        assert!(result.len() <= RECENTLY_FINISHED_LIMIT, "must cap at RECENTLY_FINISHED_LIMIT");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

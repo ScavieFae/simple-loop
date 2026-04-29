@@ -277,19 +277,34 @@ def parse_requeued_briefs(goals_path, running_path=None):
     except OSError:
         return []
 
-    # Build set of merged brief IDs from running.json history.
+    # Build set of merged brief IDs by scanning cards for Status: merged.
+    # Card-is-truth: running.json history[] is no longer the authoritative source.
     merged_briefs = set()
-    if running_path:
-        try:
-            with open(running_path) as f:
-                rc = json.load(f)
-            for entry in rc.get("history", []):
-                if entry.get("merge_sha"):
-                    bid = entry.get("brief", "")
-                    if bid:
-                        merged_briefs.add(bid)
-        except Exception:
-            pass
+    try:
+        import pathlib
+        goals_parent = pathlib.Path(goals_path).resolve().parent  # .loop/state
+        project_dir = goals_parent.parent.parent  # project root
+        cards_dir = project_dir / "wiki" / "briefs" / "cards"
+        if cards_dir.is_dir():
+            for card_dir in cards_dir.iterdir():
+                if not card_dir.is_dir() or card_dir.name.startswith('.'):
+                    continue
+                index_path = card_dir / "index.md"
+                if not index_path.exists():
+                    continue
+                try:
+                    content = index_path.read_text()
+                    for line in content.splitlines():
+                        low = line.lower().strip()
+                        if low.startswith("status:") or "**status:**" in low:
+                            val = low.split("status:")[-1].strip().strip("*.,;")
+                            if val == "merged":
+                                merged_briefs.add(card_dir.name)
+                            break
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     results = []
     lines = contents.splitlines()

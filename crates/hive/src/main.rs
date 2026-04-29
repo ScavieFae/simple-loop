@@ -681,17 +681,11 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
         // so ranked/unranked ids stay aligned in a single column. Single
         // digits get "N." (2 chars); blank for unranked. If every brief is
         // unranked, skip the slot entirely — panel looks exactly as before.
-        let any_ranked = cells.queued.iter().any(|q| q.priority_rank.is_some());
-        for qb in &cells.queued {
+        for (idx, qb) in cells.queued.iter().enumerate() {
             let mut spans: Vec<Span> = Vec::with_capacity(4);
             spans.push(Span::styled("  · ", Style::default().fg(MUTED)));
-            if any_ranked {
-                let tag = match qb.priority_rank {
-                    Some(r) => format!("{:>2}. ", r + 1),
-                    None => "    ".to_string(),
-                };
-                spans.push(Span::styled(tag, Style::default().fg(MUTED)));
-            }
+            let tag = format!("{:>2}. ", idx + 1);
+            spans.push(Span::styled(tag, Style::default().fg(MUTED)));
             spans.push(Span::styled(
                 qb.brief.clone(),
                 Style::default().fg(Color::White),
