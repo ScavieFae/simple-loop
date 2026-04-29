@@ -48,6 +48,10 @@ mkdir -p "$BIN_DIR"
 cp "$SCRIPT_DIR/lib/daemon.sh" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/actions.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/assess.py" "$INSTALL_DIR/lib/"
+cp "$SCRIPT_DIR/lib/sweep.py" "$INSTALL_DIR/lib/"
+cp "$SCRIPT_DIR/lib/scouts.py" "$INSTALL_DIR/lib/"
+cp "$SCRIPT_DIR/lib/auto_merge.py" "$INSTALL_DIR/lib/"
+cp "$SCRIPT_DIR/lib/startup_repair.py" "$INSTALL_DIR/lib/"
 cp "$SCRIPT_DIR/lib/metrics-report.py" "$INSTALL_DIR/lib/" 2>/dev/null || true
 cp "$SCRIPT_DIR/lib/lint.py" "$INSTALL_DIR/lib/" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/lib/daemon.sh"
