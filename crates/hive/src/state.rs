@@ -189,21 +189,86 @@ pub fn latest_daemon_log_ts(path: &Path) -> Option<DateTime<Utc>> {
     None
 }
 
-pub fn count_brief_cycles(log_path: &Path, brief: &str) -> usize {
-    let file = match fs::File::open(log_path) {
-        Ok(f) => f,
-        Err(_) => return 0,
+/// Progress data read from a brief's `progress.json`. The daemon writes this
+/// file deterministically on every iteration — it is script-written, not
+/// LLM-written, so its fields are schema-bound and safe to trust as integers.
+/// Used for the Active cell instead of the log.jsonl-counting heuristic, which
+/// could render LLM-hallucinated values like "2026 cycles" (incident 2026-04-23,
+/// same class as the parse_log_ts fix).
+pub struct BriefProgress {
+    pub iteration: usize,
+    pub total: usize,
+    pub last_task: String,
+    pub tasks_remaining: usize,
+    pub status: String,
+}
+
+#[derive(Deserialize)]
+struct BriefProgressRaw {
+    #[serde(default)]
+    iteration: serde_json::Value,
+    #[serde(default)]
+    tasks_completed: Vec<serde_json::Value>,
+    #[serde(default)]
+    tasks_remaining: Vec<serde_json::Value>,
+    #[serde(default)]
+    status: String,
+}
+
+/// Read and validate `<worktree_root>/.loop/state/progress.json`. Returns None
+/// on missing file, malformed JSON, or values that fail sanity bounds
+/// (iteration or total > 100 — well past MAX_ITERATIONS, indicating a
+/// hallucinated field). Never renders raw garbage: callers receive Some with
+/// valid data or None for the fail-safe `cycle ?/?` path.
+pub fn read_brief_progress(worktree_root: &Path) -> Option<BriefProgress> {
+    let path = worktree_root.join(".loop/state/progress.json");
+    let body = fs::read_to_string(&path).ok()?;
+    let raw: BriefProgressRaw = serde_json::from_str(&body).ok()?;
+
+    let iteration: usize = match &raw.iteration {
+        serde_json::Value::Null => 0,
+        v => match v.as_u64() {
+            Some(n) if n <= 100 => n as usize,
+            Some(n) => {
+                eprintln!("hive warn: progress.json iteration={n} exceeds sanity bound (>100), using fail-safe");
+                return None;
+            }
+            None => {
+                eprintln!("hive warn: progress.json iteration is not an integer ({v:?}), using fail-safe");
+                return None;
+            }
+        },
     };
-    let reader = BufReader::new(file);
-    let mut count = 0usize;
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let Ok(entry) = serde_json::from_str::<RawLogLine>(&line) else { continue };
-        if entry.brief.as_deref() == Some(brief) {
-            count += 1;
-        }
+
+    let tasks_remaining_count = raw.tasks_remaining.len();
+    let total = raw.tasks_completed.len() + tasks_remaining_count;
+    if total > 100 {
+        eprintln!("hive warn: progress.json total tasks={total} exceeds sanity bound (>100), using fail-safe");
+        return None;
     }
-    count
+
+    let last_task_val = raw
+        .tasks_completed
+        .last()
+        .or_else(|| raw.tasks_remaining.first());
+    let last_task_raw = match last_task_val {
+        Some(v) => v.as_str().unwrap_or("—").to_string(),
+        None => "—".to_string(),
+    };
+    let last_task = if last_task_raw.chars().count() > 40 {
+        let s: String = last_task_raw.chars().take(39).collect();
+        format!("{s}…")
+    } else {
+        last_task_raw
+    };
+
+    Some(BriefProgress {
+        iteration,
+        total,
+        last_task,
+        tasks_remaining: tasks_remaining_count,
+        status: raw.status,
+    })
 }
 
 // ── HiveState ─────────────────────────────────────────────────────────────────
@@ -414,7 +479,9 @@ pub struct ActiveBrief {
     pub brief: String,
     pub branch: String,
     pub dispatched_at: Option<DateTime<Utc>>,
-    pub cycle_count: usize,
+    /// Progress read from `progress.json` in the brief's worktree. None when
+    /// the file is missing, malformed, or fails sanity checks.
+    pub brief_progress: Option<BriefProgress>,
     /// Max cycle number N from `.loop/modules/validator/state/reviews/{brief}-cycle-N.md`.
     /// None means no validator review has landed yet for this brief.
     pub latest_validator_cycle: Option<usize>,
@@ -1378,7 +1445,6 @@ impl CellsState {
                     .dispatched_at
                     .as_deref()
                     .and_then(parse_log_ts);
-                let cycle_count = count_brief_cycles(log_path, &r.brief);
                 let cycle_budget = {
                     let brief_file = briefs_dir_local.join(format!("{}.md", r.brief));
                     parse_cycle_budget(&brief_file)
@@ -1391,6 +1457,10 @@ impl CellsState {
                         None
                     }
                 };
+                let brief_progress = worktree_path
+                    .as_deref()
+                    .map(Path::new)
+                    .and_then(read_brief_progress);
                 let latest_validator_cycle = latest_validator_cycle(
                     reviews_dir,
                     worktree_path.as_deref().map(Path::new),
@@ -1400,7 +1470,7 @@ impl CellsState {
                     brief: r.brief.clone(),
                     branch: r.branch.clone(),
                     dispatched_at,
-                    cycle_count,
+                    brief_progress,
                     latest_validator_cycle,
                     cycle_budget,
                     worktree_path,
@@ -4132,5 +4202,71 @@ some non-bracket junk line
         assert!(!brief_id_matches("brief-101", "brief-1010"));
         // Completely different numbers
         assert!(!brief_id_matches("brief-102", "brief-101"));
+    }
+
+    // ── read_brief_progress tests ─────────────────────────────────────────────
+
+    fn make_progress_worktree(content: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "hive_progress_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let state_dir = dir.join(".loop/state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut f = std::fs::File::create(state_dir.join("progress.json")).unwrap();
+        write!(f, "{}", content).unwrap();
+        dir
+    }
+
+    #[test]
+    fn read_brief_progress_well_formed() {
+        // iteration=2, tasks_completed=[a,b], tasks_remaining=[c,d,e,f]
+        // → cycle 2/6, last_task "b", 4 remaining
+        let root = make_progress_worktree(
+            r#"{"iteration":2,"tasks_completed":["a","b"],"tasks_remaining":["c","d","e","f"],"status":"running"}"#,
+        );
+        let p = read_brief_progress(&root).expect("should parse well-formed progress.json");
+        assert_eq!(p.iteration, 2);
+        assert_eq!(p.total, 6);
+        assert_eq!(p.last_task, "b");
+        assert_eq!(p.tasks_remaining, 4);
+        assert_eq!(p.status, "running");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_brief_progress_missing_file() {
+        // No progress.json present → None, no panic.
+        let dir = std::env::temp_dir().join(format!(
+            "hive_noprogress_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = read_brief_progress(&dir);
+        assert!(result.is_none(), "missing progress.json must yield None");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_brief_progress_iteration_2026_failsafe() {
+        // iteration=2026 exceeds sanity bound → None.
+        // This test directly proves the symptom-2 class (year-as-cycle-count)
+        // cannot reach the display layer.
+        let root = make_progress_worktree(
+            r#"{"iteration":2026,"tasks_completed":[],"tasks_remaining":[],"status":"running"}"#,
+        );
+        let result = read_brief_progress(&root);
+        assert!(
+            result.is_none(),
+            "iteration=2026 must trigger fail-safe (None), not render '2026 cycles'"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

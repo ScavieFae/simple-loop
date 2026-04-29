@@ -456,16 +456,19 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
             // Cycle number is the latest validator cycle if one has landed,
             // else 0 (brief dispatched but no review yet). Budget may be None
             // for briefs without a parseable `## Budget` section.
+            //
+            // When budget is unknown: read from progress.json (daemon-written,
+            // schema-bound) instead of counting log.jsonl entries (LLM-written,
+            // can hallucinate values like "2026"). Fail-safe is `cycle ?/?`.
             let current_cycle = brief.latest_validator_cycle.unwrap_or(0);
             let cycle_label = match brief.cycle_budget {
                 Some(budget) => {
                     format!("cycle {}/{}", current_cycle, budget)
                 }
-                None => {
-                    // Fall back to the existing event-count display when we
-                    // can't read a budget — honest about its imprecision.
-                    format!("~{} events", brief.cycle_count)
-                }
+                None => match &brief.brief_progress {
+                    Some(p) if p.total > 0 => format!("cycle {}/{}", p.iteration, p.total),
+                    _ => "cycle ?/?".to_string(),
+                },
             };
             // Branch name is almost always identical to the brief id in
             // simple-loop (both follow `brief-NNN-slug`), so it's duplicate
@@ -486,6 +489,21 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
                     None => MUTED,
                 }),
             ));
+            // When no cycle budget, append last_task + remaining from progress.json.
+            if brief.cycle_budget.is_none() {
+                if let Some(p) = &brief.brief_progress {
+                    if p.total > 0 {
+                        row_spans.push(Span::styled(
+                            format!(" · last_task: {}", p.last_task),
+                            Style::default().fg(MUTED),
+                        ));
+                        row_spans.push(Span::styled(
+                            format!(" · {} tasks remaining", p.tasks_remaining),
+                            Style::default().fg(MUTED),
+                        ));
+                    }
+                }
+            }
             row_spans.push(Span::styled(
                 format!("  ·  {}", age),
                 Style::default().fg(MUTED),
