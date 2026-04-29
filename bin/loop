@@ -904,6 +904,25 @@ cmd_start() {
 
     mkdir -p "$LOG_DIR" "$SIGNALS_DIR"
 
+    # LaunchAgent path — if the plist is installed, let launchd own the process
+    local project_name
+    project_name="$(basename "$PROJECT_DIR")"
+    local _la_label="com.scaviefae.simpleloop.${project_name}"
+    local _la_plist="$HOME/Library/LaunchAgents/${_la_label}.plist"
+
+    if [ -f "$_la_plist" ]; then
+        echo "Starting via LaunchAgent (launchd-managed)..."
+        launchctl load -w "$_la_plist"
+        sleep 2
+        if launchctl list "$_la_label" >/dev/null 2>&1; then
+            echo "Daemon running via launchd. Logs: loop logs -f"
+            echo "Survives SSH disconnects and reboots. To stop: loop stop"
+        else
+            die "LaunchAgent failed to start. Check: loop logs"
+        fi
+        return 0
+    fi
+
     local daemon_script="$LIB_DIR/daemon.sh"
     if [ ! -f "$daemon_script" ]; then
         # Try relative to this script (running from source)
@@ -912,6 +931,7 @@ cmd_start() {
     [ -f "$daemon_script" ] || die "daemon.sh not found. Is Simple Loop installed?"
 
     echo "Starting daemon (interval=${interval}s)..."
+    echo "(Tip: run 'loop install-service' for SSH/reboot survival via launchd)"
 
     # Use caffeinate on macOS to prevent sleep
     if command -v caffeinate >/dev/null 2>&1; then
@@ -936,6 +956,21 @@ cmd_start() {
 
 cmd_stop() {
     require_loop_dir
+
+    # LaunchAgent path — if the plist is installed, let launchctl unload stop the process
+    local project_name
+    project_name="$(basename "$PROJECT_DIR")"
+    local _la_label="com.scaviefae.simpleloop.${project_name}"
+    local _la_plist="$HOME/Library/LaunchAgents/${_la_label}.plist"
+
+    if [ -f "$_la_plist" ]; then
+        echo "Stopping via LaunchAgent (launchd-managed)..."
+        launchctl unload "$_la_plist" 2>/dev/null && echo "LaunchAgent unloaded: $_la_label" || true
+        rm -f "$PID_FILE"
+        echo "Stopped. (LaunchAgent remains installed; daemon restarts on next login)"
+        echo "To start again: loop start  |  To remove permanently: loop uninstall-service"
+        return 0
+    fi
 
     if ! [ -f "$PID_FILE" ]; then
         echo "No PID file found. Daemon not running."
