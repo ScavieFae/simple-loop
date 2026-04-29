@@ -252,6 +252,16 @@ _BLOCKED_ON_RE = re.compile(r"^\s*\*\*Blocked-on:\*\*\s+(brief-\d+(?:-[\w-]+)?)"
 _LIST_ITEM_BRIEF_RE = re.compile(r"^\s{0,3}\d+\.\s+\*{0,2}(brief-\d+[\w-]*)")
 
 
+def _brief_id_matches(a: str, b: str) -> bool:
+    """True when a and b refer to the same brief (handles truncated vs full IDs).
+
+    running.json history often has truncated IDs ("brief-102") while goals.md
+    and the filesystem use full slugs ("brief-102-loop-status-blocked-state-surface").
+    Matching is symmetric: either argument can be the truncated form.
+    """
+    return a == b or a.startswith(b + "-") or b.startswith(a + "-")
+
+
 def parse_requeued_briefs(goals_path, running_path=None):
     """Parse goals.md for re-queued entries with a **Blocked-on:** marker.
 
@@ -307,7 +317,7 @@ def parse_requeued_briefs(goals_path, running_path=None):
                 "brief_id": brief_id,
                 "blocked_on": blocked_on,
                 "description": desc,
-                "ready_to_dispatch": blocked_on in merged_briefs,
+                "ready_to_dispatch": any(_brief_id_matches(blocked_on, m) for m in merged_briefs),
             })
             current_entry = None  # consume — don't double-emit
 

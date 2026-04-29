@@ -870,7 +870,7 @@ pub fn parse_requeued_goals_md(goals_path: &Path, merged_briefs: &std::collectio
         }
         if let Some(blocked_on) = extract_blocked_on(line) {
             if let Some((brief_id, desc)) = current_entry.take() {
-                let ready = merged_briefs.contains(&blocked_on);
+                let ready = merged_briefs.iter().any(|m| brief_id_matches(m, &blocked_on));
                 results.push(ReQueuedBrief { brief_id, blocked_on, description: desc, ready_to_dispatch: ready });
             }
         }
@@ -1101,6 +1101,18 @@ pub fn discover_not_doing_briefs(briefs_dir: &Path) -> Vec<NotDoingBrief> {
     out
 }
 
+/// Returns true when two brief IDs refer to the same brief.
+///
+/// Handles the common mismatch between truncated history IDs (e.g. "brief-102"
+/// written by the backfill script) and full filesystem IDs (e.g.
+/// "brief-102-loop-status-blocked-state-surface" from the symlink name).
+/// Matching is symmetric: either side can be the truncated form.
+pub fn brief_id_matches(a: &str, b: &str) -> bool {
+    a == b
+        || a.starts_with(&format!("{}-", b))
+        || b.starts_with(&format!("{}-", a))
+}
+
 /// Scan `.loop/briefs/*.md` and return work-unit ids not in `exclude`.
 /// Any `.md` file that isn't the `_template.md` is treated as a work unit —
 /// covers `brief-NNN-*`, `audit-YYYY-MM-DD-N`, `capture-YYYY-MM-DD-N`, and
@@ -1128,7 +1140,7 @@ pub fn discover_queued_briefs(
             continue;
         }
         let brief_id = name.trim_end_matches(".md").to_string();
-        if exclude.contains(&brief_id) {
+        if exclude.iter().any(|ex| brief_id_matches(&brief_id, ex)) {
             continue;
         }
         if parse_brief_status(&path).as_deref() == Some("not-doing") {
@@ -3551,6 +3563,31 @@ some non-bracket junk line
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn discover_queued_briefs_excludes_truncated_history_id() {
+        // Running.json history often has short IDs like "brief-102" while the
+        // .loop/briefs/ symlink is named "brief-102-loop-status-blocked-state-surface".
+        // brief_id_matches() must bridge this gap.
+        let dir = std::env::temp_dir().join(format!(
+            "hive_queue_trunc_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Full-slug file that should be excluded by the truncated history ID "brief-102"
+        std::fs::write(dir.join("brief-102-loop-status-blocked-state-surface.md"), "body").unwrap();
+        std::fs::write(dir.join("brief-103-agent-metrics.md"), "body").unwrap();
+        let mut exclude = HashSet::new();
+        exclude.insert("brief-102".to_string()); // truncated — as written by backfill
+        let missing_goals = dir.join("nonexistent-goals.md");
+        let queued = discover_queued_briefs(&dir, &exclude, &missing_goals);
+        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
+        assert_eq!(ids, vec!["brief-103-agent-metrics"], "truncated history ID must exclude full-slug file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── parse_goals_priority ──────────────────────────────────────────────
 
     fn tmp_goals_path(tag: &str) -> std::path::PathBuf {
@@ -4037,5 +4074,63 @@ some non-bracket junk line
         let merged = HashSet::new();
         let result = parse_requeued_goals_md(&path, &merged);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn requeued_parse_ready_when_blocker_is_full_slug_of_truncated_goals_id() {
+        // goals.md says **Blocked-on:** brief-101 (short)
+        // running.json history has "brief-101-code-change-review-shape" (full slug)
+        // brief_id_matches must bridge this: truncated goals ID matches full history ID.
+        let path = write_goals(
+            "## Queued next\n\
+             1. brief-103-agent-metrics — waiting for brief-101.\n\
+               **Blocked-on:** brief-101\n",
+        );
+        let mut merged = HashSet::new();
+        merged.insert("brief-101-code-change-review-shape".to_string()); // full slug in history
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ready_to_dispatch, "full-slug history entry must clear short blocked-on id");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn requeued_parse_ready_when_blocker_truncated_history_matches_full_goals_id() {
+        // goals.md says **Blocked-on:** brief-102-loop-status-blocked-state-surface (full)
+        // running.json history has "brief-102" (truncated, as written by backfill)
+        let path = write_goals(
+            "## Queued next\n\
+             1. brief-103-agent-metrics — waiting for brief-102.\n\
+               **Blocked-on:** brief-102-loop-status-blocked-state-surface\n",
+        );
+        let mut merged = HashSet::new();
+        merged.insert("brief-102".to_string()); // truncated in history
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ready_to_dispatch, "truncated history entry must clear full-slug blocked-on id");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ── brief_id_matches ──────────────────────────────────────────────────
+
+    #[test]
+    fn brief_id_matches_exact() {
+        assert!(brief_id_matches("brief-101", "brief-101"));
+        assert!(brief_id_matches("brief-101-slug", "brief-101-slug"));
+    }
+
+    #[test]
+    fn brief_id_matches_truncated_vs_full() {
+        assert!(brief_id_matches("brief-101-code-change-review-shape", "brief-101"));
+        assert!(brief_id_matches("brief-101", "brief-101-code-change-review-shape"));
+    }
+
+    #[test]
+    fn brief_id_matches_no_false_positives() {
+        // "brief-1010" must NOT match "brief-101"
+        assert!(!brief_id_matches("brief-1010", "brief-101"));
+        assert!(!brief_id_matches("brief-101", "brief-1010"));
+        // Completely different numbers
+        assert!(!brief_id_matches("brief-102", "brief-101"));
     }
 }

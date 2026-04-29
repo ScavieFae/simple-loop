@@ -136,6 +136,75 @@ class TestParseRequeuedBriefs(unittest.TestCase):
             self.assertEqual(result[0]["brief_id"], "brief-067-cont")
             self.assertEqual(result[0]["blocked_on"], "brief-067")
 
+    def test_ready_when_history_has_full_slug_goals_has_short_id(self):
+        """goals.md: **Blocked-on:** brief-101 (short) — history: brief-101-code-change-review-shape (full slug)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            goals = _write(tmp, "goals.md", """\
+# Goals
+
+## Queued next
+
+1. **brief-103 (metrics)** — blocked on brief-101.
+   **Blocked-on:** brief-101
+""")
+            running = _write(tmp, "running.json", json.dumps({
+                "active": [],
+                "history": [
+                    {"brief": "brief-101-code-change-review-shape", "merge_sha": "abc1234"},
+                ],
+            }))
+            result = parse_requeued_briefs(goals, running)
+            self.assertEqual(len(result), 1)
+            self.assertTrue(result[0]["ready_to_dispatch"],
+                            "full-slug history entry must clear short blocked-on id")
+
+    def test_ready_when_history_has_short_id_goals_has_full_slug(self):
+        """goals.md: **Blocked-on:** brief-102-loop-status-blocked-state-surface (full) — history: brief-102 (truncated)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            goals = _write(tmp, "goals.md", """\
+# Goals
+
+## Queued next
+
+1. **brief-103 (metrics)** — blocked on brief-102.
+   **Blocked-on:** brief-102-loop-status-blocked-state-surface
+""")
+            running = _write(tmp, "running.json", json.dumps({
+                "active": [],
+                "history": [
+                    {"brief": "brief-102", "merge_sha": "def5678"},
+                ],
+            }))
+            result = parse_requeued_briefs(goals, running)
+            self.assertEqual(len(result), 1)
+            self.assertTrue(result[0]["ready_to_dispatch"],
+                            "truncated history entry must clear full-slug blocked-on id")
+
+    def test_no_false_positive_on_numeric_prefix_overlap(self):
+        """brief-1010 must not match brief-101."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            goals = _write(tmp, "goals.md", """\
+# Goals
+
+## Queued next
+
+1. **brief-103 (metrics)** — blocked on brief-1010.
+   **Blocked-on:** brief-1010
+""")
+            running = _write(tmp, "running.json", json.dumps({
+                "active": [],
+                "history": [
+                    {"brief": "brief-101", "merge_sha": "abc1234"},
+                ],
+            }))
+            result = parse_requeued_briefs(goals, running)
+            self.assertEqual(len(result), 1)
+            self.assertFalse(result[0]["ready_to_dispatch"],
+                             "brief-101 must NOT match brief-1010")
+
 
 if __name__ == "__main__":
     unittest.main()
