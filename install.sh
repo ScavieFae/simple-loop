@@ -56,6 +56,7 @@ chmod +x "$INSTALL_DIR/lib/daemon.sh"
 cp "$SCRIPT_DIR/templates/config.sh" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/templates/brief-template.md" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/templates/prompts/"*.md "$INSTALL_DIR/templates/prompts/"
+cp "$SCRIPT_DIR/templates/com.scaviefae.simpleloop.plist" "$INSTALL_DIR/templates/"
 
 # Copy docs (conventions, operating docs, templates used by `loop init`)
 if [ -d "$SCRIPT_DIR/docs" ]; then

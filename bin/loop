@@ -1718,6 +1718,95 @@ cmd_sweep() {
     python3 "$sweep_script" "$PROJECT_DIR" "$@"
 }
 
+# ── install-service / uninstall-service ──────────────────────
+
+cmd_install_service() {
+    require_loop_dir
+
+    local interval="${1:-${HEARTBEAT_INTERVAL:-300}}"
+
+    # Resolve installed lib dir — same logic as cmd_start
+    local daemon_script="$LIB_DIR/daemon.sh"
+    if [ ! -f "$daemon_script" ]; then
+        daemon_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/daemon.sh"
+    fi
+    [ -f "$daemon_script" ] || die "daemon.sh not found. Is Simple Loop installed?"
+    local resolved_lib_dir
+    resolved_lib_dir="$(dirname "$daemon_script")"
+
+    # Resolve plist template
+    local plist_template="$TEMPLATES_DIR/com.scaviefae.simpleloop.plist"
+    if [ ! -f "$plist_template" ]; then
+        plist_template="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/templates/com.scaviefae.simpleloop.plist"
+    fi
+    [ -f "$plist_template" ] || die "Plist template not found. Is Simple Loop installed? (looked at: $plist_template)"
+
+    local project_name
+    project_name="$(basename "$PROJECT_DIR")"
+    local label="com.scaviefae.simpleloop.${project_name}"
+    local agents_dir="$HOME/Library/LaunchAgents"
+    local plist_dest="${agents_dir}/${label}.plist"
+    local log_file="$LOG_DIR/daemon.log"
+
+    mkdir -p "$agents_dir"
+    mkdir -p "$LOG_DIR"
+
+    # Interpolate template — sed-safe: escape / in paths
+    local safe_project_dir safe_lib_dir safe_log_file safe_home safe_path
+    safe_project_dir="$(printf '%s\n' "$PROJECT_DIR" | sed 's/[\/&]/\\&/g')"
+    safe_lib_dir="$(printf '%s\n' "$resolved_lib_dir" | sed 's/[\/&]/\\&/g')"
+    safe_log_file="$(printf '%s\n' "$log_file" | sed 's/[\/&]/\\&/g')"
+    safe_home="$(printf '%s\n' "$HOME" | sed 's/[\/&]/\\&/g')"
+    safe_path="$(printf '%s\n' "$PATH" | sed 's/[\/&]/\\&/g')"
+
+    sed \
+        -e "s/{{PROJECT_NAME}}/${project_name}/g" \
+        -e "s/{{PROJECT_DIR}}/${safe_project_dir}/g" \
+        -e "s/{{LIB_DIR}}/${safe_lib_dir}/g" \
+        -e "s/{{INTERVAL}}/${interval}/g" \
+        -e "s/{{LOG_FILE}}/${safe_log_file}/g" \
+        -e "s/{{HOME}}/${safe_home}/g" \
+        -e "s/{{PATH}}/${safe_path}/g" \
+        "$plist_template" > "$plist_dest"
+
+    echo "LaunchAgent written: $plist_dest"
+
+    # Unload first if already loaded (idempotent re-install)
+    launchctl unload "$plist_dest" 2>/dev/null || true
+
+    launchctl load -w "$plist_dest"
+    echo "LaunchAgent loaded: $label"
+    echo ""
+    echo "Daemon is now managed by launchd. It will:"
+    echo "  - Start automatically on login"
+    echo "  - Restart automatically if it crashes"
+    echo "  - Survive SSH disconnects and terminal closes"
+    echo ""
+    echo "Verify: launchctl list | grep simpleloop"
+    echo "Logs:   loop logs -f"
+}
+
+cmd_uninstall_service() {
+    require_loop_dir
+
+    local project_name
+    project_name="$(basename "$PROJECT_DIR")"
+    local label="com.scaviefae.simpleloop.${project_name}"
+    local plist_dest="$HOME/Library/LaunchAgents/${label}.plist"
+
+    if [ ! -f "$plist_dest" ]; then
+        echo "No LaunchAgent plist found at $plist_dest"
+        echo "Nothing to uninstall."
+        return 0
+    fi
+
+    launchctl unload "$plist_dest" 2>/dev/null && echo "LaunchAgent unloaded: $label" || true
+    rm -f "$plist_dest"
+    echo "Removed: $plist_dest"
+    echo ""
+    echo "LaunchAgent uninstalled. Use 'loop start' to run the daemon manually."
+}
+
 # ── cleanup ──────────────────────────────────────────────────
 
 cmd_cleanup() {
@@ -1758,6 +1847,8 @@ Work:
   brief --no-interactive   Create brief from template, open in $EDITOR
   start [interval]         Start the daemon (default: 300s heartbeat)
   stop                     Stop the daemon
+  install-service [interval]  Install as macOS LaunchAgent (survives SSH/reboot)
+  uninstall-service           Remove the LaunchAgent
 
 Monitor:
   status                   Show daemon state, active brief, recent logs
@@ -1812,6 +1903,8 @@ case "${1:-help}" in
     metrics) shift; cmd_metrics "$@" ;;
     lint)    shift; cmd_lint "$@" ;;
     sweep)   shift; cmd_sweep "$@" ;;
+    install-service)   shift; cmd_install_service "$@" ;;
+    uninstall-service) cmd_uninstall_service ;;
     cleanup) cmd_cleanup ;;
     help|--help|-h) cmd_help ;;
     *)       echo "Unknown command: $1"; cmd_help; exit 1 ;;
