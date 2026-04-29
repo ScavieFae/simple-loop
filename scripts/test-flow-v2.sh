@@ -197,24 +197,43 @@ assert_json "auto_merge flipped to True after approve"      "$RJ" "str(d['pendin
 # ── Test 5: reject-brief ─────────────────────────────────────────────────────
 
 echo ""
-echo "=== Test 5: reject-brief (awaiting_review → history[] with rejected_at + reason) ==="
+echo "=== Test 5: reject-brief (awaiting_review removed, card Status → rejected) ==="
+
+# Seed card for brief-002-human with Status: queued
+mkdir -p "$SCRATCH/wiki/briefs/cards/brief-002-human"
+cat > "$SCRATCH/wiki/briefs/cards/brief-002-human/index.md" <<'CARDEOF'
+---
+id: brief-002-human
+Status: queued
+---
+# Brief: human-review test
+CARDEOF
+git -C "$SCRATCH" add -A && git -C "$SCRATCH" commit -q -m "test: seed card" 2>/dev/null || true
 
 write_running "{
     'active': [],
     'completed_pending_eval': [],
     'pending_merges': [],
     'awaiting_review': [{'brief': 'brief-002-human', 'branch': 'brief-002-human', 'brief_file': '.loop/briefs/brief-002-human.md', 'auto_merge': False}],
-    'history': [],
     'queue': []
 }"
 
 python3 "$ACTIONS" reject-brief brief-002-human "$SCRATCH" "scope exceeded brief bounds" > /dev/null 2>&1
 
-assert_json "awaiting_review[] empty after reject"          "$RJ" "len(d['awaiting_review'])"    "0"
-assert_json "history[] has one entry after reject"           "$RJ" "len(d['history'])"            "1"
-assert_json "history[0] is brief-002-human"                  "$RJ" "d['history'][0]['brief']"     "brief-002-human"
-assert_json "rejected_at timestamp present"                  "$RJ" "bool(d['history'][0].get('rejected_at'))"  "True"
-assert_json "reject_reason preserved"                        "$RJ" "d['history'][0].get('reject_reason','')"  "scope exceeded brief bounds"
+assert_json "awaiting_review[] empty after reject"            "$RJ" "len(d['awaiting_review'])"    "0"
+REJECT_STATUS=$(python3 -c "
+lines = open('$SCRATCH/wiki/briefs/cards/brief-002-human/index.md').readlines()
+in_fm = False
+for l in lines:
+    s = l.strip()
+    if s == '---':
+        if not in_fm: in_fm = True
+        else: break
+    elif in_fm and s.lower().startswith('status:'):
+        print(s.split(':',1)[1].strip())
+        break
+")
+assert_eq "card Status → rejected after reject-brief"         "$REJECT_STATUS"  "rejected"
 
 # ── Test 6: depends-on frontmatter parsing ───────────────────────────────────
 
@@ -327,16 +346,23 @@ print(','.join(read_depends_on('$SCRATCH/.loop/briefs/brief-005-multidep.md')))
 ")
 assert_eq "read_depends_on handles comma-separated list"   "$READ_MULTI"  "brief-010-foo,brief-011-bar"
 
-# ── Test 9: depends-on history-check post-restart false-negative ─────────────
+# ── Test 9: depends-on card-scan post-restart false-negative ─────────────────
 
 echo ""
-echo "=== Test 9: single-dep matches against running.json history post-restart ==="
+echo "=== Test 9: single-dep matches against card Status==merged (card-is-truth) ==="
 
-# Reproduces brief-012's 2026-04-22 failure: brief-010 was in history, daemon
-# reported "not yet merged." With fix 1's parser, history lookup now works;
-# test asserts the check-depends-on action returns "allowed" in that scenario.
+# Reproduces brief-012's 2026-04-22 failure. brief-108: now scans cards, not history[].
+# Seed: card for brief-010 with Status: merged.
+mkdir -p "$SCRATCH/wiki/briefs/cards/brief-010-api-v0-1"
+cat > "$SCRATCH/wiki/briefs/cards/brief-010-api-v0-1/index.md" <<'CARDEOF'
+---
+id: brief-010-api-v0-1
+Status: merged
+---
+# Brief: api-v0-1
+CARDEOF
+git -C "$SCRATCH" add -A && git -C "$SCRATCH" commit -q -m "test: seed merged card" 2>/dev/null || true
 
-# Seed: brief-010 in history, pending-dispatch for a brief depends-on brief-010.
 cat > "$SCRATCH/.loop/briefs/brief-006-single-dep.md" <<'EOF'
 # Brief: single-dep test
 
@@ -351,7 +377,6 @@ write_running "{
     'completed_pending_eval': [],
     'pending_merges': [],
     'awaiting_review': [],
-    'history': [{'brief': 'brief-010-api-v0-1', 'branch': 'brief-010-api-v0-1', 'merged_at': '2026-04-22T01:26:36Z'}],
     'queue': []
 }"
 
@@ -364,40 +389,40 @@ cat > "$SCRATCH/.loop/state/pending-dispatch.json" <<EOF
 EOF
 
 DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 1p)
-assert_eq "check-depends-on allows when single dep in history" "$DEPS_LINE1"  "allowed"
+assert_eq "check-depends-on allows when single dep is merged card" "$DEPS_LINE1"  "allowed"
 
-# Blocked case: dep NOT in history
-write_running "{
-    'active': [],
-    'completed_pending_eval': [],
-    'pending_merges': [],
-    'awaiting_review': [],
-    'history': [],
-    'queue': []
-}"
+# Blocked case: card exists but Status != merged
+sed -i '' 's/Status: merged/Status: queued/' "$SCRATCH/wiki/briefs/cards/brief-010-api-v0-1/index.md"
 
 DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 1p)
-assert_eq "check-depends-on blocks when dep missing from history" "$DEPS_LINE1"  "blocked:brief-010-api-v0-1"
+assert_eq "check-depends-on blocks when dep card not merged" "$DEPS_LINE1"  "blocked:brief-010-api-v0-1"
 
 # Diagnostic line always emits, even in the error-fallback path (grep-debuggable).
 DEPS_LINE2=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 2p)
 case "$DEPS_LINE2" in
-    brief=*"depends_on="*"history_ids="*"match="*) pass "check-depends-on emits diagnostic line" ;;
+    brief=*"depends_on="*"merged_ids="*"match="*) pass "check-depends-on emits diagnostic line" ;;
     *) fail "check-depends-on diagnostic line — got '$DEPS_LINE2'" ;;
 esac
 
+# Restore merged status for subsequent tests
+sed -i '' 's/Status: queued/Status: merged/' "$SCRATCH/wiki/briefs/cards/brief-010-api-v0-1/index.md"
+
 # Multi-dep all-merged → allowed
-write_running "{
-    'active': [],
-    'completed_pending_eval': [],
-    'pending_merges': [],
-    'awaiting_review': [],
-    'history': [
-        {'brief': 'brief-010-foo', 'merged_at': '2026-04-22T00:00:00Z'},
-        {'brief': 'brief-011-bar', 'merged_at': '2026-04-22T01:00:00Z'}
-    ],
-    'queue': []
-}"
+mkdir -p "$SCRATCH/wiki/briefs/cards/brief-010-foo"
+cat > "$SCRATCH/wiki/briefs/cards/brief-010-foo/index.md" <<'CARDEOF'
+---
+id: brief-010-foo
+Status: merged
+---
+CARDEOF
+mkdir -p "$SCRATCH/wiki/briefs/cards/brief-011-bar"
+cat > "$SCRATCH/wiki/briefs/cards/brief-011-bar/index.md" <<'CARDEOF'
+---
+id: brief-011-bar
+Status: merged
+---
+CARDEOF
+git -C "$SCRATCH" add -A && git -C "$SCRATCH" commit -q -m "test: seed multidep merged cards" 2>/dev/null || true
 
 cat > "$SCRATCH/.loop/state/pending-dispatch.json" <<EOF
 {
@@ -411,14 +436,7 @@ DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n
 assert_eq "check-depends-on allows multi-dep when all merged" "$DEPS_LINE1"  "allowed"
 
 # Multi-dep one-missing → blocked on first unmet
-write_running "{
-    'active': [],
-    'completed_pending_eval': [],
-    'pending_merges': [],
-    'awaiting_review': [],
-    'history': [{'brief': 'brief-010-foo', 'merged_at': '2026-04-22T00:00:00Z'}],
-    'queue': []
-}"
+sed -i '' 's/Status: merged/Status: queued/' "$SCRATCH/wiki/briefs/cards/brief-011-bar/index.md"
 
 DEPS_LINE1=$(python3 "$ACTIONS" check-depends-on "$SCRATCH" 2>/dev/null | sed -n 1p)
 assert_eq "check-depends-on blocks multi-dep on first unmet" "$DEPS_LINE1"  "blocked:brief-011-bar"
@@ -2636,6 +2654,14 @@ cat > "$DEDUP_SCRATCH/.loop/briefs/brief-076-test.md" <<'DEOF'
 DEOF
 
 touch "$DEDUP_SCRATCH/.loop/state/log.jsonl"
+mkdir -p "$DEDUP_SCRATCH/wiki/briefs/cards/brief-076-test"
+cat > "$DEDUP_SCRATCH/wiki/briefs/cards/brief-076-test/index.md" <<'DCARD'
+---
+id: brief-076-test
+Status: queued
+---
+# Brief: dedup test
+DCARD
 git -C "$DEDUP_SCRATCH" add -A
 git -C "$DEDUP_SCRATCH" commit -q -m "test: init"
 
@@ -2714,7 +2740,6 @@ python3 -c "import json; json.dump({
     'completed_pending_eval': [],
     'pending_merges': [],
     'awaiting_review': [{'brief': 'brief-076-test', 'branch': 'brief-076-test', 'brief_file': '.loop/briefs/brief-076-test.md', 'auto_merge': False}],
-    'history': [],
     'queue': []
 }, open('$DEDUP_SCRATCH/.loop/state/running.json','w'), indent=2)"
 
@@ -2729,8 +2754,20 @@ else
     fail "dedup-clear: reject-brief did not write dedup-clear signal — expected $T79_SIGNAL"
 fi
 
-# Test 80: brief moved to history[] after rejection (sanity check + state integrity).
-assert_json "dedup-clear: brief in history[] after rejection"   "$DEDUP_RJ" "len(d['history'])"         "1"
+# Test 80: card Status → rejected after rejection (card-is-truth: no history[] write).
+DEDUP_CARD_STATUS=$(python3 -c "
+lines = open('$DEDUP_SCRATCH/wiki/briefs/cards/brief-076-test/index.md').readlines()
+in_fm = False
+for l in lines:
+    s = l.strip()
+    if s == '---':
+        if not in_fm: in_fm = True
+        else: break
+    elif in_fm and s.lower().startswith('status:'):
+        print(s.split(':',1)[1].strip())
+        break
+")
+assert_eq "dedup-clear: card Status → rejected after rejection"   "$DEDUP_CARD_STATUS"  "rejected"
 
 rm -rf "$DEDUP_SCRATCH"
 

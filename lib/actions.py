@@ -711,7 +711,7 @@ def approve_brief(paths, brief_id):
 # ─── Action: reject-brief ────────────────────────────────────────────
 
 def reject_brief(paths, brief_id, reason=""):
-    """Move a brief from awaiting_review[] to history[] with rejected marker."""
+    """Move a brief from awaiting_review[] and set card Status → rejected."""
     rc = load_running(paths)
     waiting = rc.get("awaiting_review", [])
 
@@ -730,12 +730,26 @@ def reject_brief(paths, brief_id, reason=""):
     moved["rejected_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     moved["reject_reason"] = reason
     rc["awaiting_review"] = new_waiting
-    rc.setdefault("history", []).append(moved)
     save_running(paths, rc)
+
+    # Update card Status → rejected (card-is-truth: no history[] write)
+    project_dir = paths["project_dir"]
+    _card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief_id, "index.md")
+    if os.path.exists(_card_path):
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from _set_card_status import set_card_status as _set_card_status_fn
+            _changed = _set_card_status_fn(_card_path, "rejected")
+            if _changed:
+                git(project_dir, "add", _card_path, check=False)
+                git(project_dir, "commit", "-m", f"loop: card status → rejected for {brief_id}", check=False)
+                log_action(paths, "card_status_set_rejected", {"brief": brief_id})
+        except Exception as e:
+            print(f"reject: card status update failed for {brief_id}: {e} (non-fatal)", file=sys.stderr)
 
     signal_dedup_clear(paths, brief_id)
     log_action(paths, "reject-brief", {"brief": brief_id, "reason": reason})
-    print(f"Rejected {brief_id}: moved to history")
+    print(f"Rejected {brief_id}: card Status → rejected")
     return True
 
 
@@ -911,6 +925,21 @@ def dispatch(paths):
         "worker_slot": worker_slot,
     })
     save_running(paths, rc)
+
+    # Update card Status → active (card-is-truth: queued → active on dispatch)
+    _card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief, "index.md")
+    if os.path.exists(_card_path):
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from _set_card_status import set_card_status as _set_card_status_fn
+            _changed = _set_card_status_fn(_card_path, "active")
+            if _changed:
+                git(project_dir, "add", _card_path, check=False)
+                git(project_dir, "commit", "-m", f"loop: card status → active for {brief}", check=False)
+                log_action(paths, "card_status_set_active", {"brief": brief})
+        except Exception as e:
+            print(f"dispatch: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
+
     git(project_dir, "push", remote, main_branch, check=False)
 
     # Remove queue file
@@ -1058,17 +1087,10 @@ def merge(paths):
     rc["pending_merges"] = [e for e in rc.get("pending_merges", []) if e.get("brief") != brief]
     rc["awaiting_review"] = [e for e in rc.get("awaiting_review", []) if e.get("brief") != brief]
 
-    rc.setdefault("history", []).append({
-        "brief": brief,
-        "branch": branch,
-        "merged_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "evaluation": evaluation,
-    })
     save_running(paths, rc)
 
-    # --- Producer-side cleanup (brief-107) ---
-    # Fires AFTER history[] write. If either step fails, log + continue —
-    # history[] is the SOT; cleanup is derivative.
+    # --- Producer-side cleanup (brief-107, extended brief-108) ---
+    # Card Status → merged is the permanent record (card-is-truth). No history[] write.
     _cleanup_staged = False
 
     _symlink_path = os.path.join(project_dir, ".loop", "briefs", f"{brief}.md")
@@ -1378,13 +1400,13 @@ def validator_presence_check(brief_file_path, worktree_dir):
 # ─── Action: check-depends-on ────────────────────────────────────────
 #
 # Brief-014 fix 1 + 2: parse **Depends-on:** from pending-dispatch brief,
-# compare against running.json history[]. Prints two lines to stdout:
+# compare against card Status==merged (card-is-truth, brief-108). Prints two lines to stdout:
 #   line 1: verdict — "allowed" or "blocked:<first-unmet-dep>"
-#   line 2: diagnostic — "brief=<id> depends_on=<list> history_ids=<list> match=<allowed|blocked:…>"
+#   line 2: diagnostic — "brief=<id> depends_on=<list> merged_ids=<list> match=<allowed|blocked:…>"
 # Diagnostic always emits regardless of outcome so grep-debugging is cheap.
 
 def check_depends_on(paths):
-    """Verify pending-dispatch brief's Depends-on against merged history."""
+    """Verify pending-dispatch brief's Depends-on against card Status==merged."""
     # Inline import avoids circular dep at module load (assess.py imports from
     # the same tree but isn't a package sibling).
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1411,21 +1433,42 @@ def check_depends_on(paths):
 
         if not depends_on:
             print("allowed")
-            print(f"brief={brief_id} depends_on=[] history_ids=<skipped> match=allowed")
+            print(f"brief={brief_id} depends_on=[] merged_ids=<skipped> match=allowed")
             return True
 
-        with open(paths["running_file"]) as f:
-            rc = json.load(f)
-        history_ids = [h.get("brief", "") for h in rc.get("history", [])]
+        # Scan cards for merged status (card-is-truth: no history[] needed)
+        cards_dir = os.path.join(paths["project_dir"], "wiki", "briefs", "cards")
+        merged_ids = []
+        if os.path.isdir(cards_dir):
+            for card_id in os.listdir(cards_dir):
+                card_file = os.path.join(cards_dir, card_id, "index.md")
+                if not os.path.isfile(card_file):
+                    continue
+                try:
+                    in_fm = False
+                    with open(card_file) as cf:
+                        for line in cf:
+                            stripped = line.strip()
+                            if stripped == "---":
+                                if not in_fm:
+                                    in_fm = True
+                                else:
+                                    break
+                            elif in_fm and stripped.lower().startswith("status:"):
+                                if stripped.split(":", 1)[1].strip().lower() == "merged":
+                                    merged_ids.append(card_id)
+                                break
+                except Exception:
+                    pass
 
-        unmet = [d for d in depends_on if d not in history_ids]
+        unmet = [d for d in depends_on if not any(_brief_id_matches(d, m) for m in merged_ids)]
         if unmet:
             verdict = f"blocked:{unmet[0]}"
             print(verdict)
-            print(f"brief={brief_id} depends_on={depends_on} history_ids={history_ids} match={verdict}")
+            print(f"brief={brief_id} depends_on={depends_on} merged_ids={merged_ids} match={verdict}")
             return True
         print("allowed")
-        print(f"brief={brief_id} depends_on={depends_on} history_ids={history_ids} match=allowed")
+        print(f"brief={brief_id} depends_on={depends_on} merged_ids={merged_ids} match=allowed")
         return True
     except Exception as e:
         # Fail open: don't block dispatch on a parse error. Still emit
