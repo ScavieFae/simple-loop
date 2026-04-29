@@ -680,9 +680,8 @@ pub struct PendingBrief {
 pub struct QueuedBrief {
     pub brief: String,
     /// Position in `.loop/state/goals.md` `## Queued next` (0 = top).
-    /// `None` for briefs present in `.loop/briefs/` but not named in
-    /// goals.md — these sort after ranked briefs in `brief_sort_key`
-    /// order (i.e. current numeric behavior).
+    /// `None` for cards not named in goals.md — these sort after ranked
+    /// briefs in `brief_sort_key` order (i.e. current numeric behavior).
     pub priority_rank: Option<usize>,
     /// Env var names listed in `**Depends-on-secrets:**` frontmatter, if any.
     /// Non-empty means this brief is credential-gated and won't dispatch until
@@ -910,7 +909,12 @@ pub fn parse_requeued_goals_md(goals_path: &Path, merged_briefs: &std::collectio
         let desc = {
             let s = trimmed.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ');
             let s = s.trim_start_matches('*').trim();
-            if s.len() > 80 { format!("{}…", &s[..77]) } else { s.to_string() }
+            if s.chars().count() > 80 {
+                let truncated: String = s.chars().take(77).collect();
+                format!("{}…", truncated)
+            } else {
+                s.to_string()
+            }
         };
         Some((brief_id.to_string(), desc))
     };
@@ -1214,57 +1218,6 @@ pub fn brief_id_matches(a: &str, b: &str) -> bool {
         || b.starts_with(&format!("{}-", a))
 }
 
-/// Scan `.loop/briefs/*.md` and return work-unit ids not in `exclude`.
-/// Any `.md` file that isn't the `_template.md` is treated as a work unit —
-/// covers `brief-NNN-*`, `audit-YYYY-MM-DD-N`, `capture-YYYY-MM-DD-N`, and
-/// whatever future types get added. Dirs and dotfiles are skipped.
-///
-/// Results are sorted by priority (from `goals_path` `## Queued next`)
-/// first, then by `brief_sort_key` (numeric/type-prefix) for unranked
-/// briefs. Missing or malformed goals.md degrades to pure numeric order.
-pub fn discover_queued_briefs(
-    briefs_dir: &Path,
-    exclude: &HashSet<String>,
-    goals_path: &Path,
-) -> Vec<QueuedBrief> {
-    let Ok(entries) = fs::read_dir(briefs_dir) else {
-        return vec![];
-    };
-    let priority = parse_goals_priority(goals_path);
-    let mut out: Vec<QueuedBrief> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(".md") || name.starts_with('.') || name == "_template.md" {
-            continue;
-        }
-        let brief_id = name.trim_end_matches(".md").to_string();
-        if exclude.iter().any(|ex| brief_id_matches(&brief_id, ex)) {
-            continue;
-        }
-        if parse_brief_status(&path).as_deref() == Some("not-doing") {
-            continue;
-        }
-        let priority_rank = priority.iter().position(|p| priority_matches(p, &brief_id));
-        let depends_on_secrets = parse_depends_on_secrets(&path);
-        out.push(QueuedBrief {
-            brief: brief_id,
-            priority_rank,
-            depends_on_secrets,
-        });
-    }
-    out.sort_by(|a, b| {
-        let rank_a = a.priority_rank.unwrap_or(usize::MAX);
-        let rank_b = b.priority_rank.unwrap_or(usize::MAX);
-        rank_a
-            .cmp(&rank_b)
-            .then_with(|| brief_sort_key(&a.brief).cmp(&brief_sort_key(&b.brief)))
-    });
-    out
-}
-
 /// Scan `wiki/briefs/cards/*/index.md` and return entries whose `Status:` is
 /// `queued`. Ordered by priority (from `goals_path` `## Queued next`) first,
 /// then by `brief_sort_key` for unranked entries.
@@ -1397,8 +1350,7 @@ pub fn discover_recently_finished_from_cards(cards_dir: &Path) -> Vec<RecentlyFi
 /// Scan `wiki/briefs/cards/*/` for card dirs not already accounted for in
 /// active/pending/queued/history. Accepts any work-unit prefix (`brief-`,
 /// `audit-`, `capture-`, etc). These are drafts: the identifier is claimed
-/// but the work isn't dispatch-ready (missing `index.md`, missing
-/// `.loop/briefs/` symlink, or both).
+/// but the work isn't dispatch-ready (missing `index.md` or `Status: queued`).
 pub fn discover_draft_briefs(cards_dir: &Path, exclude: &HashSet<String>) -> Vec<DraftBrief> {
     let Ok(entries) = fs::read_dir(cards_dir) else {
         return vec![];
@@ -2640,33 +2592,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn discover_queued_briefs_excludes_not_doing() {
-        let dir = std::env::temp_dir().join(format!(
-            "hive_queued_excl_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // normal queued brief
-        std::fs::write(dir.join("brief-010-normal.md"), "**Status:** queued\n").unwrap();
-        // not-doing brief — must be filtered out
-        std::fs::write(dir.join("brief-011-declined.md"), "**Status:** not-doing\n").unwrap();
-        // no status field — treated as queued (existing behaviour)
-        std::fs::write(dir.join("brief-012-nostatus.md"), "# Just a brief\n").unwrap();
-
-        let exclude = HashSet::new();
-        let goals = std::env::temp_dir().join("hive_goals_missing.md");
-        let result = discover_queued_briefs(&dir, &exclude, &goals);
-        let ids: Vec<&str> = result.iter().map(|b| b.brief.as_str()).collect();
-        assert!(ids.contains(&"brief-010-normal"), "normal queued brief must appear");
-        assert!(!ids.contains(&"brief-011-declined"), "not-doing brief must be excluded from queue");
-        assert!(ids.contains(&"brief-012-nostatus"), "brief without status field must appear");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
 
     #[test]
     fn pid_alive_for_current_process() {
@@ -3533,37 +3458,6 @@ some non-bracket junk line
     }
 
     #[test]
-    fn discover_queued_accepts_non_brief_prefixes() {
-        let dir = std::env::temp_dir().join(format!(
-            "hive_queue_multi_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in &[
-            "brief-016-foo.md",
-            "audit-2026-04-22-01.md",
-            "capture-2026-04-22-01.md",
-            "_template.md",     // skipped
-            ".hidden.md",       // skipped
-            "random.txt",       // skipped
-        ] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let exclude = HashSet::new();
-        let missing_goals = dir.join("nonexistent-goals.md");
-        let queued = discover_queued_briefs(&dir, &exclude, &missing_goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["audit-2026-04-22-01", "brief-016-foo", "capture-2026-04-22-01"]
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn parse_cycle_budget_uses_max_integer_for_dual_bound_briefs() {
         // brief-011 in the wild: first integer is 8 (soft cap), but the
         // section names 8-10 as the real upper range. Expect 10.
@@ -3742,60 +3636,6 @@ some non-bracket junk line
         assert!(drafts[1].has_index, "brief-012 has index.md");
 
         std::fs::remove_dir_all(&cards).ok();
-    }
-
-    #[test]
-    fn discover_queued_briefs_excludes_history_and_active() {
-        let dir = std::env::temp_dir().join(format!(
-            "hive_queue_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in &[
-            "brief-001-old.md",
-            "brief-008-pending.md",
-            "brief-009-queued.md",
-            "brief-011-also-queued.md",
-            "_template.md",
-        ] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let mut exclude = HashSet::new();
-        exclude.insert("brief-001-old".to_string());
-        exclude.insert("brief-008-pending".to_string());
-        let missing_goals = dir.join("nonexistent-goals.md");
-        let queued = discover_queued_briefs(&dir, &exclude, &missing_goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        assert_eq!(ids, vec!["brief-009-queued", "brief-011-also-queued"]);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discover_queued_briefs_excludes_truncated_history_id() {
-        // Running.json history often has short IDs like "brief-102" while the
-        // .loop/briefs/ symlink is named "brief-102-loop-status-blocked-state-surface".
-        // brief_id_matches() must bridge this gap.
-        let dir = std::env::temp_dir().join(format!(
-            "hive_queue_trunc_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Full-slug file that should be excluded by the truncated history ID "brief-102"
-        std::fs::write(dir.join("brief-102-loop-status-blocked-state-surface.md"), "body").unwrap();
-        std::fs::write(dir.join("brief-103-agent-metrics.md"), "body").unwrap();
-        let mut exclude = HashSet::new();
-        exclude.insert("brief-102".to_string()); // truncated — as written by backfill
-        let missing_goals = dir.join("nonexistent-goals.md");
-        let queued = discover_queued_briefs(&dir, &exclude, &missing_goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        assert_eq!(ids, vec!["brief-103-agent-metrics"], "truncated history ID must exclude full-slug file");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── parse_goals_priority ──────────────────────────────────────────────
@@ -3999,205 +3839,6 @@ some non-bracket junk line
         assert!(!priority_matches("brief-018", "brief-017-foo"));
     }
 
-    // ── queued_sort_respects_priority ─────────────────────────────────────
-
-    fn tmp_briefs_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hive_queued_sort_{}_{}",
-            tag,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// Return a goals.md path in the same parent tempdir as `dir`, but
-    /// outside `dir` itself — `discover_queued_briefs` scans `dir` for
-    /// `.md` files, so a goals.md inside it would leak as a queued brief.
-    fn tmp_goals_sibling(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.parent().unwrap().join(format!(
-            "{}-goals.md",
-            dir.file_name().unwrap().to_string_lossy()
-        ))
-    }
-
-    #[test]
-    fn queued_sort_respects_priority_all_ranked() {
-        let dir = tmp_briefs_dir("all-ranked");
-        for name in &[
-            "brief-016-a.md",
-            "brief-017-b.md",
-            "brief-020-c.md",
-        ] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let goals = tmp_goals_sibling(&dir);
-        std::fs::write(
-            &goals,
-            "## Queued next\n\
-             1. **brief-017-b** — first.\n\
-             2. **brief-020-c** — second.\n\
-             3. **brief-016-a** — third.\n",
-        )
-        .unwrap();
-        let queued = discover_queued_briefs(&dir, &HashSet::new(), &goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        assert_eq!(ids, vec!["brief-017-b", "brief-020-c", "brief-016-a"]);
-        let ranks: Vec<_> = queued.iter().map(|q| q.priority_rank).collect();
-        assert_eq!(ranks, vec![Some(0), Some(1), Some(2)]);
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_file(&goals).ok();
-    }
-
-    #[test]
-    fn queued_sort_mixes_ranked_and_unranked() {
-        let dir = tmp_briefs_dir("mixed");
-        for name in &[
-            "brief-016-a.md",
-            "brief-019-d.md",
-            "brief-020-c.md",
-            "brief-022-e.md",
-        ] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let goals = tmp_goals_sibling(&dir);
-        std::fs::write(
-            &goals,
-            "## Queued next\n\
-             1. **brief-020-c** — top.\n\
-             2. **brief-016-a** — second.\n",
-        )
-        .unwrap();
-        let queued = discover_queued_briefs(&dir, &HashSet::new(), &goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        // Ranked lead in goals order, then unranked in numeric order.
-        assert_eq!(
-            ids,
-            vec!["brief-020-c", "brief-016-a", "brief-019-d", "brief-022-e"]
-        );
-        let ranks: Vec<_> = queued.iter().map(|q| q.priority_rank).collect();
-        assert_eq!(ranks, vec![Some(0), Some(1), None, None]);
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_file(&goals).ok();
-    }
-
-    #[test]
-    fn queued_sort_all_unranked_matches_current_numeric_behavior() {
-        let dir = tmp_briefs_dir("all-unranked");
-        for name in &[
-            "brief-020-c.md",
-            "brief-016-a.md",
-            "brief-019-d.md",
-        ] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let goals = tmp_goals_sibling(&dir);
-        std::fs::write(&goals, "## Queued next\n\n(nothing queued right now)\n").unwrap();
-        let queued = discover_queued_briefs(&dir, &HashSet::new(), &goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        assert_eq!(ids, vec!["brief-016-a", "brief-019-d", "brief-020-c"]);
-        assert!(queued.iter().all(|q| q.priority_rank.is_none()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_file(&goals).ok();
-    }
-
-    #[test]
-    fn queued_sort_handles_malformed_goals_gracefully() {
-        let dir = tmp_briefs_dir("malformed");
-        for name in &["brief-020-c.md", "brief-016-a.md"] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let goals = tmp_goals_sibling(&dir);
-        // No structure, no ids — parser returns empty list, sort falls
-        // back to pure numeric.
-        std::fs::write(&goals, "just some free-form prose, no headings no lists\n").unwrap();
-        let queued = discover_queued_briefs(&dir, &HashSet::new(), &goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        assert_eq!(ids, vec!["brief-016-a", "brief-020-c"]);
-        assert!(queued.iter().all(|q| q.priority_rank.is_none()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_file(&goals).ok();
-    }
-
-    #[test]
-    fn queued_sort_handles_missing_heading() {
-        let dir = tmp_briefs_dir("missing-heading");
-        for name in &["brief-020-c.md", "brief-016-a.md"] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let goals = tmp_goals_sibling(&dir);
-        std::fs::write(
-            &goals,
-            "# Goals\n\n## Done\n- **brief-001-foo** — merged.\n",
-        )
-        .unwrap();
-        let queued = discover_queued_briefs(&dir, &HashSet::new(), &goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        assert_eq!(ids, vec!["brief-016-a", "brief-020-c"]);
-        assert!(queued.iter().all(|q| q.priority_rank.is_none()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_file(&goals).ok();
-    }
-
-    #[test]
-    fn queued_sort_ignores_priority_id_without_matching_file() {
-        let dir = tmp_briefs_dir("phantom-priority");
-        for name in &["brief-020-c.md"] {
-            std::fs::write(dir.join(name), "body").unwrap();
-        }
-        let goals = tmp_goals_sibling(&dir);
-        std::fs::write(
-            &goals,
-            "## Queued next\n\
-             1. **brief-404-gone** — id in goals.md but no file.\n\
-             2. **brief-020-c** — real.\n",
-        )
-        .unwrap();
-        let queued = discover_queued_briefs(&dir, &HashSet::new(), &goals);
-        let ids: Vec<_> = queued.iter().map(|q| q.brief.as_str()).collect();
-        // Phantom id in goals.md is skipped; real id gets rank from its
-        // position (index 1 in the priority list).
-        assert_eq!(ids, vec!["brief-020-c"]);
-        assert_eq!(queued[0].priority_rank, Some(1));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_file(&goals).ok();
-    }
-
-    /// Live-data smoke test against the real `.loop/state/goals.md` and
-    /// `.loop/briefs/` in the repo. Guarded by `HIVE_LIVE_VERIFY=1` so it
-    /// only runs on demand (won't break if goals.md is reordered tomorrow).
-    /// Used for brief-021 manual verification; keep around as a reusable
-    /// sanity probe.
-    #[test]
-    fn live_goals_priority_smoke() {
-        if std::env::var("HIVE_LIVE_VERIFY").ok().as_deref() != Some("1") {
-            return;
-        }
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let root = manifest
-            .ancestors()
-            .find(|p| p.join(".loop/state/goals.md").exists())
-            .expect("portal root with .loop/state/goals.md not found");
-        let goals = root.join(".loop/state/goals.md");
-        let briefs = root.join(".loop/briefs");
-
-        let priority = parse_goals_priority(&goals);
-        eprintln!("parse_goals_priority({}) → {:?}", goals.display(), priority);
-        assert!(!priority.is_empty(), "expected at least one priority id");
-
-        let mut exclude = HashSet::new();
-        // Simulate brief-017 being Active (as it is per goals.md today).
-        exclude.insert("brief-017-pi0-real-integration".to_string());
-        let queued = discover_queued_briefs(&briefs, &exclude, &goals);
-        eprintln!("Queued (brief-017 Active):");
-        for q in &queued {
-            eprintln!("  rank={:?}  brief={}", q.priority_rank, q.brief);
-        }
-    }
-
     // ── parse_requeued_goals_md tests (brief-102) ─────────────────────────────
 
     fn write_goals(content: &str) -> std::path::PathBuf {
@@ -4318,6 +3959,31 @@ some non-bracket junk line
         let result = parse_requeued_goals_md(&path, &merged);
         assert_eq!(result.len(), 1);
         assert!(result[0].ready_to_dispatch, "truncated history entry must clear full-slug blocked-on id");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn requeued_parse_truncates_at_char_boundary_with_em_dash() {
+        // Regression: byte-indexed `&s[..77]` panicked when the boundary landed
+        // inside a multi-byte UTF-8 char. Mattie's standard brief-description
+        // shape `**brief-NNN (subject)** — **status:** ...` reliably puts the
+        // second em-dash near byte 77 for subjects ~50–65 chars long.
+        // The fix: char-counted truncation (`.chars().take(77).collect()`).
+        let path = write_goals(
+            "## Queued next\n\
+             1. brief-107-daemon-producer-state-cleanup-on-merge — dispatchable now — harness brief touching daemon contract.\n\
+               **Blocked-on:** brief-100\n",
+        );
+        let merged = HashSet::new();
+        let result = parse_requeued_goals_md(&path, &merged);
+        assert_eq!(result.len(), 1, "must parse without panic");
+        assert!(
+            result[0].description.ends_with('…'),
+            "long description must be truncated with ellipsis; got: {:?}",
+            result[0].description
+        );
+        // Truncated string must itself be valid UTF-8.
+        let _ = result[0].description.chars().count();
         std::fs::remove_file(&path).ok();
     }
 

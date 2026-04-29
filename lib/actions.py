@@ -297,7 +297,7 @@ def parse_requeued_briefs(goals_path, running_path=None):
                     for line in content.splitlines():
                         low = line.lower().strip()
                         if low.startswith("status:") or "**status:**" in low:
-                            val = low.split("status:")[-1].strip().strip("*.,;")
+                            val = low.split("status:")[-1].strip().strip("*.,;").strip()
                             if val == "merged":
                                 merged_briefs.add(card_dir.name)
                             break
@@ -1104,19 +1104,9 @@ def merge(paths):
 
     save_running(paths, rc)
 
-    # --- Producer-side cleanup (brief-107, extended brief-108) ---
+    # --- Producer-side cleanup (brief-107, brief-108) ---
     # Card Status → merged is the permanent record (card-is-truth). No history[] write.
     _cleanup_staged = False
-
-    _symlink_path = os.path.join(project_dir, ".loop", "briefs", f"{brief}.md")
-    if os.path.lexists(_symlink_path):
-        try:
-            git(project_dir, "rm", "--force", "-q", _symlink_path, check=False)
-            _cleanup_staged = True
-            print(f"cleanup: removed symlink .loop/briefs/{brief}.md")
-            log_action(paths, "cleanup_symlink_removed", {"brief": brief})
-        except Exception as e:
-            print(f"cleanup: symlink removal failed for {brief}: {e} (non-fatal)", file=sys.stderr)
 
     _card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief, "index.md")
     if os.path.exists(_card_path):

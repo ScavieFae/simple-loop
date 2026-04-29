@@ -117,7 +117,6 @@ cmd_init() {
             echo "  .loop/state/running.json"
             echo "  .loop/state/goals.md"
             echo "  .loop/state/stewardship-log.md"
-            echo "  .loop/briefs/README.md"
             echo "  .loop/signals/"
             echo "  .loop/config.json"
             if [ "$_init_mode" = "wiki-full" ]; then
@@ -135,10 +134,10 @@ cmd_init() {
             return 0
         fi
 
-        mkdir -p .loop/state .loop/briefs .loop/signals
+        mkdir -p .loop/state .loop/signals
 
         cat > .loop/state/running.json <<'JSON'
-{"active": [], "completed_pending_eval": [], "pending_merges": [], "awaiting_review": [], "history": []}
+{"active": [], "completed_pending_eval": [], "pending_merges": [], "awaiting_review": []}
 JSON
 
         cat > .loop/state/goals.md <<'MD'
@@ -153,17 +152,6 @@ MD
 
         cat > .loop/state/stewardship-log.md <<'MD'
 # Stewardship Log
-MD
-
-        cat > .loop/briefs/README.md <<'MD'
-# Briefs
-
-Brief files here are symlinks into `wiki/briefs/cards/<brief-id>/index.md`.
-
-To add a brief:
-```
-ln -s ../../wiki/briefs/cards/<brief-id>/index.md .loop/briefs/<brief-id>.md
-```
 MD
 
         cat > .loop/config.json <<CJSON
@@ -269,7 +257,7 @@ MD
 
 Each brief lives in its own directory here: `cards/brief-NNN-slug/`. The card collects all artifacts for one brief:
 
-- `index.md` — the brief itself (symlinked from `.loop/briefs/brief-NNN-slug.md`)
+- `index.md` — the brief itself (Status: frontmatter is the source of truth for brief state)
 - `plan.md` — implementation plan (optional, written by worker)
 - `closeout.md` — summary written at completion
 - `evaluation.md` — validator review
@@ -277,9 +265,8 @@ Each brief lives in its own directory here: `cards/brief-NNN-slug/`. The card co
 ## Adding a brief
 
 1. Create a directory: `mkdir wiki/briefs/cards/brief-NNN-slug/`
-2. Write the brief: `wiki/briefs/cards/brief-NNN-slug/index.md`
-3. Symlink it: `ln -s ../../wiki/briefs/cards/brief-NNN-slug/index.md .loop/briefs/brief-NNN-slug.md`
-4. Add it to `goals.md` under `## Queued next`.
+2. Write the brief: `wiki/briefs/cards/brief-NNN-slug/index.md` with `Status: queued` in frontmatter
+3. Add it to `goals.md` under `## Queued next` (for priority ordering).
 MD
 
             cat > wiki/briefs/runway.md <<'MD'
@@ -651,7 +638,7 @@ GHMSG
     echo "  Creating .loop/..."
 
     # Scaffold directories
-    mkdir -p .loop/{prompts,briefs,state/signals,evaluations,knowledge,logs,modules}
+    mkdir -p .loop/{prompts,state/signals,evaluations,knowledge,logs,modules}
 
     # Write config
     cat > .loop/config.sh <<CONF
@@ -674,7 +661,6 @@ CONF
         # From installed location
         cp "$TEMPLATES_DIR/prompts/worker.md" .loop/prompts/worker.md
         cp "$TEMPLATES_DIR/prompts/conductor.md" .loop/prompts/conductor.md
-        cp "$TEMPLATES_DIR/brief-template.md" .loop/briefs/.template.md
     else
         # Running from source — look relative to this script
         local script_dir
@@ -682,7 +668,6 @@ CONF
         if [ -d "$script_dir/templates" ]; then
             cp "$script_dir/templates/prompts/worker.md" .loop/prompts/worker.md
             cp "$script_dir/templates/prompts/conductor.md" .loop/prompts/conductor.md
-            cp "$script_dir/templates/brief-template.md" .loop/briefs/.template.md
         else
             echo "  Warning: template directory not found. Creating minimal templates."
             echo "# Worker Prompt — edit this" > .loop/prompts/worker.md
@@ -701,7 +686,8 @@ CONF
 {
   "active": [],
   "completed_pending_eval": [],
-  "history": []
+  "pending_merges": [],
+  "awaiting_review": []
 }
 JSON
 
@@ -879,7 +865,7 @@ Branch name: brief-${num}-${slug}
 
 Read .loop/state/goals.md for project context.
 Read .loop/knowledge/learnings.md for accumulated knowledge.
-Follow the brief format in .loop/briefs/.template.md if it exists."
+Follow the brief format in wiki/briefs/_template.md if it exists."
 
         if [ -f "$brief_file" ]; then
             echo ""

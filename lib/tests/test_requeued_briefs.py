@@ -77,7 +77,12 @@ class TestParseRequeuedBriefs(unittest.TestCase):
     def test_blocking_brief_merged_sets_ready(self):
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
-            goals = _write(tmp, "goals.md", """\
+            # goals.md must be at .loop/state/goals.md so that
+            # parse_requeued_briefs derives project root correctly.
+            goals_dir = tmp / ".loop" / "state"
+            goals_dir.mkdir(parents=True)
+            goals = str(goals_dir / "goals.md")
+            (goals_dir / "goals.md").write_text("""\
 # Goals
 
 ## Queued next
@@ -85,13 +90,12 @@ class TestParseRequeuedBriefs(unittest.TestCase):
 1. **brief-099 (Recorder rebuild)** — blocked on brief-100.
    **Blocked-on:** brief-100
 """)
-            running = _write(tmp, "running.json", json.dumps({
-                "active": [],
-                "history": [
-                    {"brief": "brief-100", "merge_sha": "abc1234"},
-                ],
-            }))
-            result = parse_requeued_briefs(goals, running)
+            # Card-is-truth: mark brief-100 as merged via card Status:
+            card_dir = tmp / "wiki" / "briefs" / "cards" / "brief-100"
+            card_dir.mkdir(parents=True)
+            (card_dir / "index.md").write_text("**Status:** merged\n")
+
+            result = parse_requeued_briefs(goals)
             self.assertEqual(len(result), 1)
             self.assertTrue(result[0]["ready_to_dispatch"])
 
@@ -136,11 +140,14 @@ class TestParseRequeuedBriefs(unittest.TestCase):
             self.assertEqual(result[0]["brief_id"], "brief-067-cont")
             self.assertEqual(result[0]["blocked_on"], "brief-067")
 
-    def test_ready_when_history_has_full_slug_goals_has_short_id(self):
-        """goals.md: **Blocked-on:** brief-101 (short) — history: brief-101-code-change-review-shape (full slug)."""
+    def test_ready_when_card_has_full_slug_goals_has_short_id(self):
+        """goals.md: **Blocked-on:** brief-101 (short) — card: brief-101-code-change-review-shape (full slug)."""
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
-            goals = _write(tmp, "goals.md", """\
+            goals_dir = tmp / ".loop" / "state"
+            goals_dir.mkdir(parents=True)
+            goals = str(goals_dir / "goals.md")
+            (goals_dir / "goals.md").write_text("""\
 # Goals
 
 ## Queued next
@@ -148,22 +155,23 @@ class TestParseRequeuedBriefs(unittest.TestCase):
 1. **brief-103 (metrics)** — blocked on brief-101.
    **Blocked-on:** brief-101
 """)
-            running = _write(tmp, "running.json", json.dumps({
-                "active": [],
-                "history": [
-                    {"brief": "brief-101-code-change-review-shape", "merge_sha": "abc1234"},
-                ],
-            }))
-            result = parse_requeued_briefs(goals, running)
+            card_dir = tmp / "wiki" / "briefs" / "cards" / "brief-101-code-change-review-shape"
+            card_dir.mkdir(parents=True)
+            (card_dir / "index.md").write_text("**Status:** merged\n")
+
+            result = parse_requeued_briefs(goals)
             self.assertEqual(len(result), 1)
             self.assertTrue(result[0]["ready_to_dispatch"],
-                            "full-slug history entry must clear short blocked-on id")
+                            "full-slug card must clear short blocked-on id")
 
-    def test_ready_when_history_has_short_id_goals_has_full_slug(self):
-        """goals.md: **Blocked-on:** brief-102-loop-status-blocked-state-surface (full) — history: brief-102 (truncated)."""
+    def test_ready_when_card_has_short_id_goals_has_full_slug(self):
+        """goals.md: **Blocked-on:** brief-102-loop-status-blocked-state-surface (full) — card: brief-102 (short)."""
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
-            goals = _write(tmp, "goals.md", """\
+            goals_dir = tmp / ".loop" / "state"
+            goals_dir.mkdir(parents=True)
+            goals = str(goals_dir / "goals.md")
+            (goals_dir / "goals.md").write_text("""\
 # Goals
 
 ## Queued next
@@ -171,16 +179,14 @@ class TestParseRequeuedBriefs(unittest.TestCase):
 1. **brief-103 (metrics)** — blocked on brief-102.
    **Blocked-on:** brief-102-loop-status-blocked-state-surface
 """)
-            running = _write(tmp, "running.json", json.dumps({
-                "active": [],
-                "history": [
-                    {"brief": "brief-102", "merge_sha": "def5678"},
-                ],
-            }))
-            result = parse_requeued_briefs(goals, running)
+            card_dir = tmp / "wiki" / "briefs" / "cards" / "brief-102"
+            card_dir.mkdir(parents=True)
+            (card_dir / "index.md").write_text("**Status:** merged\n")
+
+            result = parse_requeued_briefs(goals)
             self.assertEqual(len(result), 1)
             self.assertTrue(result[0]["ready_to_dispatch"],
-                            "truncated history entry must clear full-slug blocked-on id")
+                            "short-slug card must clear full-slug blocked-on id")
 
     def test_no_false_positive_on_numeric_prefix_overlap(self):
         """brief-1010 must not match brief-101."""

@@ -698,13 +698,13 @@ def check_review_md_shape(content: str, brief_path: Path, project_root: Path) ->
 
 # ── Check 12: goals.md state-prose ───────────────────────────
 
-# Brief-104: goals.md is "priority intent only" — state prose ("merged",
-# "rejected", etc.) bleeds display surfaces (hive Queued shows merged briefs).
-# Severity: WARNING (fail-permissive during transition; flip to ERROR post-sweep).
-_GOALS_STATE_SEVERITY = WARNING
+# Brief-104 + Brief-108: goals.md is "priority intent only" — state prose
+# ("merged", "rejected", "killed", etc.) bleeds display surfaces (hive Queued
+# shows merged briefs). Severity: ERROR (strict; goals.md sweep completed 2026-04-29).
+_GOALS_STATE_SEVERITY = ERROR
 
 _GOALS_STATE_PATTERNS: List[Tuple["re.Pattern[str]", str]] = [
-    # ~~strikethrough~~ — visual "this is done" that belongs in running.json
+    # ~~strikethrough~~ — visual "this is done" that belongs in cards
     (re.compile(r"~~.+~~"), "strikethrough"),
     # [MERGED sha/date] — bracketed merge receipt
     (re.compile(r"\[MERGED\b", re.IGNORECASE), "bracketed MERGED"),
@@ -723,18 +723,27 @@ _GOALS_STATE_PATTERNS: List[Tuple["re.Pattern[str]", str]] = [
     # "completed" or "shipped" as terminal state words
     (re.compile(r"\bcompleted\b", re.IGNORECASE), "completed state"),
     (re.compile(r"\bshipped\b", re.IGNORECASE), "shipped state"),
+    # "Recently merged" — historical list masquerading as queue
+    (re.compile(r"\brecently\s+merged\b", re.IGNORECASE), "recently merged section"),
+    # "Killed YYYY-MM-DD" — dead-brief state label
+    (re.compile(r"\bKilled\s+\d{4}-\d{2}-\d{2}"), "Killed+date"),
+    # "Rejected YYYY-MM-DD" — rejected-brief state label (title case)
+    (re.compile(r"\bRejected\s+\d{4}-\d{2}-\d{2}"), "Rejected+date"),
+    # "(forensic)" — archaeic forensic-section label
+    (re.compile(r"\(forensic\)"), "forensic label"),
 ]
 
 
 def check_goals_md_state_prose(content: str, goals_path: Path, project_root: Path) -> List[Issue]:
-    """goals.md must not carry state prose — state lives in running.json.
+    """goals.md must not carry state prose — state lives in card Status: frontmatter.
 
     Flags patterns that indicate state bleeding into goals.md entries:
     strikethrough, bracketed state keywords, merged+sha/date, REJECTED,
-    KILL, ABSORBED into, completed, shipped.
+    KILL, ABSORBED into, completed, shipped, recently merged, Killed+date,
+    Rejected+date, forensic labels.
 
-    Severity: WARNING (fail-permissive; escalate to ERROR after sweep clears
-    the existing state prose). Deterministic regex only — no LLM calls.
+    Severity: ERROR (strict; goals.md sweep completed 2026-04-29 per brief-108).
+    Deterministic regex only — no LLM calls.
     """
     issues: List[Issue] = []
     for lineno, line in enumerate(content.splitlines(), start=1):
