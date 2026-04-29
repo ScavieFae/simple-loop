@@ -696,6 +696,79 @@ def check_review_md_shape(content: str, brief_path: Path, project_root: Path) ->
     return issues
 
 
+# ── Check 12: goals.md state-prose ───────────────────────────
+
+# Brief-104: goals.md is "priority intent only" — state prose ("merged",
+# "rejected", etc.) bleeds display surfaces (hive Queued shows merged briefs).
+# Severity: WARNING (fail-permissive during transition; flip to ERROR post-sweep).
+_GOALS_STATE_SEVERITY = WARNING
+
+_GOALS_STATE_PATTERNS: List[Tuple["re.Pattern[str]", str]] = [
+    # ~~strikethrough~~ — visual "this is done" that belongs in running.json
+    (re.compile(r"~~.+~~"), "strikethrough"),
+    # [MERGED sha/date] — bracketed merge receipt
+    (re.compile(r"\[MERGED\b", re.IGNORECASE), "bracketed MERGED"),
+    # [REJECTED] — bracketed rejection receipt
+    (re.compile(r"\[REJECTED\b", re.IGNORECASE), "bracketed REJECTED"),
+    # MERGED + INSTALLED + VERIFIED — post-install state marker
+    (re.compile(r"\bMERGED\s*\+\s*INSTALLED", re.IGNORECASE), "MERGED+INSTALLED+VERIFIED"),
+    # "merged <sha>" or "merged YYYY-MM-DD" — inline merge receipt
+    (re.compile(r"\bmerged\s+(?:`?[0-9a-f]{5,}`?|\d{4}-\d{2}-\d{2})", re.IGNORECASE), "merged+sha/date"),
+    # REJECTED — or REJECTED YYYY-MM-DD (all-caps only; lowercase "rejected" in prose is common)
+    (re.compile(r"\bREJECTED\s*(?:—|–|--|2\d{3}-\d{2}-\d{2})"), "REJECTED state"),
+    # KILL as a bare disposition (all-caps to avoid "skill", etc.)
+    (re.compile(r"\bKILL\b"), "KILL disposition"),
+    # ABSORBED into — explicit absorption language
+    (re.compile(r"\bABSORBED\s+into\b", re.IGNORECASE), "ABSORBED into"),
+    # "completed" or "shipped" as terminal state words
+    (re.compile(r"\bcompleted\b", re.IGNORECASE), "completed state"),
+    (re.compile(r"\bshipped\b", re.IGNORECASE), "shipped state"),
+]
+
+
+def check_goals_md_state_prose(content: str, goals_path: Path, project_root: Path) -> List[Issue]:
+    """goals.md must not carry state prose — state lives in running.json.
+
+    Flags patterns that indicate state bleeding into goals.md entries:
+    strikethrough, bracketed state keywords, merged+sha/date, REJECTED,
+    KILL, ABSORBED into, completed, shipped.
+
+    Severity: WARNING (fail-permissive; escalate to ERROR after sweep clears
+    the existing state prose). Deterministic regex only — no LLM calls.
+    """
+    issues: List[Issue] = []
+    for lineno, line in enumerate(content.splitlines(), start=1):
+        for pattern, label in _GOALS_STATE_PATTERNS:
+            if pattern.search(line):
+                snippet = line.strip()[:120]
+                issues.append(Issue(
+                    severity=_GOALS_STATE_SEVERITY,
+                    message=f"Line {lineno}: goals.md state-y prose ({label}): `{snippet}`",
+                    expected="goals.md carries priority intent only. State (merged, rejected, etc.) lives in running.json. Shipped entries get DELETED on next sweep, not struck-through.",
+                    fix="Remove state prose from this line. If the entry has shipped, delete the line entirely.",
+                ))
+                break  # one issue per line, even if multiple patterns match
+    return issues
+
+
+GOALS_CHECKS: List[Tuple[str, Callable]] = [
+    ("goals-state-prose", check_goals_md_state_prose),
+]
+
+
+def lint_goals_md(goals_path: Path, project_root: Path) -> List[Issue]:
+    """Run goals.md-specific lint checks."""
+    try:
+        content = goals_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return [Issue(severity=ERROR, message=f"Cannot read file: {e}")]
+
+    issues: List[Issue] = []
+    for _name, check_fn in GOALS_CHECKS:
+        issues.extend(check_fn(content, goals_path, project_root))
+    return issues
+
+
 # ── Check registry ────────────────────────────────────────────
 
 CHECKS: List[Tuple[str, Callable]] = [
@@ -835,6 +908,23 @@ def main(argv: List[str] = None) -> int:
     if not project_root:
         # Fall back: use target's root or cwd
         project_root = Path.cwd()
+
+    # goals.md lint mode — different check set than brief files
+    if target.is_file() and target.name == "goals.md":
+        issues = lint_goals_md(target, project_root)
+        try:
+            rel = target.relative_to(project_root)
+        except ValueError:
+            rel = target
+        if issues:
+            print(format_issues(str(rel), issues))
+            print()
+            issue_word = "issue" if len(issues) == 1 else "issues"
+            print(f"{len(issues)} {issue_word} in goals.md.")
+            return 1
+        else:
+            print("✓ Clean (goals.md).")
+            return 0
 
     # Collect brief files to lint
     brief_files: List[Path] = []

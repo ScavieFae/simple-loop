@@ -20,6 +20,8 @@ from lint import (
     check_adr_resolution,
     check_mandatory_reading_links,
     check_status_consistency,
+    check_goals_md_state_prose,
+    lint_goals_md,
     lint_file,
     main,
 )
@@ -441,6 +443,159 @@ class TestMainDirFilter(unittest.TestCase):
             # Default: excluded (status != queued); --all: included → clean, exit 0
             self.assertEqual(main([str(cards)]), 0)       # excluded by default
             self.assertEqual(main(["--all", str(cards)]), 0)  # included with --all
+
+
+# ── Check 12: goals-state-prose ──────────────────────────────────────────────
+
+CLEAN_GOALS = """\
+# Goals
+
+## Queued next
+
+1. **brief-042 (scene reset)** — dispatchable now. Resets the sim on Run.
+2. **brief-043 (camera polish)** — Depends-on brief-042.
+
+## Done
+
+- brief-001 — initial spike.
+"""
+
+STALE_GOALS_STRIKETHROUGH = """\
+# Goals
+
+## Queued next
+
+~~1. **[MERGED abc1234 2026-04-28] brief-042 (scene reset)**~~
+2. **brief-043 (camera polish)**
+"""
+
+STALE_GOALS_INLINE_STATE = """\
+# Goals
+
+## Current Priority
+
+**brief-100 MERGED + INSTALLED + VERIFIED (`ce1fe7f`)** — daemon hole closed.
+
+## Queued next
+
+1. brief-042 — dispatchable now.
+2. brief-043 — REJECTED — superseded.
+"""
+
+
+def run_goals_check(content: str, goals_path=None, project_root=None):
+    gp = goals_path or Path("/tmp/.loop/state/goals.md")
+    pr = project_root or Path("/tmp")
+    return check_goals_md_state_prose(content, gp, pr)
+
+
+class TestGoalsMdStateProse(unittest.TestCase):
+    def test_clean_goals_passes(self):
+        issues = run_goals_check(CLEAN_GOALS)
+        self.assertEqual(issues, [])
+
+    def test_strikethrough_warns(self):
+        issues = run_goals_check(STALE_GOALS_STRIKETHROUGH)
+        self.assertTrue(any("strikethrough" in i.message for i in issues))
+        self.assertTrue(all(i.severity == WARNING for i in issues))
+
+    def test_bracketed_merged_warns(self):
+        content = "1. **[MERGED abc1234 2026-04-28] brief-042**\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("MERGED" in i.message for i in issues))
+        self.assertEqual(issues[0].severity, WARNING)
+
+    def test_bracketed_rejected_warns(self):
+        content = "4. ~~**[REJECTED] brief-081**~~ — superseded.\n"
+        issues = run_goals_check(content)
+        self.assertTrue(len(issues) >= 1)
+        self.assertTrue(all(i.severity == WARNING for i in issues))
+
+    def test_merged_installed_verified_warns(self):
+        content = "brief-100 MERGED + INSTALLED + VERIFIED (`ce1fe7f`)\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("MERGED+INSTALLED" in i.message for i in issues))
+        self.assertEqual(issues[0].severity, WARNING)
+
+    def test_merged_with_sha_warns(self):
+        content = "- brief-001 — merged `58a3376`.\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("merged+sha" in i.message for i in issues))
+
+    def test_merged_with_date_warns(self):
+        content = "- brief-042 merged 2026-04-28.\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("merged+sha" in i.message for i in issues))
+
+    def test_rejected_with_dash_warns(self):
+        content = "4. brief-082 — REJECTED — methodology incomplete.\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("REJECTED" in i.message for i in issues))
+
+    def test_kill_disposition_warns(self):
+        content = "- brief-057 KILL — roadmap wishlist.\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("KILL" in i.message for i in issues))
+
+    def test_absorbed_into_warns(self):
+        content = "- brief-083 ABSORBED into brief-089 2026-04-27.\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("ABSORBED" in i.message for i in issues))
+
+    def test_completed_warns(self):
+        content = "- brief-042 completed.\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("completed" in i.message for i in issues))
+
+    def test_shipped_warns(self):
+        content = "- brief-077 SHIPPED (commit `c4b7d3e`).\n"
+        issues = run_goals_check(content)
+        self.assertTrue(any("shipped" in i.message for i in issues))
+
+    def test_one_issue_per_line(self):
+        # Line has both strikethrough AND bracketed MERGED — should emit only 1 issue
+        content = "~~[MERGED abc1234 2026-04-28] brief-042~~\n"
+        issues = run_goals_check(content)
+        self.assertEqual(len(issues), 1)
+
+    def test_inline_state_in_priority_section_warns(self):
+        issues = run_goals_check(STALE_GOALS_INLINE_STATE)
+        # Should flag the MERGED+INSTALLED+VERIFIED line AND the REJECTED line
+        self.assertGreaterEqual(len(issues), 2)
+        self.assertTrue(all(i.severity == WARNING for i in issues))
+
+
+class TestLintGoalsMd(unittest.TestCase):
+    def test_clean_goals_exits_0(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gp = Path(tmpdir) / "goals.md"
+            gp.write_text(CLEAN_GOALS)
+            self.assertEqual(main([str(gp)]), 0)
+
+    def test_stale_goals_exits_1(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gp = Path(tmpdir) / "goals.md"
+            gp.write_text(STALE_GOALS_STRIKETHROUGH)
+            self.assertEqual(main([str(gp)]), 1)
+
+    def test_lint_goals_md_function_clean(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gp = Path(tmpdir) / "goals.md"
+            gp.write_text(CLEAN_GOALS)
+            issues = lint_goals_md(gp, Path(tmpdir))
+            self.assertEqual(issues, [])
+
+    def test_lint_goals_md_function_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gp = Path(tmpdir) / "goals.md"
+            gp.write_text(STALE_GOALS_INLINE_STATE)
+            issues = lint_goals_md(gp, Path(tmpdir))
+            self.assertGreater(len(issues), 0)
+
+    def test_lint_goals_md_missing_file_errors(self):
+        issues = lint_goals_md(Path("/tmp/no-such-goals-xyz.md"), Path("/tmp"))
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, ERROR)
 
 
 if __name__ == "__main__":
