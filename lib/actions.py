@@ -1066,6 +1066,41 @@ def merge(paths):
     })
     save_running(paths, rc)
 
+    # --- Producer-side cleanup (brief-107) ---
+    # Fires AFTER history[] write. If either step fails, log + continue —
+    # history[] is the SOT; cleanup is derivative.
+    _cleanup_staged = False
+
+    _symlink_path = os.path.join(project_dir, ".loop", "briefs", f"{brief}.md")
+    if os.path.lexists(_symlink_path):
+        try:
+            git(project_dir, "rm", "--force", "-q", _symlink_path, check=False)
+            _cleanup_staged = True
+            print(f"cleanup: removed symlink .loop/briefs/{brief}.md")
+            log_action(paths, "cleanup_symlink_removed", {"brief": brief})
+        except Exception as e:
+            print(f"cleanup: symlink removal failed for {brief}: {e} (non-fatal)", file=sys.stderr)
+
+    _card_path = os.path.join(project_dir, "wiki", "briefs", "cards", brief, "index.md")
+    if os.path.exists(_card_path):
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from _set_card_status import set_card_status as _set_card_status_fn
+            _changed = _set_card_status_fn(_card_path, "merged")
+            if _changed:
+                git(project_dir, "add", _card_path, check=False)
+                _cleanup_staged = True
+                print(f"cleanup: card status → merged for {brief}")
+                log_action(paths, "cleanup_card_status_set", {"brief": brief})
+            else:
+                print(f"cleanup: card status already merged for {brief} (no-op)")
+        except Exception as e:
+            print(f"cleanup: card status update failed for {brief}: {e} (non-fatal)", file=sys.stderr)
+
+    if _cleanup_staged:
+        git(project_dir, "commit", "-m", f"loop: post-merge cleanup for {brief}", check=False)
+    # --- End producer-side cleanup ---
+
     signal_dedup_clear(paths, brief)
     git(project_dir, "push", remote, main_branch, check=False)
 
