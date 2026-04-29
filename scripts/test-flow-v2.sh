@@ -3677,6 +3677,154 @@ esac
 
 rm -rf "$RMS_SCRATCH"
 
+# ── Tests 124-126 (brief-107): Producer-side cleanup on merge ────────────────
+
+echo ""
+echo "=== Tests 124-126: Producer-side cleanup — symlink removal + card status (brief-107) ==="
+
+CLEANUP_SCRATCH=$(mktemp -d)
+
+git -C "$CLEANUP_SCRATCH" init -q -b main
+git -C "$CLEANUP_SCRATCH" config user.email "test@test"
+git -C "$CLEANUP_SCRATCH" config user.name "Test"
+
+mkdir -p "$CLEANUP_SCRATCH/.loop/state/signals"
+mkdir -p "$CLEANUP_SCRATCH/.loop/briefs"
+mkdir -p "$CLEANUP_SCRATCH/.loop/worktrees"
+mkdir -p "$CLEANUP_SCRATCH/wiki/briefs/cards/brief-CLN-test"
+
+git init --bare -q "$CLEANUP_SCRATCH/origin.git"
+git -C "$CLEANUP_SCRATCH" remote add origin "$CLEANUP_SCRATCH/origin.git"
+
+cat > "$CLEANUP_SCRATCH/.loop/config.sh" <<'EOF'
+PROJECT_NAME="test"
+GIT_REMOTE="origin"
+GIT_MAIN_BRANCH="main"
+EOF
+
+touch "$CLEANUP_SCRATCH/.loop/state/log.jsonl"
+
+# Card with YAML frontmatter + non-trivial fields to catch field-drop bugs.
+# (The _set_card_status.py helper requires --- frontmatter.)
+cat > "$CLEANUP_SCRATCH/wiki/briefs/cards/brief-CLN-test/index.md" <<'CARDEOF'
+---
+id: brief-CLN-test
+branch: brief-CLN-test
+status: queued
+model: sonnet
+auto-merge: "true"
+validator: core/agents/reviewer.md
+human-gate: none
+target-repo: test-project
+---
+
+# Brief: producer-side cleanup test
+
+**ID:** brief-CLN-test
+**Status:** queued
+CARDEOF
+
+# Symlink from .loop/briefs/ → card dir (the portal pattern)
+ln -sf "../../wiki/briefs/cards/brief-CLN-test/index.md" \
+    "$CLEANUP_SCRATCH/.loop/briefs/brief-CLN-test.md"
+
+# Commit both the symlink and the card so git rm / git add work during merge
+git -C "$CLEANUP_SCRATCH" add -A
+git -C "$CLEANUP_SCRATCH" commit -q -m "init: seed cleanup test"
+git -C "$CLEANUP_SCRATCH" push -q origin main
+
+# Create brief branch
+git -C "$CLEANUP_SCRATCH" checkout -q -b brief-CLN-test
+echo "brief work" > "$CLEANUP_SCRATCH/brief-cln-work.txt"
+git -C "$CLEANUP_SCRATCH" add -A
+git -C "$CLEANUP_SCRATCH" commit -q -m "brief-CLN-test: work done"
+git -C "$CLEANUP_SCRATCH" checkout -q main
+
+# Seed state files
+python3 -c "
+import json
+json.dump({
+    'active': [{'brief': 'brief-CLN-test', 'branch': 'brief-CLN-test'}],
+    'completed_pending_eval': [],
+    'pending_merges': [{'brief': 'brief-CLN-test', 'branch': 'brief-CLN-test', 'auto_merge': True}],
+    'awaiting_review': [],
+    'history': [],
+    'queue': []
+}, open('$CLEANUP_SCRATCH/.loop/state/running.json', 'w'), indent=2)
+"
+python3 -c "
+import json
+json.dump({'brief': 'brief-CLN-test', 'branch': 'brief-CLN-test',
+           'auto_merge': True, 'title': 'cleanup test'},
+    open('$CLEANUP_SCRATCH/.loop/state/pending-merge.json', 'w'), indent=2)
+"
+
+# Run merge() — exercises the full producer-side cleanup path
+python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from actions import init_paths, merge
+paths = init_paths('$CLEANUP_SCRATCH')
+merge(paths)
+" 2>/dev/null
+
+# Test 124: symlink is gone from .loop/briefs/ after merge
+if [ ! -e "$CLEANUP_SCRATCH/.loop/briefs/brief-CLN-test.md" ] && \
+   [ ! -L "$CLEANUP_SCRATCH/.loop/briefs/brief-CLN-test.md" ]; then
+    pass "symlink removed from .loop/briefs/ after merge (brief-107 cleanup)"
+else
+    fail "symlink still present at .loop/briefs/brief-CLN-test.md after merge"
+fi
+
+# Test 125: card YAML frontmatter Status is set to merged after merge
+CARD_STATUS_125=$(python3 -c "
+with open('$CLEANUP_SCRATCH/wiki/briefs/cards/brief-CLN-test/index.md') as f:
+    lines = f.readlines()
+in_fm = False
+for line in lines:
+    s = line.strip()
+    if s == '---':
+        in_fm = not in_fm
+        continue
+    if in_fm and s.lower().startswith('status:'):
+        print(s.split(':', 1)[1].strip())
+        break
+else:
+    print('NOT_FOUND')
+" 2>/dev/null)
+assert_eq "card YAML frontmatter Status set to 'merged' after merge (brief-107)" \
+    "$CARD_STATUS_125" "merged"
+
+# Test 126: all non-status frontmatter fields preserved verbatim after merge
+FIELDS_OK=$(python3 -c "
+with open('$CLEANUP_SCRATCH/wiki/briefs/cards/brief-CLN-test/index.md') as f:
+    content = f.read()
+fm = {}
+in_fm = False
+for line in content.splitlines():
+    if line.strip() == '---':
+        in_fm = not in_fm
+        continue
+    if in_fm and ':' in line:
+        key, _, val = line.partition(':')
+        fm[key.strip().lower()] = val.strip()
+expected = {
+    'id': 'brief-CLN-test',
+    'branch': 'brief-CLN-test',
+    'model': 'sonnet',
+    'auto-merge': '\"true\"',
+    'validator': 'core/agents/reviewer.md',
+    'human-gate': 'none',
+    'target-repo': 'test-project',
+}
+errors = [f'{k}: expected {v!r} got {fm.get(k)!r}' for k, v in expected.items() if fm.get(k) != v]
+print('OK' if not errors else 'FAIL: ' + '; '.join(errors))
+" 2>/dev/null)
+assert_eq "non-status frontmatter fields preserved verbatim after merge (brief-107)" \
+    "$FIELDS_OK" "OK"
+
+rm -rf "$CLEANUP_SCRATCH"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
