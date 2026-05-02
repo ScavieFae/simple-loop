@@ -31,6 +31,15 @@ STALE_THRESHOLD_SECONDS = 300  # 5 min
 HEARTBEAT_SUMMARY_LINES = 5
 SIGNAL_RATE_LIMIT_SECONDS = 1800  # 30 min per run per signal type
 
+# Cost estimates: $/hr for each modal machine type (approximate; for preemption cost reporting)
+_GPU_COST_PER_HOUR = {
+    "modal:a10g": 1.10,
+    "modal:a100-40gb": 2.78,
+    "modal:h100": 4.00,
+}
+# ~1 step/sec measured on A10G (brief-118 smoke); used for wasted-cost estimate
+_APPROX_STEPS_PER_HOUR = 3600
+
 
 # ─── Project root discovery ─────────────────────────────────────────────
 
@@ -619,9 +628,13 @@ def run(project_root=None, dry_run=False, verbose=False):
             if is_preempted:
                 prev_hbs = read_last_heartbeats(project_root, run_id, n=3)
                 prev_step = prev_hbs[-2].get("last_step") if len(prev_hbs) >= 2 else None
+                wasted = (prev_step or 0) - (current_step or 0)
+                gpu_cost_hr = _GPU_COST_PER_HOUR.get(meta.get("machine", ""), 1.10)
+                cost_estimate = round(wasted / _APPROX_STEPS_PER_HOUR * gpu_cost_hr, 2)
                 extra = {
-                    "wasted_steps": (prev_step or 0) - (current_step or 0),
+                    "wasted_steps": wasted,
                     "previous_step": prev_step,
+                    "cost_estimate_usd": cost_estimate,
                 }
                 sig = fire_signal(project_root, "preempted", meta, log_state, extra)
                 if sig:
