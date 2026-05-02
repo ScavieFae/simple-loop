@@ -494,7 +494,7 @@ def update_run_card_summary(run_card_path, last_heartbeats):
 # ─── Completion handling ─────────────────────────────────────────────────
 
 def handle_completion(project_root, meta, log_state):
-    """On Modal status: completed, flip run card status and note checkpoint download needed."""
+    """On Modal status: completed, flip run card status and trigger checkpoint download."""
     run_card_path = meta["run_card_path"]
     run_id = meta["run_id"]
 
@@ -532,26 +532,40 @@ def handle_completion(project_root, meta, log_state):
             f"| Final loss | {log_state['last_loss']} |"
         )
 
-    # Note that checkpoint download should be triggered
-    checkpoint_note = (
-        f"\n!!! note \"Training complete as of {now_iso}\"\n"
-        f"    Modal app {meta.get('app_id')} reports completed. "
-        f"Run the checkpoint download script to pull weights:\n"
-        f"    `python tools/training-ground/scripts/download_checkpoint.py --run-id {run_id}`\n"
-        f"    Then update the Checkpoint row in Receipts above.\n"
-    )
-    if "Training complete" not in updated:
-        updated = updated.replace(
-            "!!! warning \"Fill post-run\"",
-            checkpoint_note + "!!! warning \"Fill post-run\"",
-            1
-        )
-
     try:
         run_card_path.write_text(updated)
         print(f"scout: {run_id} complete — run card updated, status: complete")
     except (IOError, OSError) as e:
         print(f"scout: failed to update run card on completion: {e}", file=sys.stderr)
+        return
+
+    # Trigger checkpoint download script (retry once on failure)
+    download_script = (
+        project_root / "tools" / "training-ground" / "scripts" / "download_checkpoint.py"
+    )
+    if not download_script.exists():
+        print(f"scout: {run_id} no download script at {download_script} — skipping auto-download")
+        return
+
+    download_succeeded = False
+    for _attempt in range(2):
+        try:
+            result = subprocess.run(
+                [sys.executable, str(download_script), "--run-id", run_id],
+                capture_output=True, text=True, timeout=300,
+                cwd=str(project_root),
+            )
+            if result.returncode == 0:
+                download_succeeded = True
+                print(f"scout: {run_id} checkpoint download complete")
+                break
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    if not download_succeeded:
+        print(f"scout: {run_id} checkpoint download failed — firing stale signal", file=sys.stderr)
+        fire_signal(project_root, "stale", meta, log_state,
+                    {"cause": "checkpoint-download-failed"})
 
 
 # ─── Main scout loop ─────────────────────────────────────────────────────

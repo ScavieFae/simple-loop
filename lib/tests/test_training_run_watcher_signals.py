@@ -297,5 +297,105 @@ class TestWatcherOff(unittest.TestCase):
             self.assertEqual(result["signals_fired"], [])
 
 
+# ─── Test: completion handling ───────────────────────────────────────────────
+
+class TestCompletion(unittest.TestCase):
+
+    def test_completion_flips_status_and_populates_receipts(self):
+        """Mock completed status → run card status: complete + Receipts filled."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run_id = "test-complete-run"
+            root, log_file = make_project(tmp, run_id, app_id="ap-complete")
+            write_log(log_file, step=50000, loss=0.008)
+
+            with patch.object(scout, "check_modal_app_status", return_value="completed"):
+                scout.run(project_root=root)
+
+            text = (root / "wiki" / "runs" / run_id / "index.md").read_text()
+            self.assertIn("status: complete", text)
+            self.assertNotIn("status: running", text)
+            self.assertIn("50000", text)
+            self.assertIn("0.008", text)
+
+    def test_completion_triggers_checkpoint_download(self):
+        """Mock completed → checkpoint download script invoked with --run-id <run_id>."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run_id = "test-complete-download"
+            root, log_file = make_project(tmp, run_id, app_id="ap-dl")
+            write_log(log_file, step=50000, loss=0.008)
+
+            script_path = root / "tools" / "training-ground" / "scripts" / "download_checkpoint.py"
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)\n")
+
+            with patch.object(scout, "check_modal_app_status", return_value="completed"), \
+                 patch("training_run_watcher.subprocess.run") as mock_run:
+                mock_run.return_value = unittest.mock.MagicMock(returncode=0, stdout="", stderr="")
+                scout.run(project_root=root)
+
+            self.assertTrue(mock_run.called, "download_checkpoint.py subprocess not called")
+            called_cmd = mock_run.call_args[0][0]
+            self.assertIn("--run-id", called_cmd)
+            self.assertIn(run_id, called_cmd)
+
+    def test_completion_download_failure_fires_stale_signal(self):
+        """Failed checkpoint download → training-stale signal with cause: checkpoint-download-failed."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            run_id = "test-complete-dl-fail"
+            root, log_file = make_project(tmp, run_id, app_id="ap-dl-fail")
+            write_log(log_file, step=50000, loss=0.008)
+
+            script_path = root / "tools" / "training-ground" / "scripts" / "download_checkpoint.py"
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(1)\n")
+
+            with patch.object(scout, "check_modal_app_status", return_value="completed"), \
+                 patch("training_run_watcher.subprocess.run") as mock_run:
+                mock_run.return_value = unittest.mock.MagicMock(returncode=1, stdout="", stderr="err")
+                scout.run(project_root=root)
+
+            sig_path = root / ".loop" / "state" / "signals" / f"training-stale-{run_id}.json"
+            self.assertTrue(sig_path.exists(), "stale signal not fired on download failure")
+            sig = json.loads(sig_path.read_text())
+            self.assertEqual(sig.get("cause"), "checkpoint-download-failed")
+
+
+# ─── Test: inference-mode registry stub ─────────────────────────────────────
+
+class TestInferenceModeStub(unittest.TestCase):
+
+    def setUp(self):
+        lib_dir = str(Path(__file__).parent.parent)
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+
+    def test_inference_dispatch_raises_not_implemented(self):
+        """dispatch_scout() with mode: inference raises NotImplementedError."""
+        from scouts import dispatch_scout
+        with tempfile.TemporaryDirectory() as d:
+            spec = Path(d) / "test-inference.md"
+            spec.write_text(
+                "---\nname: test-inference\nmode: inference\nprompt: check something\n---\n"
+            )
+            with self.assertRaises(NotImplementedError):
+                dispatch_scout(str(spec), d)
+
+    def test_registry_parses_inference_mode_and_prompt(self):
+        """Registry accepts mode: inference + prompt: field in frontmatter."""
+        from scouts import parse_specialist, get_mode
+        with tempfile.TemporaryDirectory() as d:
+            spec = Path(d) / "test-inference.md"
+            spec.write_text(
+                "---\nname: test-inference\nmode: inference\nprompt: check something\n---\n"
+            )
+            fm, _ = parse_specialist(str(spec))
+            self.assertEqual(get_mode(fm), "inference")
+            self.assertIn("prompt", fm)
+            self.assertEqual(fm["prompt"], "check something")
+
+
 if __name__ == "__main__":
     unittest.main()
