@@ -1,4 +1,4 @@
-use crate::state::{parse_log_ts, RawLogLine};
+use crate::state::{load_daemon_log_events, parse_log_ts, RawLogLine};
 use chrono::{DateTime, Utc};
 use ratatui::{
     layout::Rect,
@@ -247,6 +247,32 @@ pub fn load_buzz_state(window: Duration, offset_from_now_secs: i64) -> BuzzState
                 duration_ms,
             });
         }
+    }
+
+    // Workers and validators write to daemon.log, not log.jsonl — include
+    // them so worker events appear as POP_GREEN hexes.
+    let daemon_log_path = Path::new(".loop/logs/daemon.log");
+    let max_age = window.as_secs() as i64 + offset_from_now_secs + 60;
+    for ev in load_daemon_log_events(daemon_log_path, max_age) {
+        if let Some(ts) = ev.ts {
+            if ts < cutoff || ts > window_end {
+                continue;
+            }
+        }
+        let (cost_usd, duration_ms) = ev
+            .ts
+            .map(|t| find_metric(&metrics, t, None))
+            .unwrap_or((FALLBACK_COST, None));
+        let intensity_bucket = cost_to_bucket(cost_usd);
+        events.push(BuzzEvent {
+            ts: ev.ts,
+            actor: ev.actor,
+            action: ev.event,
+            brief: ev.brief,
+            cost_usd,
+            intensity_bucket,
+            duration_ms,
+        });
     }
 
     // Chronological order (oldest → newest); newest displayed top-left in renderer
