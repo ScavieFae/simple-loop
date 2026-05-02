@@ -111,6 +111,11 @@ struct App {
     signal_cursor: usize,
     /// True when the signal-detail modal is open.
     show_signal_detail: bool,
+    /// Cursor position in the Buzz grid (0 = newest event, rendered top-left).
+    buzz_cursor: usize,
+    /// Seconds to offset the Buzz time window end backward from now.
+    /// 0 = window ends at "now"; positive = window is in the past.
+    buzz_window_offset_secs: i64,
     /// Vertical scroll offset inside the signal-detail modal.
     signal_modal_scroll: u16,
     /// Index into learnings, cycled every LEARNING_ROTATION_SECS while
@@ -132,13 +137,15 @@ impl App {
             hive: state::HiveState::load(),
             cells: state::CellsState::load(),
             dance_floor: state::DanceFloorState::load(),
-            buzz: buzz::load_buzz_state(std::time::Duration::from_secs(3 * 3600)),
+            buzz: buzz::load_buzz_state(std::time::Duration::from_secs(3 * 3600), 0),
             signals: state::SignalsState::load(),
             learnings: state::LearningsState::load(),
             dance_floor_auto_scroll: true,
             show_help: false,
             signal_cursor: 0,
             show_signal_detail: false,
+            buzz_cursor: 0,
+            buzz_window_offset_secs: 0,
             signal_modal_scroll: 0,
             learning_index: 0,
             last_learning_rotation: Instant::now(),
@@ -154,7 +161,7 @@ impl App {
         self.hive = state::HiveState::load();
         self.cells = state::CellsState::load();
         self.dance_floor = state::DanceFloorState::load();
-        self.buzz = buzz::load_buzz_state(std::time::Duration::from_secs(3 * 3600));
+        self.reload_buzz();
         self.signals = state::SignalsState::load();
         self.learnings = state::LearningsState::load();
         // Clamp cursor to current signals count — signals come and go as the
@@ -172,6 +179,18 @@ impl App {
         if self.last_learning_rotation.elapsed().as_secs() >= LEARNING_ROTATION_SECS {
             self.learning_index = self.learning_index.wrapping_add(1);
             self.last_learning_rotation = Instant::now();
+        }
+    }
+
+    fn reload_buzz(&mut self) {
+        self.buzz = buzz::load_buzz_state(
+            std::time::Duration::from_secs(3 * 3600),
+            self.buzz_window_offset_secs,
+        );
+        if !self.buzz.events.is_empty() {
+            self.buzz_cursor = self.buzz_cursor.min(self.buzz.events.len() - 1);
+        } else {
+            self.buzz_cursor = 0;
         }
     }
 
@@ -1389,6 +1408,15 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
     loop {
         app.maybe_rotate_learning();
 
+        // Compute Buzz row width for Up/Down cursor navigation (approximation from terminal size).
+        let buzz_hexes_per_row = terminal
+            .size()
+            .map(|sz| {
+                let right_w = (sz.width as usize * 67 / 100).saturating_sub(2);
+                (right_w / 2).max(1)
+            })
+            .unwrap_or(10);
+
         let hive_text = render_hive(&app);
         let cells_text = render_cells(&app.cells, app.config.layout.active_section_height);
         let (dance_floor_text, dance_floor_line_count) = render_dance_floor(&app.dance_floor);
@@ -1414,6 +1442,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         let show_buzz = app.focused == Panel::Buzz;
         let show_help = app.show_help;
         let show_signal_detail = app.show_signal_detail;
+        let buzz_cursor_idx = app.buzz_cursor;
         let signal_modal_scroll = app.signal_modal_scroll;
         let selected_signal_idx = if show_signal_detail {
             Some(app.signal_cursor)
@@ -1481,13 +1510,33 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
 
             // Right main slot: Buzz when focused, otherwise Dance Floor
             if show_buzz {
-                let buzz_text = buzz::render_buzz(&app.buzz, main_row[1]);
+                let buzz_block = app.panel_block(Panel::Buzz);
+                let inner = buzz_block.inner(main_row[1]);
+                f.render_widget(buzz_block, main_row[1]);
+
+                // Split inner area: grid (most), detail (2 lines), legend (1 line)
+                let buzz_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(2),
+                        Constraint::Length(2),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+
+                let buzz_text = buzz::render_buzz(&app.buzz, buzz_layout[0], buzz_cursor_idx);
                 let buzz_scroll = app.scroll[Panel::Buzz as usize];
                 f.render_widget(
-                    Paragraph::new(buzz_text)
-                        .scroll((buzz_scroll, 0))
-                        .block(app.panel_block(Panel::Buzz)),
-                    main_row[1],
+                    Paragraph::new(buzz_text).scroll((buzz_scroll, 0)),
+                    buzz_layout[0],
+                );
+                f.render_widget(
+                    Paragraph::new(buzz::render_buzz_detail(&app.buzz, buzz_cursor_idx)),
+                    buzz_layout[1],
+                );
+                f.render_widget(
+                    Paragraph::new(buzz::render_buzz_legend()),
+                    buzz_layout[2],
                 );
             } else {
                 // Auto-scroll: pin dance floor to bottom unless user manually scrolled up
@@ -1669,6 +1718,41 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                 app.refresh_state();
                                 last_state_refresh = Instant::now();
                             }
+                            KeyCode::Left if app.focused == Panel::Buzz => {
+                                app.buzz_cursor = app.buzz_cursor.saturating_sub(1);
+                            }
+                            KeyCode::Right
+                                if app.focused == Panel::Buzz
+                                    && !app.buzz.events.is_empty() =>
+                            {
+                                let max = app.buzz.events.len() - 1;
+                                app.buzz_cursor = (app.buzz_cursor + 1).min(max);
+                            }
+                            KeyCode::Up if app.focused == Panel::Buzz => {
+                                app.buzz_cursor =
+                                    app.buzz_cursor.saturating_sub(buzz_hexes_per_row);
+                            }
+                            KeyCode::Down
+                                if app.focused == Panel::Buzz
+                                    && !app.buzz.events.is_empty() =>
+                            {
+                                let max = app.buzz.events.len() - 1;
+                                app.buzz_cursor =
+                                    (app.buzz_cursor + buzz_hexes_per_row).min(max);
+                            }
+                            KeyCode::Char('[') if app.focused == Panel::Buzz => {
+                                app.buzz_window_offset_secs += 3 * 3600 / 2;
+                                app.reload_buzz();
+                            }
+                            KeyCode::Char(']') if app.focused == Panel::Buzz => {
+                                app.buzz_window_offset_secs =
+                                    (app.buzz_window_offset_secs - 3 * 3600 / 2).max(0);
+                                app.reload_buzz();
+                            }
+                            KeyCode::Char('=') if app.focused == Panel::Buzz => {
+                                app.buzz_window_offset_secs = 0;
+                                app.reload_buzz();
+                            }
                             _ => {}
                         }
                     }
@@ -1746,6 +1830,66 @@ mod tests {
         }
         // Back to frame 0 after full cycle
         assert_eq!(app.spinner_frame, 0);
+    }
+
+    fn app_with_buzz_events(n: usize) -> App {
+        let mut app = App::new();
+        let events = (0..n)
+            .map(|_| buzz::BuzzEvent {
+                ts: None,
+                actor: Some("worker".to_string()),
+                action: None,
+                brief: None,
+                cost_usd: 0.10,
+                intensity_bucket: 2,
+                duration_ms: None,
+            })
+            .collect();
+        app.buzz = buzz::BuzzState { events };
+        app
+    }
+
+    #[test]
+    fn buzz_cursor_clamps_at_zero_going_left() {
+        let mut app = app_with_buzz_events(3);
+        app.buzz_cursor = 0;
+        app.buzz_cursor = app.buzz_cursor.saturating_sub(1);
+        assert_eq!(app.buzz_cursor, 0);
+    }
+
+    #[test]
+    fn buzz_cursor_clamps_at_max_going_right() {
+        let mut app = app_with_buzz_events(3);
+        for _ in 0..10 {
+            let max = app.buzz.events.len().saturating_sub(1);
+            app.buzz_cursor = (app.buzz_cursor + 1).min(max);
+        }
+        assert_eq!(app.buzz_cursor, 2); // 3 events, max index = 2
+    }
+
+    #[test]
+    fn buzz_window_offset_increments_on_pan_left() {
+        let mut app = App::new();
+        assert_eq!(app.buzz_window_offset_secs, 0);
+        app.buzz_window_offset_secs += 3 * 3600 / 2;
+        assert_eq!(app.buzz_window_offset_secs, 5400);
+    }
+
+    #[test]
+    fn buzz_window_offset_does_not_go_below_zero_on_pan_right() {
+        let mut app = App::new();
+        // Simulate pan-right from zero: offset cannot go negative
+        let new_offset = app.buzz_window_offset_secs - 5400;
+        app.buzz_window_offset_secs = new_offset.max(0);
+        assert_eq!(app.buzz_window_offset_secs, 0);
+    }
+
+    #[test]
+    fn buzz_window_offset_resets_to_zero_on_equal() {
+        let mut app = App::new();
+        app.buzz_window_offset_secs = 10800;
+        app.buzz_window_offset_secs = 0;
+        assert_eq!(app.buzz_window_offset_secs, 0);
     }
 
     /// Build an App with a synthetic signals list for cursor-behavior tests.

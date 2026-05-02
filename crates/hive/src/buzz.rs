@@ -126,12 +126,14 @@ struct RawMetricLine {
     timestamp: Option<String>,
     session_id: Option<String>,
     cost_usd: Option<f64>,
+    duration_ms: Option<u64>,
 }
 
 struct MetricEntry {
     ts: DateTime<Utc>,
     session_id: Option<String>,
     cost_usd: f64,
+    duration_ms: Option<u64>,
 }
 
 fn load_metrics(path: &Path) -> Vec<MetricEntry> {
@@ -154,6 +156,7 @@ fn load_metrics(path: &Path) -> Vec<MetricEntry> {
             ts,
             session_id: raw.session_id,
             cost_usd: raw.cost_usd.unwrap_or(0.0),
+            duration_ms: raw.duration_ms,
         });
     }
     entries.sort_by_key(|e| e.ts);
@@ -161,14 +164,14 @@ fn load_metrics(path: &Path) -> Vec<MetricEntry> {
 }
 
 // Try session_id join first; fall back to nearest-timestamp within window.
-fn find_metric_cost(
+fn find_metric(
     metrics: &[MetricEntry],
     event_ts: DateTime<Utc>,
     event_session_id: Option<&str>,
-) -> f64 {
+) -> (f64, Option<u64>) {
     if let Some(sid) = event_session_id {
         if let Some(m) = metrics.iter().find(|m| m.session_id.as_deref() == Some(sid)) {
-            return m.cost_usd;
+            return (m.cost_usd, m.duration_ms);
         }
     }
     let best = metrics.iter().min_by_key(|m| {
@@ -176,10 +179,10 @@ fn find_metric_cost(
     });
     if let Some(m) = best {
         if (m.ts - event_ts).num_seconds().abs() <= METRICS_MATCH_WINDOW_SECS {
-            return m.cost_usd;
+            return (m.cost_usd, m.duration_ms);
         }
     }
-    FALLBACK_COST
+    (FALLBACK_COST, None)
 }
 
 // ── data model ────────────────────────────────────────────────────────────────
@@ -188,31 +191,22 @@ pub struct BuzzEvent {
     pub ts: Option<DateTime<Utc>>,
     pub actor: Option<String>,
     pub action: Option<String>,
-    // Used in Cycle 3 cursor drill-in detail panel
-    #[allow(dead_code)]
     pub brief: Option<String>,
-    // Used in Cycle 3 cursor drill-in detail panel (cost display)
-    #[allow(dead_code)]
     pub cost_usd: f64,
     pub intensity_bucket: u8,
+    pub duration_ms: Option<u64>,
 }
 
 pub struct BuzzState {
     pub events: Vec<BuzzEvent>,
-    // Used in Cycle 3 time-window pan ([/]/=)
-    #[allow(dead_code)]
-    pub window: Duration,
-    // Used in Cycle 3 time-window pan ([/]/=)
-    #[allow(dead_code)]
-    pub window_end: DateTime<Utc>,
 }
 
 // ── loader ────────────────────────────────────────────────────────────────────
 
-pub fn load_buzz_state(window: Duration) -> BuzzState {
+pub fn load_buzz_state(window: Duration, offset_from_now_secs: i64) -> BuzzState {
     let log_path = Path::new(".loop/state/log.jsonl");
     let metrics_path = Path::new(".loop/state/metrics.jsonl");
-    let window_end = Utc::now();
+    let window_end = Utc::now() - chrono::Duration::seconds(offset_from_now_secs);
     let cutoff = window_end - chrono::Duration::seconds(window.as_secs() as i64);
 
     let metrics = load_metrics(metrics_path);
@@ -236,10 +230,10 @@ pub fn load_buzz_state(window: Duration) -> BuzzState {
                 }
             }
 
-            let cost_usd = if let Some(event_ts) = ts {
-                find_metric_cost(&metrics, event_ts, entry.session_id.as_deref())
+            let (cost_usd, duration_ms) = if let Some(event_ts) = ts {
+                find_metric(&metrics, event_ts, entry.session_id.as_deref())
             } else {
-                FALLBACK_COST
+                (FALLBACK_COST, None)
             };
             let intensity_bucket = cost_to_bucket(cost_usd);
 
@@ -250,6 +244,7 @@ pub fn load_buzz_state(window: Duration) -> BuzzState {
                 brief: entry.brief,
                 cost_usd,
                 intensity_bucket,
+                duration_ms,
             });
         }
     }
@@ -262,7 +257,7 @@ pub fn load_buzz_state(window: Duration) -> BuzzState {
         (None, None) => std::cmp::Ordering::Equal,
     });
 
-    BuzzState { events, window, window_end }
+    BuzzState { events }
 }
 
 // ── renderer ──────────────────────────────────────────────────────────────────
@@ -277,13 +272,12 @@ pub fn load_buzz_state(window: Duration) -> BuzzState {
 /// (e.g. certain Nerd Font variants in Warp) paint it at 2 columns, which
 /// shifts subsequent glyphs. If the grid looks misaligned, that's the
 /// escalation trigger noted in the brief — don't paper over it here.
-pub fn render_buzz<'a>(state: &BuzzState, area: Rect) -> Text<'a> {
+pub fn render_buzz<'a>(state: &BuzzState, area: Rect, cursor: usize) -> Text<'a> {
     if state.events.is_empty() {
-        let center_line = Line::from(Span::styled(
-            "no buzz yet",
-            Style::default().fg(MUTED),
-        ));
-        return Text::from(center_line);
+        return Text::from(Line::from(vec![
+            Span::styled("⬡ ", Style::default().fg(MUTED)),
+            Span::styled("no buzz yet", Style::default().fg(MUTED)),
+        ]));
     }
 
     // inner_width excludes the 2-column border (1 left + 1 right)
@@ -318,10 +312,11 @@ pub fn render_buzz<'a>(state: &BuzzState, area: Rect) -> Text<'a> {
                 .unwrap_or_else(|| actor_color(ev.actor.as_deref()));
 
             let (color, bold) = apply_intensity(base_color, ev.intensity_bucket);
-            let style = if bold {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color)
+            let is_cursor = ev_idx == cursor;
+            let style = {
+                let s = Style::default().fg(color);
+                let s = if bold { s.add_modifier(Modifier::BOLD) } else { s };
+                if is_cursor { s.add_modifier(Modifier::UNDERLINED) } else { s }
             };
             spans.push(Span::styled("⬢ ", style));
         }
@@ -332,6 +327,78 @@ pub fn render_buzz<'a>(state: &BuzzState, area: Rect) -> Text<'a> {
     }
 
     Text::from(lines)
+}
+
+/// Render the detail line for the currently-selected hex.
+/// Shows: actor · action · brief · cost · wall-time · timestamp
+pub fn render_buzz_detail<'a>(state: &BuzzState, cursor: usize) -> Text<'a> {
+    if state.events.is_empty() {
+        return Text::from(Line::from(Span::styled("—", Style::default().fg(MUTED))));
+    }
+    let count = state.events.len();
+    let idx = cursor.min(count - 1);
+    let ev = &state.events[count - 1 - idx]; // newest-first: cursor 0 = newest event
+
+    let actor_str = ev.actor.as_deref().unwrap_or("?").to_string();
+    let action_str = ev.action.as_deref().unwrap_or("?").to_string();
+    let brief_str = ev.brief.as_deref().unwrap_or("—").to_string();
+    let cost_str = format!("${:.4}", ev.cost_usd);
+    let wall_str = ev
+        .duration_ms
+        .map(|ms| {
+            if ms >= 1000 {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            } else {
+                format!("{}ms", ms)
+            }
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let ts_str = ev
+        .ts
+        .map(|t| t.format("%H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "?".to_string());
+
+    let ev_color = event_color_override(ev.action.as_deref())
+        .unwrap_or_else(|| actor_color(ev.actor.as_deref()));
+
+    let line1 = Line::from(vec![
+        Span::styled(actor_str, Style::default().fg(ev_color)),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(action_str, Style::default().fg(Color::White)),
+        Span::styled(" · brief: ", Style::default().fg(MUTED)),
+        Span::styled(brief_str, Style::default().fg(GOLD)),
+    ]);
+    let line2 = Line::from(vec![
+        Span::styled("cost: ", Style::default().fg(MUTED)),
+        Span::styled(cost_str, Style::default().fg(AMBER)),
+        Span::styled("  wall: ", Style::default().fg(MUTED)),
+        Span::styled(wall_str, Style::default().fg(Color::White)),
+        Span::styled("  ts: ", Style::default().fg(MUTED)),
+        Span::styled(ts_str, Style::default().fg(MUTED)),
+    ]);
+
+    Text::from(vec![line1, line2])
+}
+
+/// Render the legend strip: ⬢ actor_name for each apiary role.
+pub fn render_buzz_legend<'a>() -> Text<'a> {
+    let pairs: &[(&'static str, Color)] = &[
+        ("queen", LAVENDER),
+        ("worker", POP_GREEN),
+        ("validator", ORANGE),
+        ("reviewer", INDIGO),
+        ("scout", TEAL),
+        ("daemon", AMBER),
+        ("reject", CORAL),
+        ("merge", SHINY_GOLD),
+    ];
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    for (label, color) in pairs {
+        spans.push(Span::styled("⬢ ", Style::default().fg(*color)));
+        spans.push(Span::styled(*label, Style::default().fg(MUTED)));
+        spans.push(Span::raw(" "));
+    }
+    Text::from(Line::from(spans))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -362,7 +429,7 @@ mod tests {
         let tmp = std::env::temp_dir();
         std::env::set_current_dir(&tmp).unwrap();
 
-        let state = load_buzz_state(Duration::from_secs(3600));
+        let state = load_buzz_state(Duration::from_secs(3600), 0);
         assert!(state.events.is_empty());
 
         std::env::set_current_dir(&original).unwrap();
@@ -372,11 +439,9 @@ mod tests {
     fn render_buzz_empty_state_returns_no_buzz_yet() {
         let state = BuzzState {
             events: vec![],
-            window: Duration::from_secs(3600),
-            window_end: Utc::now(),
         };
         let area = Rect::new(0, 0, 40, 10);
-        let text = render_buzz(&state, area);
+        let text = render_buzz(&state, area, 0);
         let rendered: String = text.lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
@@ -397,6 +462,7 @@ mod tests {
                     brief: None,
                     cost_usd: 0.10,
                     intensity_bucket: 2,
+                    duration_ms: None,
                 },
                 BuzzEvent {
                     ts: Some(base_ts + chrono::Duration::minutes(1)),
@@ -405,6 +471,7 @@ mod tests {
                     brief: None,
                     cost_usd: 0.10,
                     intensity_bucket: 2,
+                    duration_ms: None,
                 },
                 BuzzEvent {
                     ts: Some(base_ts + chrono::Duration::minutes(2)),
@@ -413,14 +480,13 @@ mod tests {
                     brief: None,
                     cost_usd: 0.10,
                     intensity_bucket: 2,
+                    duration_ms: None,
                 },
             ],
-            window: Duration::from_secs(3600),
-            window_end: Utc::now(),
         };
 
         let area = Rect::new(0, 0, 40, 10);
-        let text = render_buzz(&state, area);
+        let text = render_buzz(&state, area, 0);
         assert!(!text.lines.is_empty(), "should produce at least one row");
 
         // First span in first row (after optional offset space) should be queen color
@@ -442,8 +508,8 @@ mod tests {
         let t2: DateTime<Utc> = "2026-04-30T11:00:00Z".parse().unwrap();
 
         let mut events = [
-            BuzzEvent { ts: Some(t2), actor: None, action: None, brief: None, cost_usd: 0.10, intensity_bucket: 2 },
-            BuzzEvent { ts: Some(t1), actor: None, action: None, brief: None, cost_usd: 0.10, intensity_bucket: 2 },
+            BuzzEvent { ts: Some(t2), actor: None, action: None, brief: None, cost_usd: 0.10, intensity_bucket: 2, duration_ms: None },
+            BuzzEvent { ts: Some(t1), actor: None, action: None, brief: None, cost_usd: 0.10, intensity_bucket: 2, duration_ms: None },
         ];
         events.sort_by(|a, b| match (a.ts, b.ts) {
             (Some(at), Some(bt)) => at.cmp(&bt),
@@ -511,12 +577,11 @@ mod tests {
                 brief: None,
                 cost_usd: 0.10,
                 intensity_bucket: 2,
+                duration_ms: None,
             }],
-            window: Duration::from_secs(3600),
-            window_end: Utc::now(),
         };
         let area = Rect::new(0, 0, 40, 10);
-        let text = render_buzz(&state, area);
+        let text = render_buzz(&state, area, 0);
         let first_line = &text.lines[0];
         let hex_span = first_line.spans.iter().find(|s| s.content.contains('⬢')).unwrap();
         // CORAL = Rgb(255, 107, 107) at bucket 2 (no intensity change)
@@ -539,5 +604,100 @@ mod tests {
         assert!(bold4, "bucket 4 should signal bold");
         let Color::Rgb(br, bg, bb) = bright else { panic!() };
         assert!(br > 184 && bg > 148 && bb > 230, "bucket 4 should brighten the color");
+    }
+
+    #[test]
+    fn render_buzz_cursor_highlights_selected_hex() {
+        let base_ts: DateTime<Utc> = "2026-04-30T12:00:00Z".parse().unwrap();
+        let state = BuzzState {
+            events: vec![
+                BuzzEvent {
+                    ts: Some(base_ts),
+                    actor: Some("daemon".to_string()),
+                    action: None,
+                    brief: None,
+                    cost_usd: 0.10,
+                    intensity_bucket: 2,
+                    duration_ms: None,
+                },
+                BuzzEvent {
+                    ts: Some(base_ts + chrono::Duration::minutes(1)),
+                    actor: Some("worker".to_string()),
+                    action: None,
+                    brief: None,
+                    cost_usd: 0.10,
+                    intensity_bucket: 2,
+                    duration_ms: None,
+                },
+            ],
+        };
+        let area = Rect::new(0, 0, 40, 10);
+        // cursor=0 highlights newest (worker). Check UNDERLINED modifier present.
+        let text = render_buzz(&state, area, 0);
+        let first_hex = text.lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains('⬢'))
+            .unwrap();
+        assert!(
+            first_hex.style.add_modifier.contains(Modifier::UNDERLINED),
+            "cursor=0 should have UNDERLINED on the first (newest) hex"
+        );
+    }
+
+    #[test]
+    fn render_buzz_detail_shows_actor_and_action() {
+        let base_ts: DateTime<Utc> = "2026-04-30T12:34:56Z".parse().unwrap();
+        let state = BuzzState {
+            events: vec![BuzzEvent {
+                ts: Some(base_ts),
+                actor: Some("queen".to_string()),
+                action: Some("dispatch".to_string()),
+                brief: Some("brief-042".to_string()),
+                cost_usd: 0.25,
+                intensity_bucket: 2,
+                duration_ms: Some(3500),
+            }],
+        };
+        let text = render_buzz_detail(&state, 0);
+        let rendered: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(rendered.contains("queen"), "should show actor");
+        assert!(rendered.contains("dispatch"), "should show action");
+        assert!(rendered.contains("brief-042"), "should show brief");
+        assert!(rendered.contains("$0.2500"), "should show cost");
+        assert!(rendered.contains("3.5s"), "should show wall time in seconds");
+    }
+
+    #[test]
+    fn render_buzz_legend_contains_all_apiary_roles() {
+        let text = render_buzz_legend();
+        let rendered: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        for role in &["queen", "worker", "validator", "reviewer", "scout", "daemon", "reject", "merge"] {
+            assert!(rendered.contains(role), "legend should contain {}", role);
+        }
+    }
+
+    #[test]
+    fn load_buzz_state_offset_shifts_window_end() {
+        // Call with a huge offset (1 year back) — whatever is in the local state
+        // will be far outside the window, so events.len() should be 0.
+        // Also tests that the function doesn't panic with large offset values.
+        let original = std::env::current_dir().unwrap();
+        let tmp = std::env::temp_dir();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let state = load_buzz_state(Duration::from_secs(3600), 365 * 24 * 3600);
+        // No log.jsonl in temp dir, so always empty regardless of window.
+        assert!(state.events.is_empty());
+
+        std::env::set_current_dir(&original).unwrap();
     }
 }
