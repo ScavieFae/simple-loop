@@ -2,9 +2,10 @@ use crate::state::{parse_log_ts, RawLogLine};
 use chrono::{DateTime, Utc};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
+use serde::Deserialize;
 use std::{
     fs,
     io::{BufRead, BufReader},
@@ -15,8 +16,6 @@ use std::{
 // Color constants — mirrors main.rs verbatim per brief anti-pattern
 const AMBER: Color = Color::from_u32(0x00F5A623);
 const GOLD: Color = Color::from_u32(0x00FFCE5C);
-// Used in Cycle 2 for reject event overrides
-#[allow(dead_code)]
 const CORAL: Color = Color::from_u32(0x00FF6B6B);
 const MUTED: Color = Color::from_u32(0x006A6A6A);
 const INDIGO: Color = Color::from_u32(0x007B8FD4);
@@ -26,9 +25,16 @@ const ORANGE: Color = Color::from_u32(0x00FF8C00);
 const TEAL: Color = Color::from_u32(0x005DADE2);
 
 // Ceremonial gold for merge events — distinct from STAMP_GREEN and GOLD.
-// Used in Cycle 2 event-type overrides.
-#[allow(dead_code)]
 pub const SHINY_GOLD: Color = Color::from_u32(0x00FFD700);
+
+// When a log event has no matching metrics entry, assign a fallback cost in
+// the median bucket range ($0.05–$0.30) so unfatributed events stay visible
+// at base intensity rather than rendering faint.
+const FALLBACK_COST: f64 = 0.10;
+
+// Maximum timestamp delta (seconds) to consider a metrics entry a match for
+// a log event when joining by proximity (session_id absent).
+const METRICS_MATCH_WINDOW_SECS: i64 = 1800;
 
 fn actor_color(actor: Option<&str>) -> Color {
     match actor {
@@ -43,22 +49,151 @@ fn actor_color(actor: Option<&str>) -> Color {
     }
 }
 
+// Returns CORAL for reject-class events, SHINY_GOLD for merge-class events,
+// None for everything else. Applied after actor_color, before intensity.
+fn event_color_override(action: Option<&str>) -> Option<Color> {
+    let action = action?;
+    let lower = action.to_lowercase();
+    if lower.contains("error")
+        || lower.contains("escalate")
+        || lower.contains("fail")
+        || lower.contains("reject")
+    {
+        return Some(CORAL);
+    }
+    if lower.contains("merge") || lower.contains("approve") {
+        return Some(SHINY_GOLD);
+    }
+    None
+}
+
+// Map cost_usd to a 0–4 intensity bucket per the log-scale table in the brief.
+pub fn cost_to_bucket(cost: f64) -> u8 {
+    if cost < 0.005 {
+        0
+    } else if cost < 0.05 {
+        1
+    } else if cost < 0.30 {
+        2
+    } else if cost < 1.00 {
+        3
+    } else {
+        4
+    }
+}
+
+// Adjust color brightness based on bucket. Returns (adjusted_color, bold).
+// Bucket 0–1 dim by multiplying channels. Bucket 3–4 brighten by blending
+// toward white. Bucket 4 also signals bold.
+fn apply_intensity(color: Color, bucket: u8) -> (Color, bool) {
+    let Color::Rgb(r, g, b) = color else {
+        return (color, bucket >= 4);
+    };
+    let (r, g, b, bold) = match bucket {
+        0 => (
+            (r as f32 * 0.50) as u8,
+            (g as f32 * 0.50) as u8,
+            (b as f32 * 0.50) as u8,
+            false,
+        ),
+        1 => (
+            (r as f32 * 0.70) as u8,
+            (g as f32 * 0.70) as u8,
+            (b as f32 * 0.70) as u8,
+            false,
+        ),
+        2 => (r, g, b, false),
+        3 => (
+            (r as f32 + (255.0 - r as f32) * 0.30) as u8,
+            (g as f32 + (255.0 - g as f32) * 0.30) as u8,
+            (b as f32 + (255.0 - b as f32) * 0.30) as u8,
+            false,
+        ),
+        _ => (
+            (r as f32 + (255.0 - r as f32) * 0.60) as u8,
+            (g as f32 + (255.0 - g as f32) * 0.60) as u8,
+            (b as f32 + (255.0 - b as f32) * 0.60) as u8,
+            true,
+        ),
+    };
+    (Color::Rgb(r, g, b), bold)
+}
+
+// ── metrics.jsonl ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RawMetricLine {
+    timestamp: Option<String>,
+    session_id: Option<String>,
+    cost_usd: Option<f64>,
+}
+
+struct MetricEntry {
+    ts: DateTime<Utc>,
+    session_id: Option<String>,
+    cost_usd: f64,
+}
+
+fn load_metrics(path: &Path) -> Vec<MetricEntry> {
+    let mut entries: Vec<MetricEntry> = Vec::new();
+    let Ok(file) = fs::File::open(path) else {
+        return entries;
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<RawMetricLine>(&line) else {
+            continue;
+        };
+        let Some(ts_str) = raw.timestamp.as_deref() else { continue };
+        let Some(ts) = parse_log_ts(ts_str) else { continue };
+        entries.push(MetricEntry {
+            ts,
+            session_id: raw.session_id,
+            cost_usd: raw.cost_usd.unwrap_or(0.0),
+        });
+    }
+    entries.sort_by_key(|e| e.ts);
+    entries
+}
+
+// Try session_id join first; fall back to nearest-timestamp within window.
+fn find_metric_cost(
+    metrics: &[MetricEntry],
+    event_ts: DateTime<Utc>,
+    event_session_id: Option<&str>,
+) -> f64 {
+    if let Some(sid) = event_session_id {
+        if let Some(m) = metrics.iter().find(|m| m.session_id.as_deref() == Some(sid)) {
+            return m.cost_usd;
+        }
+    }
+    let best = metrics.iter().min_by_key(|m| {
+        (m.ts - event_ts).num_seconds().unsigned_abs()
+    });
+    if let Some(m) = best {
+        if (m.ts - event_ts).num_seconds().abs() <= METRICS_MATCH_WINDOW_SECS {
+            return m.cost_usd;
+        }
+    }
+    FALLBACK_COST
+}
+
 // ── data model ────────────────────────────────────────────────────────────────
 
 pub struct BuzzEvent {
     pub ts: Option<DateTime<Utc>>,
     pub actor: Option<String>,
-    // Used in Cycle 3 cursor drill-in detail panel
-    #[allow(dead_code)]
     pub action: Option<String>,
     // Used in Cycle 3 cursor drill-in detail panel
     #[allow(dead_code)]
     pub brief: Option<String>,
-    // Used in Cycle 2 intensity bucketing via metrics.jsonl join
+    // Used in Cycle 3 cursor drill-in detail panel (cost display)
     #[allow(dead_code)]
     pub cost_usd: f64,
-    // Used in Cycle 2 render with log-scale brightness
-    #[allow(dead_code)]
     pub intensity_bucket: u8,
 }
 
@@ -76,9 +211,11 @@ pub struct BuzzState {
 
 pub fn load_buzz_state(window: Duration) -> BuzzState {
     let log_path = Path::new(".loop/state/log.jsonl");
+    let metrics_path = Path::new(".loop/state/metrics.jsonl");
     let window_end = Utc::now();
     let cutoff = window_end - chrono::Duration::seconds(window.as_secs() as i64);
 
+    let metrics = load_metrics(metrics_path);
     let mut events: Vec<BuzzEvent> = Vec::new();
 
     if let Ok(file) = fs::File::open(log_path) {
@@ -99,14 +236,20 @@ pub fn load_buzz_state(window: Duration) -> BuzzState {
                 }
             }
 
+            let cost_usd = if let Some(event_ts) = ts {
+                find_metric_cost(&metrics, event_ts, entry.session_id.as_deref())
+            } else {
+                FALLBACK_COST
+            };
+            let intensity_bucket = cost_to_bucket(cost_usd);
+
             events.push(BuzzEvent {
                 ts,
                 actor: entry.derived_actor(),
                 action: entry.event.or(entry.action),
                 brief: entry.brief,
-                // Cycle 1: cost stub — all events get bucket 2 (median / base color)
-                cost_usd: 0.0,
-                intensity_bucket: 2,
+                cost_usd,
+                intensity_bucket,
             });
         }
     }
@@ -169,8 +312,18 @@ pub fn render_buzz<'a>(state: &BuzzState, area: Rect) -> Text<'a> {
         for ev_idx in consumed..row_end {
             // Reverse index: newest event (highest index) → leftmost hex
             let ev = &state.events[event_count - 1 - ev_idx];
-            let color = actor_color(ev.actor.as_deref());
-            spans.push(Span::styled("⬢ ", Style::default().fg(color)));
+
+            // Event-type override takes priority over actor base color
+            let base_color = event_color_override(ev.action.as_deref())
+                .unwrap_or_else(|| actor_color(ev.actor.as_deref()));
+
+            let (color, bold) = apply_intensity(base_color, ev.intensity_bucket);
+            let style = if bold {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            spans.push(Span::styled("⬢ ", style));
         }
 
         lines.push(Line::from(spans));
@@ -201,22 +354,6 @@ mod tests {
         assert_eq!(actor_color(Some("researcher")), GOLD);
         assert_eq!(actor_color(None), MUTED);
         assert_eq!(actor_color(Some("unknown_actor")), MUTED);
-    }
-
-    #[test]
-    fn intensity_bucket_stubbed_to_2_in_cycle1() {
-        // All events loaded in Cycle 1 must be bucket 2 (median / base color)
-        // until Cycle 2 wires the metrics.jsonl cost join.
-        let original = std::env::current_dir().unwrap();
-        let tmp = std::env::temp_dir();
-        std::env::set_current_dir(&tmp).unwrap();
-
-        let state = load_buzz_state(Duration::from_secs(3600));
-        // No log file in tmp → empty, no assertions on buckets needed.
-        // Just verify it doesn't panic.
-        assert!(state.events.iter().all(|e| e.intensity_bucket == 2));
-
-        std::env::set_current_dir(&original).unwrap();
     }
 
     #[test]
@@ -258,7 +395,7 @@ mod tests {
                     actor: Some("daemon".to_string()),
                     action: None,
                     brief: None,
-                    cost_usd: 0.0,
+                    cost_usd: 0.10,
                     intensity_bucket: 2,
                 },
                 BuzzEvent {
@@ -266,7 +403,7 @@ mod tests {
                     actor: Some("worker".to_string()),
                     action: None,
                     brief: None,
-                    cost_usd: 0.0,
+                    cost_usd: 0.10,
                     intensity_bucket: 2,
                 },
                 BuzzEvent {
@@ -274,7 +411,7 @@ mod tests {
                     actor: Some("queen".to_string()),
                     action: None,
                     brief: None,
-                    cost_usd: 0.0,
+                    cost_usd: 0.10,
                     intensity_bucket: 2,
                 },
             ],
@@ -287,13 +424,14 @@ mod tests {
         assert!(!text.lines.is_empty(), "should produce at least one row");
 
         // First span in first row (after optional offset space) should be queen color
+        // at bucket 2 (base intensity → apply_intensity returns same RGB)
         let first_line = &text.lines[0];
         let first_hex = first_line.spans.iter().find(|s| s.content.contains('⬢')).unwrap();
-        assert_eq!(
-            first_hex.style.fg,
-            Some(LAVENDER),
-            "newest event (queen) should be leftmost hex (LAVENDER)"
-        );
+        let Color::Rgb(r, g, b) = first_hex.style.fg.unwrap() else {
+            panic!("expected Rgb color");
+        };
+        // LAVENDER = 0x00B894E6 → Rgb(184, 148, 230). Bucket 2 → unchanged.
+        assert_eq!((r, g, b), (0xB8, 0x94, 0xE6), "newest event (queen) should be leftmost hex (LAVENDER at base intensity)");
     }
 
     #[test]
@@ -304,8 +442,8 @@ mod tests {
         let t2: DateTime<Utc> = "2026-04-30T11:00:00Z".parse().unwrap();
 
         let mut events = [
-            BuzzEvent { ts: Some(t2), actor: None, action: None, brief: None, cost_usd: 0.0, intensity_bucket: 2 },
-            BuzzEvent { ts: Some(t1), actor: None, action: None, brief: None, cost_usd: 0.0, intensity_bucket: 2 },
+            BuzzEvent { ts: Some(t2), actor: None, action: None, brief: None, cost_usd: 0.10, intensity_bucket: 2 },
+            BuzzEvent { ts: Some(t1), actor: None, action: None, brief: None, cost_usd: 0.10, intensity_bucket: 2 },
         ];
         events.sort_by(|a, b| match (a.ts, b.ts) {
             (Some(at), Some(bt)) => at.cmp(&bt),
@@ -316,5 +454,90 @@ mod tests {
 
         assert_eq!(events[0].ts, Some(t1));
         assert_eq!(events[1].ts, Some(t2));
+    }
+
+    // ── Cycle 2 tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn cost_to_bucket_boundaries() {
+        assert_eq!(cost_to_bucket(0.0), 0, "$0.00 → bucket 0");
+        assert_eq!(cost_to_bucket(0.004), 0, "$0.004 → bucket 0");
+        assert_eq!(cost_to_bucket(0.005), 1, "$0.005 → bucket 1");
+        assert_eq!(cost_to_bucket(0.049), 1, "$0.049 → bucket 1");
+        assert_eq!(cost_to_bucket(0.05), 2, "$0.05 → bucket 2");
+        assert_eq!(cost_to_bucket(0.10), 2, "$0.10 → bucket 2");
+        assert_eq!(cost_to_bucket(0.299), 2, "$0.299 → bucket 2");
+        assert_eq!(cost_to_bucket(0.30), 3, "$0.30 → bucket 3");
+        assert_eq!(cost_to_bucket(0.999), 3, "$0.999 → bucket 3");
+        assert_eq!(cost_to_bucket(1.00), 4, "$1.00 → bucket 4");
+        assert_eq!(cost_to_bucket(5.00), 4, "$5.00 → bucket 4");
+    }
+
+    #[test]
+    fn event_override_reject_actions_return_coral() {
+        assert_eq!(event_color_override(Some("error")), Some(CORAL));
+        assert_eq!(event_color_override(Some("escalate")), Some(CORAL));
+        assert_eq!(event_color_override(Some("fail")), Some(CORAL));
+        assert_eq!(event_color_override(Some("reject")), Some(CORAL));
+        assert_eq!(event_color_override(Some("task_fail")), Some(CORAL));
+        assert_eq!(event_color_override(Some("escalate_blocked")), Some(CORAL));
+    }
+
+    #[test]
+    fn event_override_merge_actions_return_shiny_gold() {
+        assert_eq!(event_color_override(Some("merge")), Some(SHINY_GOLD));
+        assert_eq!(event_color_override(Some("approve")), Some(SHINY_GOLD));
+        assert_eq!(event_color_override(Some("daemon:merge")), Some(SHINY_GOLD));
+        assert_eq!(event_color_override(Some("stamp_merge")), Some(SHINY_GOLD));
+    }
+
+    #[test]
+    fn event_override_none_for_normal_actions() {
+        assert_eq!(event_color_override(None), None);
+        assert_eq!(event_color_override(Some("dispatch")), None);
+        assert_eq!(event_color_override(Some("heartbeat")), None);
+        assert_eq!(event_color_override(Some("evaluate")), None);
+    }
+
+    #[test]
+    fn event_override_takes_priority_over_actor_color_in_render() {
+        // A queen actor with an "escalate" action should render CORAL, not LAVENDER.
+        let base_ts: DateTime<Utc> = "2026-04-30T12:00:00Z".parse().unwrap();
+        let state = BuzzState {
+            events: vec![BuzzEvent {
+                ts: Some(base_ts),
+                actor: Some("queen".to_string()),
+                action: Some("escalate".to_string()),
+                brief: None,
+                cost_usd: 0.10,
+                intensity_bucket: 2,
+            }],
+            window: Duration::from_secs(3600),
+            window_end: Utc::now(),
+        };
+        let area = Rect::new(0, 0, 40, 10);
+        let text = render_buzz(&state, area);
+        let first_line = &text.lines[0];
+        let hex_span = first_line.spans.iter().find(|s| s.content.contains('⬢')).unwrap();
+        // CORAL = Rgb(255, 107, 107) at bucket 2 (no intensity change)
+        assert_eq!(
+            hex_span.style.fg,
+            Some(Color::Rgb(0xFF, 0x6B, 0x6B)),
+            "escalate action on queen should render CORAL not LAVENDER"
+        );
+    }
+
+    #[test]
+    fn apply_intensity_dims_bucket_0_and_brightens_bucket_4() {
+        // Base color LAVENDER = Rgb(184, 148, 230)
+        let (dim, bold0) = apply_intensity(LAVENDER, 0);
+        assert!(!bold0);
+        let Color::Rgb(r, g, b) = dim else { panic!() };
+        assert!(r < 184 && g < 148 && b < 230, "bucket 0 should dim the color");
+
+        let (bright, bold4) = apply_intensity(LAVENDER, 4);
+        assert!(bold4, "bucket 4 should signal bold");
+        let Color::Rgb(br, bg, bb) = bright else { panic!() };
+        assert!(br > 184 && bg > 148 && bb > 230, "bucket 4 should brighten the color");
     }
 }

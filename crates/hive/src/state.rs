@@ -82,6 +82,7 @@ pub struct RawLogLine {
     pub actor: Option<String>,
     pub event: Option<String>,
     pub brief: Option<String>,
+    pub session_id: Option<String>,
     /// Set on `daemon:scout_*` events; carries the specialist name so the
     /// dance floor and Cells Scouts subsection can attribute observations
     /// per-scout without re-parsing the action string.
