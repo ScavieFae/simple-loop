@@ -843,6 +843,18 @@ fn actor_color(actor: Option<&str>) -> Color {
     }
 }
 
+/// Canonicalize legacy actor names to current apiary terminology for display.
+/// Log events on disk preserve the original name (forensic record), but the
+/// dance floor renders the current term so it stays consistent with the
+/// glossary at wiki/operating-docs/apiary-glossary.md.
+fn display_actor(actor: Option<&str>) -> &str {
+    match actor {
+        Some("conductor") => "queen",
+        Some(other) => other,
+        None => "?",
+    }
+}
+
 fn event_color(event: Option<&str>) -> Color {
     match event {
         Some(e) if e.contains("error") || e.contains("escalate") || e.contains("fail") => CORAL,
@@ -888,7 +900,7 @@ fn render_dance_floor<'a>(df: &'a state::DanceFloorState) -> (Text<'a>, u16) {
             .ts
             .map(state::relative_time)
             .unwrap_or_else(|| "?".to_string());
-        let actor_str = ev.actor.as_deref().unwrap_or("?");
+        let actor_str = display_actor(ev.actor.as_deref());
         let ac = actor_color(ev.actor.as_deref());
         let msg_str = ev.event.as_deref().unwrap_or("?");
         let msg = truncate_chars(msg_str, 55);
@@ -1661,6 +1673,18 @@ mod tests {
         std::env::set_current_dir(&tmp).unwrap();
         let _ = detect_loop_root();
         std::env::set_current_dir(&original).unwrap();
+    }
+
+    #[test]
+    fn display_actor_canonicalizes_legacy_conductor_to_queen() {
+        // Legacy log events written before brief-065 (conductor → queen rename)
+        // still live in log.jsonl as forensic record. Dance Floor renders the
+        // current term so it stays consistent with apiary-glossary.md.
+        assert_eq!(display_actor(Some("conductor")), "queen");
+        assert_eq!(display_actor(Some("queen")), "queen");
+        assert_eq!(display_actor(Some("worker")), "worker");
+        assert_eq!(display_actor(Some("scout")), "scout");
+        assert_eq!(display_actor(None), "?");
     }
 
     #[test]
