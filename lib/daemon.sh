@@ -844,19 +844,74 @@ fire_scout() {
     local name
     name="$(basename "$scout_file" .md)"
 
-    local model
-    model="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-field "$scout_file" model 2>/dev/null)"
-    [ -z "$model" ] && model="sonnet"
+    local mode
+    mode="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-mode "$scout_file" 2>/dev/null)"
+    [ -z "$mode" ] && mode="inference"
 
     local max_runtime
     max_runtime="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-field "$scout_file" max_runtime_seconds 2>/dev/null)"
     [ -z "$max_runtime" ] && max_runtime="60"
 
-    local scout_json
-    scout_json="$(mktemp)"
     local scout_log="$LOG_DIR/scout_${name}_$(date +%Y%m%d_%H%M%S).log"
     local start
     start="$(date +%s)"
+
+    # Timeout wrapper — shared by deterministic and inference dispatch paths.
+    local TIMEOUT_BIN=""
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="gtimeout"
+    fi
+
+    # ── Deterministic dispatch ──────────────────────────────────────────
+    # mode: deterministic → run python3 <binary> --project-dir <path> directly.
+    # No claude invocation; the binary manages its own writes. No output-contract
+    # enforcement (the binary is trusted to write what the spec says it writes).
+    if [ "$mode" = "deterministic" ]; then
+        local binary
+        binary="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-field "$scout_file" binary 2>/dev/null)"
+        if [ -z "$binary" ]; then
+            daemon_log "SCOUT: $name mode=deterministic but missing binary field — skipping"
+            return 0
+        fi
+        local binary_path="$DAEMON_LIB_DIR/$binary"
+        if [ ! -f "$binary_path" ]; then
+            daemon_log "SCOUT: $name binary not found at $binary_path — skipping"
+            return 0
+        fi
+
+        if [ -n "$TIMEOUT_BIN" ]; then
+            "$TIMEOUT_BIN" "${max_runtime}s" python3 "$binary_path" --project-dir "$PROJECT_DIR" \
+                >> "$scout_log" 2>&1
+        else
+            daemon_log "SCOUT: $name running without timeout (no timeout/gtimeout on PATH)"
+            python3 "$binary_path" --project-dir "$PROJECT_DIR" >> "$scout_log" 2>&1
+        fi
+        local exit_code=$?
+        local duration_ms=$(( ( $(date +%s) - start ) * 1000 ))
+
+        # Pass "wrote" as output_status — record_fire maps exit_code!=0 to
+        # scout_failed first, so this only affects the success path (→ scout_fire).
+        python3 "$DAEMON_LIB_DIR/scouts.py" record-fire \
+            "$scout_file" "$PROJECT_DIR" "$exit_code" "$duration_ms" \
+            "wrote" "" >/dev/null 2>&1
+
+        if [ "$exit_code" -eq 0 ]; then
+            daemon_log "SCOUT: $name (deterministic) fired (${duration_ms}ms)"
+        else
+            daemon_log "SCOUT: $name (deterministic) exit=$exit_code (${duration_ms}ms)"
+        fi
+        return 0
+    fi
+
+    # ── Inference dispatch (default) ────────────────────────────────────
+    local model
+    model="$(python3 "$DAEMON_LIB_DIR/scouts.py" get-field "$scout_file" model 2>/dev/null)"
+    [ -z "$model" ] && model="sonnet"
+
+    local scout_json
+    scout_json="$(mktemp)"
 
     # Body is the role prompt (everything after frontmatter).
     local body
@@ -865,16 +920,6 @@ fire_scout() {
         daemon_log "SCOUT: $name has empty body — skipping"
         rm -f "$scout_json"
         return 0
-    fi
-
-    # Timeout wrapper keeps a runaway scout bounded. `timeout` is BSD/GNU
-    # cross-compatible on macOS when installed via coreutils; fall back to
-    # `gtimeout` then to no-timeout if neither is on PATH (logged).
-    local TIMEOUT_BIN=""
-    if command -v timeout >/dev/null 2>&1; then
-        TIMEOUT_BIN="timeout"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        TIMEOUT_BIN="gtimeout"
     fi
 
     if [ -n "$TIMEOUT_BIN" ]; then
