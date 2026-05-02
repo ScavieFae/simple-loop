@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
@@ -194,6 +195,56 @@ def cadence_seconds(fm):
     return max(1, n * mult)
 
 
+# ─── Mode field (deterministic | inference) ──────────────────────────
+# mode: deterministic — daemon runs python3 <binary> --project-dir <path> directly.
+# mode: inference     — daemon fires via claude CLI (default for existing scouts).
+
+_VALID_MODES = {"deterministic", "inference"}
+
+
+def get_mode(fm):
+    """Return scout mode: 'deterministic' | 'inference' (default for existing scouts)."""
+    return fm.get("mode", "inference")
+
+
+def dispatch_scout(specialist_path, project_dir):
+    """Dispatch a scout according to its declared mode.
+
+    mode: deterministic — subprocess python3 <binary> --project-dir <project_dir>.
+                          Returns (exit_code, stdout).
+    mode: inference     — raises NotImplementedError.
+                          Inference dispatch lives in daemon.sh (claude CLI path).
+
+    Raises ValueError for unknown mode, FileNotFoundError if binary is missing.
+    """
+    fm, _ = parse_specialist(specialist_path)
+    mode = get_mode(fm)
+
+    if mode not in _VALID_MODES:
+        raise ValueError(f"unknown scout mode {mode!r}; expected one of {_VALID_MODES}")
+
+    if mode == "inference":
+        raise NotImplementedError(
+            f"inference dispatch is handled by daemon.sh/claude, not scouts.py. "
+            f"Scout: {specialist_path}"
+        )
+
+    binary = fm.get("binary", "").strip()
+    if not binary:
+        raise ValueError(f"deterministic scout missing 'binary' field: {specialist_path}")
+
+    lib_dir = os.path.dirname(os.path.abspath(__file__))
+    binary_path = os.path.normpath(os.path.join(lib_dir, binary))
+    if not os.path.exists(binary_path):
+        raise FileNotFoundError(f"scout binary not found: {binary_path}")
+
+    result = subprocess.run(
+        [sys.executable, binary_path, "--project-dir", str(project_dir)],
+        capture_output=True, text=True,
+    )
+    return result.returncode, result.stdout
+
+
 # ─── log.jsonl scan for scout events ─────────────────────────────────
 
 _SCOUT_ACTIONS = ("daemon:scout_fire", "daemon:scout_noop", "daemon:scout_failed")
@@ -351,6 +402,7 @@ _CONTRACTS = {
     "signals-issue-file",
     "brief-draft",
     "log-only",
+    "deterministic-direct",  # deterministic scouts manage their own output
 }
 
 _NOOP_MARKERS = (
@@ -424,6 +476,10 @@ def apply_output_contract(specialist_path, scout_json_path, project_dir):
 
     if contract not in _CONTRACTS:
         return ("rejected", f"unknown_contract:{contract or 'missing'}")
+
+    if contract == "deterministic-direct":
+        # Deterministic scouts write their own output; contract enforcement is a no-op.
+        return ("noop", "")
 
     result = _extract_result(scout_json_path)
     if _is_noop(result):
@@ -529,6 +585,10 @@ def main():
     if cmd == "get-field":
         fm, _ = parse_specialist(sys.argv[2])
         _print_field(fm, sys.argv[3])
+        return
+    if cmd == "get-mode":
+        fm, _ = parse_specialist(sys.argv[2])
+        print(get_mode(fm))
         return
     if cmd == "get-body":
         _, body = parse_specialist(sys.argv[2])
