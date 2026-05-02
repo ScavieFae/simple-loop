@@ -200,6 +200,7 @@ pub struct BriefProgress {
     pub total: usize,
     pub last_task: String,
     pub tasks_remaining: usize,
+    #[allow(dead_code)]
     pub status: String,
 }
 
@@ -388,7 +389,7 @@ impl HiveState {
         };
 
         let pid = read_daemon_pid();
-        let pid_alive = pid.map(|p| self::pid_alive(p)).unwrap_or(false);
+        let pid_alive = pid.map(self::pid_alive).unwrap_or(false);
 
         let daemon_started_at = read_daemon_started_at();
 
@@ -436,6 +437,7 @@ pub struct RunningJson {
     #[serde(default)]
     pub awaiting_review: Vec<PendingEvalRaw>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub history: Vec<HistoryEntryRaw>,
 }
 
@@ -456,12 +458,16 @@ pub struct PendingEvalRaw {
 
 #[derive(Deserialize)]
 pub struct HistoryEntryRaw {
+    #[allow(dead_code)]
     pub brief: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub merged_at: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub merge_sha: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub approved_at: Option<String>,
 }
 
@@ -474,6 +480,7 @@ pub struct HistoryEntryRaw {
 pub struct ReQueuedBrief {
     pub brief_id: String,
     pub blocked_on: String,
+    #[allow(dead_code)]
     pub description: String,
     /// True when the blocking brief appears in running.json history[] with a
     /// merge_sha (precondition cleared; ready to re-dispatch).
@@ -511,7 +518,7 @@ pub struct ActiveBrief {
 pub fn parse_cycle_budget(brief_path: &Path) -> Option<usize> {
     let content = fs::read_to_string(brief_path).ok()?;
     let mut lines = content.lines();
-    while let Some(line) = lines.next() {
+    for line in lines.by_ref() {
         if line.trim_start().starts_with("## Budget") {
             break;
         }
@@ -1116,13 +1123,13 @@ fn parse_brief_status(brief_path: &Path) -> Option<String> {
 
     // YAML frontmatter: between opening and closing `---`
     if lines.first().map(|l| l.trim()) == Some("---") {
-        for i in 1..lines.len() {
-            if lines[i].trim() == "---" {
+        for line in lines.iter().skip(1) {
+            if line.trim() == "---" {
                 break;
             }
-            let lower = lines[i].to_ascii_lowercase();
+            let lower = line.to_ascii_lowercase();
             if lower.starts_with("status:") {
-                let value = lines[i]["status:".len()..].trim().trim_matches(|c: char| ".,;".contains(c));
+                let value = line["status:".len()..].trim().trim_matches(|c: char| ".,;".contains(c));
                 if !value.is_empty() {
                     return Some(normalize_status(value));
                 }
@@ -1269,6 +1276,7 @@ pub fn discover_queued_from_cards(
 /// by brief id (the history often carries two entries per brief — a
 /// dispatch-record with `approved_at` and a merge-record with `merged_at`).
 /// Returns up to `RECENTLY_FINISHED_LIMIT` entries, sorted newest-first.
+#[allow(dead_code)]
 pub fn recent_finished(history: &[HistoryEntryRaw]) -> Vec<RecentlyFinishedBrief> {
     use std::collections::HashMap;
     // For each brief id, keep the entry with the latest merged_at (or
@@ -3010,7 +3018,7 @@ some non-bracket junk line
 ";
         std::fs::write(&path, data).unwrap();
         let ts = latest_daemon_log_ts(&path).expect("should find one");
-        use chrono::{Datelike, TimeZone, Timelike};
+        use chrono::{Datelike, Timelike};
         let local = ts.with_timezone(&chrono::Local);
         assert_eq!(local.hour(), 10);
         assert_eq!(local.minute(), 30);
@@ -3038,14 +3046,12 @@ some non-bracket junk line
         let _base = chrono::NaiveDateTime::parse_from_str("2026-04-21 11:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         // Put both in the far future so max_age_secs doesn't filter them out
         // Instead use a very large max_age
-        let data = format!(
-            "[2026-04-21 11:00:00] WORKER: starting for brief-006-foo in worktree\n[2026-04-21 11:00:10] WORKER: model loaded for brief-006-foo\n"
-        );
+        let data = "[2026-04-21 11:00:00] WORKER: starting for brief-006-foo in worktree\n[2026-04-21 11:00:10] WORKER: model loaded for brief-006-foo\n";
         let path = std::env::temp_dir().join(format!(
             "hive_daemon_test_{}.log",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()
         ));
-        std::fs::write(&path, &data).unwrap();
+        std::fs::write(&path, data).unwrap();
         // Use huge max_age so the 2026 timestamps aren't filtered out
         let events = load_daemon_log_events(&path, 99_999_999);
         // Two lines with same actor+brief within 30s should collapse
@@ -3391,8 +3397,7 @@ some non-bracket junk line
     fn signal_payload_has_content_reflects_emptiness() {
         let empty = SignalPayload::default();
         assert!(!empty.has_content());
-        let mut with_summary = SignalPayload::default();
-        with_summary.summary = Some("a thing".to_string());
+        let with_summary = SignalPayload { summary: Some("a thing".to_string()), ..Default::default() };
         assert!(with_summary.has_content());
     }
 

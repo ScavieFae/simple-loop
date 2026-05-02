@@ -1,3 +1,4 @@
+mod buzz;
 mod config;
 mod state;
 
@@ -47,6 +48,7 @@ enum Panel {
     Signals,
     Cells,
     DanceFloor,
+    Buzz,
 }
 
 impl Panel {
@@ -55,7 +57,8 @@ impl Panel {
             Panel::Hive => Panel::Signals,
             Panel::Signals => Panel::Cells,
             Panel::Cells => Panel::DanceFloor,
-            Panel::DanceFloor => Panel::Hive,
+            Panel::DanceFloor => Panel::Buzz,
+            Panel::Buzz => Panel::Hive,
         }
     }
 
@@ -65,6 +68,7 @@ impl Panel {
             Panel::Signals => " Signals ",
             Panel::Cells => " Cells ",
             Panel::DanceFloor => " Dance Floor ",
+            Panel::Buzz => " Buzz ",
         }
     }
 }
@@ -92,11 +96,12 @@ const TEAL: Color = Color::from_u32(0x005DADE2);
 
 struct App {
     focused: Panel,
-    scroll: [u16; 4],
+    scroll: [u16; 5],
     spinner_frame: usize,
     hive: state::HiveState,
     cells: state::CellsState,
     dance_floor: state::DanceFloorState,
+    buzz: buzz::BuzzState,
     signals: state::SignalsState,
     learnings: state::LearningsState,
     dance_floor_auto_scroll: bool,
@@ -122,11 +127,12 @@ impl App {
     fn new() -> Self {
         App {
             focused: Panel::DanceFloor,
-            scroll: [0; 4],
+            scroll: [0; 5],
             spinner_frame: 0,
             hive: state::HiveState::load(),
             cells: state::CellsState::load(),
             dance_floor: state::DanceFloorState::load(),
+            buzz: buzz::load_buzz_state(std::time::Duration::from_secs(3 * 3600)),
             signals: state::SignalsState::load(),
             learnings: state::LearningsState::load(),
             dance_floor_auto_scroll: true,
@@ -148,6 +154,7 @@ impl App {
         self.hive = state::HiveState::load();
         self.cells = state::CellsState::load();
         self.dance_floor = state::DanceFloorState::load();
+        self.buzz = buzz::load_buzz_state(std::time::Duration::from_secs(3 * 3600));
         self.signals = state::SignalsState::load();
         self.learnings = state::LearningsState::load();
         // Clamp cursor to current signals count — signals come and go as the
@@ -1404,6 +1411,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         };
         let df_auto = app.dance_floor_auto_scroll;
         let df_manual_scroll = app.scroll[Panel::DanceFloor as usize];
+        let show_buzz = app.focused == Panel::Buzz;
         let show_help = app.show_help;
         let show_signal_detail = app.show_signal_detail;
         let signal_modal_scroll = app.signal_modal_scroll;
@@ -1471,20 +1479,31 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                 main_row[0],
             );
 
-            // Auto-scroll: pin dance floor to bottom unless user manually scrolled up
-            let df_inner_h = main_row[1].height.saturating_sub(2);
-            let df_scroll = if df_auto {
-                dance_floor_line_count.saturating_sub(df_inner_h)
+            // Right main slot: Buzz when focused, otherwise Dance Floor
+            if show_buzz {
+                let buzz_text = buzz::render_buzz(&app.buzz, main_row[1]);
+                let buzz_scroll = app.scroll[Panel::Buzz as usize];
+                f.render_widget(
+                    Paragraph::new(buzz_text)
+                        .scroll((buzz_scroll, 0))
+                        .block(app.panel_block(Panel::Buzz)),
+                    main_row[1],
+                );
             } else {
-                df_manual_scroll
-            };
-
-            f.render_widget(
-                Paragraph::new(dance_floor_text)
-                    .scroll((df_scroll, 0))
-                    .block(app.panel_block(Panel::DanceFloor)),
-                main_row[1],
-            );
+                // Auto-scroll: pin dance floor to bottom unless user manually scrolled up
+                let df_inner_h = main_row[1].height.saturating_sub(2);
+                let df_scroll = if df_auto {
+                    dance_floor_line_count.saturating_sub(df_inner_h)
+                } else {
+                    df_manual_scroll
+                };
+                f.render_widget(
+                    Paragraph::new(dance_floor_text)
+                        .scroll((df_scroll, 0))
+                        .block(app.panel_block(Panel::DanceFloor)),
+                    main_row[1],
+                );
+            }
 
             // ── footer ────────────────────────────────────────────────────────
             f.render_widget(
@@ -1492,11 +1511,13 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                     Span::styled("  q ", Style::default().fg(GOLD)),
                     Span::styled("quit  ", Style::default().fg(MUTED)),
                     Span::styled("·  j/k ", Style::default().fg(GOLD)),
-                    Span::styled("scroll/cursor  ", Style::default().fg(MUTED)),
+                    Span::styled("scroll  ", Style::default().fg(MUTED)),
                     Span::styled("·  tab ", Style::default().fg(GOLD)),
-                    Span::styled("cycle panel  ", Style::default().fg(MUTED)),
-                    Span::styled("·  enter ", Style::default().fg(GOLD)),
-                    Span::styled("open signal  ", Style::default().fg(MUTED)),
+                    Span::styled("cycle  ", Style::default().fg(MUTED)),
+                    Span::styled("·  b ", Style::default().fg(GOLD)),
+                    Span::styled("buzz  ", Style::default().fg(MUTED)),
+                    Span::styled("·  c ", Style::default().fg(GOLD)),
+                    Span::styled("cells  ", Style::default().fg(MUTED)),
                     Span::styled("·  r ", Style::default().fg(GOLD)),
                     Span::styled("refresh  ", Style::default().fg(MUTED)),
                     Span::styled("·  ? ", Style::default().fg(GOLD)),
@@ -1620,10 +1641,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                             }
                             KeyCode::Char('?') => app.toggle_help(),
                             KeyCode::Tab => app.focus_next(),
-                            KeyCode::Enter => {
-                                if app.focused == Panel::Signals {
-                                    app.open_signal_detail();
-                                }
+                            // Direct-jump keys: b → Buzz, c → Cells
+                            KeyCode::Char('b') => app.focused = Panel::Buzz,
+                            KeyCode::Char('c') => app.focused = Panel::Cells,
+                            KeyCode::Enter if app.focused == Panel::Signals => {
+                                app.open_signal_detail();
                             }
                             KeyCode::Char('j') => {
                                 if app.focused == Panel::Signals {
@@ -1688,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_tab_cycles_all_four() {
+    fn panel_tab_cycles_all_five() {
         let mut app = App::new();
         app.focused = Panel::Hive;
         app.focus_next();
@@ -1697,6 +1719,8 @@ mod tests {
         assert_eq!(app.focused, Panel::Cells);
         app.focus_next();
         assert_eq!(app.focused, Panel::DanceFloor);
+        app.focus_next();
+        assert_eq!(app.focused, Panel::Buzz);
         app.focus_next();
         assert_eq!(app.focused, Panel::Hive);
     }
