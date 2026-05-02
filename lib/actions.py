@@ -128,8 +128,12 @@ def load_running(paths):
 
 # ─── brief-034 concurrency: frontmatter parse + overlap detection ────
 
-PARALLEL_SAFE_LINE_RE = re.compile(r"^\s*\*\*Parallel-safe:\*\*\s*(\S+)", re.IGNORECASE)
-EDIT_SURFACE_LINE_RE = re.compile(r"^\s*\*\*Edit-surface:\*\*\s*(.*?)\s*$", re.IGNORECASE)
+# Match both prose form (`**Parallel-safe:** true`) and YAML-frontmatter form
+# (`Parallel-safe: true`). Pre-fix this only matched the prose form, which
+# silently parsed every YAML-frontmatter card as parallel_safe=False — meaning
+# THROTTLE>1 has been dead since brief-108 collapsed cards to YAML.
+PARALLEL_SAFE_LINE_RE = re.compile(r"^\s*(?:\*\*Parallel-safe:\*\*|Parallel-safe:)\s*(\S+)", re.IGNORECASE)
+EDIT_SURFACE_LINE_RE = re.compile(r"^\s*(?:\*\*Edit-surface:\*\*|Edit-surface:)\s*(.*?)\s*$", re.IGNORECASE)
 
 
 def _normalize_surface_path(p):
