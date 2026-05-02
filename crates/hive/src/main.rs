@@ -124,6 +124,9 @@ struct App {
     last_learning_rotation: Instant,
     /// Per-project palette + layout config from `.loop/config.json`.
     config: config::HiveConfig,
+    /// True when the Signals slot should show the Buzz hex grid instead of
+    /// "From the Hive" learnings. Toggled by `b`. Alert signals override both.
+    signals_show_buzz: bool,
 }
 
 const LEARNING_ROTATION_SECS: u64 = 60;
@@ -150,6 +153,7 @@ impl App {
             learning_index: 0,
             last_learning_rotation: Instant::now(),
             config: config::HiveConfig::load(),
+            signals_show_buzz: false,
         }
     }
 
@@ -1420,22 +1424,31 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
         let hive_text = render_hive(&app);
         let cells_text = render_cells(&app.cells, app.config.layout.active_section_height);
         let (dance_floor_text, dance_floor_line_count) = render_dance_floor(&app.dance_floor);
-        // Mode switch: Signals-slot shows actual signals when something
-        // needs attention, cycles "From the Hive" learnings when calm.
+        // Mode switch: Signals-slot priority (high→low):
+        //   1. Alert signals (signals present) — overrides both buzz and learnings
+        //   2. Buzz hex grid — when signals_show_buzz toggled ON and no alerts
+        //   3. "From the Hive" learnings — calm default
         let signals_slot_calm = app.signals.signals.is_empty();
-        let signals_text = if signals_slot_calm {
-            render_hive_learning(app.learnings.pick(app.learning_index))
-        } else {
+        let signals_slot_buzz = app.signals_show_buzz && signals_slot_calm;
+        let signals_text = if !signals_slot_calm {
             render_signals(
                 &app.signals,
                 app.signal_cursor,
                 app.focused == Panel::Signals,
             )
-        };
-        let signals_title = if signals_slot_calm {
-            " From the Hive "
+        } else if signals_slot_buzz {
+            // Buzz is rendered directly inside the draw closure using the
+            // actual slot rect — Text::default() here is never displayed.
+            Text::default()
         } else {
+            render_hive_learning(app.learnings.pick(app.learning_index))
+        };
+        let signals_title = if !signals_slot_calm {
             Panel::Signals.label()
+        } else if signals_slot_buzz {
+            " Buzz "
+        } else {
+            " From the Hive "
         };
         let df_auto = app.dance_floor_auto_scroll;
         let df_manual_scroll = app.scroll[Panel::DanceFloor as usize];
@@ -1487,13 +1500,49 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                 top_row[0],
             );
 
-            f.render_widget(
-                Paragraph::new(signals_text)
-                    .scroll((app.scroll[Panel::Signals as usize], 0))
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .block(app.panel_block_titled(Panel::Signals, signals_title)),
-                top_row[1],
-            );
+            {
+                let signals_block = app.panel_block_titled(Panel::Signals, signals_title);
+                if signals_slot_buzz {
+                    // Render buzz hex grid directly inside the signals slot.
+                    // Split inner area: grid rows + legend (1 line at bottom).
+                    let inner = signals_block.inner(top_row[1]);
+                    f.render_widget(signals_block, top_row[1]);
+                    let inner_h = inner.height;
+                    let (grid_area, legend_area) = if inner_h > 1 {
+                        let parts = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Min(1),
+                                Constraint::Length(1),
+                            ])
+                            .split(inner);
+                        (parts[0], parts[1])
+                    } else {
+                        (inner, inner)
+                    };
+                    let buzz_text =
+                        buzz::render_buzz(&app.buzz, grid_area, buzz_cursor_idx);
+                    f.render_widget(
+                        Paragraph::new(buzz_text)
+                            .scroll((app.scroll[Panel::Signals as usize], 0)),
+                        grid_area,
+                    );
+                    if inner_h > 1 {
+                        f.render_widget(
+                            Paragraph::new(buzz::render_buzz_legend()),
+                            legend_area,
+                        );
+                    }
+                } else {
+                    f.render_widget(
+                        Paragraph::new(signals_text)
+                            .scroll((app.scroll[Panel::Signals as usize], 0))
+                            .wrap(ratatui::widgets::Wrap { trim: false })
+                            .block(signals_block),
+                        top_row[1],
+                    );
+                }
+            }
 
             // ── main row ──────────────────────────────────────────────────────
             let main_row = Layout::default()
@@ -1564,7 +1613,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                     Span::styled("·  tab ", Style::default().fg(GOLD)),
                     Span::styled("cycle  ", Style::default().fg(MUTED)),
                     Span::styled("·  b ", Style::default().fg(GOLD)),
-                    Span::styled("buzz  ", Style::default().fg(MUTED)),
+                    Span::styled("buzz toggle  ", Style::default().fg(MUTED)),
                     Span::styled("·  c ", Style::default().fg(GOLD)),
                     Span::styled("cells  ", Style::default().fg(MUTED)),
                     Span::styled("·  r ", Style::default().fg(GOLD)),
@@ -1690,21 +1739,26 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                             }
                             KeyCode::Char('?') => app.toggle_help(),
                             KeyCode::Tab => app.focus_next(),
-                            // Direct-jump keys: b → Buzz, c → Cells
-                            KeyCode::Char('b') => app.focused = Panel::Buzz,
+                            // b → toggle Buzz hex grid in Signals slot (focus Signals on activation)
+                            KeyCode::Char('b') => {
+                                app.signals_show_buzz = !app.signals_show_buzz;
+                                if app.signals_show_buzz {
+                                    app.focused = Panel::Signals;
+                                }
+                            }
                             KeyCode::Char('c') => app.focused = Panel::Cells,
                             KeyCode::Enter if app.focused == Panel::Signals => {
                                 app.open_signal_detail();
                             }
                             KeyCode::Char('j') => {
-                                if app.focused == Panel::Signals {
+                                if app.focused == Panel::Signals && !app.signals_show_buzz {
                                     app.signal_cursor_down();
                                 } else {
                                     app.scroll_down();
                                 }
                             }
                             KeyCode::Char('k') => {
-                                if app.focused == Panel::Signals {
+                                if app.focused == Panel::Signals && !app.signals_show_buzz {
                                     app.signal_cursor_up();
                                 } else {
                                     if app.focused == Panel::DanceFloor {
@@ -1718,38 +1772,62 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, cwd: &str) 
                                 app.refresh_state();
                                 last_state_refresh = Instant::now();
                             }
-                            KeyCode::Left if app.focused == Panel::Buzz => {
+                            KeyCode::Left
+                                if app.focused == Panel::Buzz
+                                    || (app.focused == Panel::Signals
+                                        && app.signals_show_buzz) =>
+                            {
                                 app.buzz_cursor = app.buzz_cursor.saturating_sub(1);
                             }
                             KeyCode::Right
-                                if app.focused == Panel::Buzz
+                                if (app.focused == Panel::Buzz
+                                    || (app.focused == Panel::Signals
+                                        && app.signals_show_buzz))
                                     && !app.buzz.events.is_empty() =>
                             {
                                 let max = app.buzz.events.len() - 1;
                                 app.buzz_cursor = (app.buzz_cursor + 1).min(max);
                             }
-                            KeyCode::Up if app.focused == Panel::Buzz => {
+                            KeyCode::Up
+                                if app.focused == Panel::Buzz
+                                    || (app.focused == Panel::Signals
+                                        && app.signals_show_buzz) =>
+                            {
                                 app.buzz_cursor =
                                     app.buzz_cursor.saturating_sub(buzz_hexes_per_row);
                             }
                             KeyCode::Down
-                                if app.focused == Panel::Buzz
+                                if (app.focused == Panel::Buzz
+                                    || (app.focused == Panel::Signals
+                                        && app.signals_show_buzz))
                                     && !app.buzz.events.is_empty() =>
                             {
                                 let max = app.buzz.events.len() - 1;
                                 app.buzz_cursor =
                                     (app.buzz_cursor + buzz_hexes_per_row).min(max);
                             }
-                            KeyCode::Char('[') if app.focused == Panel::Buzz => {
+                            KeyCode::Char('[')
+                                if app.focused == Panel::Buzz
+                                    || (app.focused == Panel::Signals
+                                        && app.signals_show_buzz) =>
+                            {
                                 app.buzz_window_offset_secs += 3 * 3600 / 2;
                                 app.reload_buzz();
                             }
-                            KeyCode::Char(']') if app.focused == Panel::Buzz => {
+                            KeyCode::Char(']')
+                                if app.focused == Panel::Buzz
+                                    || (app.focused == Panel::Signals
+                                        && app.signals_show_buzz) =>
+                            {
                                 app.buzz_window_offset_secs =
                                     (app.buzz_window_offset_secs - 3 * 3600 / 2).max(0);
                                 app.reload_buzz();
                             }
-                            KeyCode::Char('=') if app.focused == Panel::Buzz => {
+                            KeyCode::Char('=')
+                                if app.focused == Panel::Buzz
+                                    || (app.focused == Panel::Signals
+                                        && app.signals_show_buzz) =>
+                            {
                                 app.buzz_window_offset_secs = 0;
                                 app.reload_buzz();
                             }
@@ -1979,5 +2057,49 @@ mod tests {
         app.signal_cursor_down();
         let sel = app.selected_signal().unwrap();
         assert_eq!(sel.brief.as_deref(), Some("brief-001"));
+    }
+
+    // ── signals_show_buzz toggle (brief-120) ──────────────────────────────────
+
+    #[test]
+    fn signals_show_buzz_defaults_false() {
+        let app = App::new();
+        assert!(!app.signals_show_buzz);
+    }
+
+    #[test]
+    fn signals_show_buzz_toggle_focuses_signals_on_activation() {
+        let mut app = App::new();
+        app.focused = Panel::DanceFloor;
+        // Simulate pressing `b` (toggle ON)
+        app.signals_show_buzz = !app.signals_show_buzz;
+        if app.signals_show_buzz {
+            app.focused = Panel::Signals;
+        }
+        assert!(app.signals_show_buzz);
+        assert_eq!(app.focused, Panel::Signals);
+    }
+
+    #[test]
+    fn signals_show_buzz_toggle_off_does_not_change_focus() {
+        let mut app = App::new();
+        app.signals_show_buzz = true;
+        app.focused = Panel::Signals;
+        // Simulate pressing `b` again (toggle OFF)
+        app.signals_show_buzz = !app.signals_show_buzz;
+        assert!(!app.signals_show_buzz);
+        // Focus stays on Signals (not reset)
+        assert_eq!(app.focused, Panel::Signals);
+    }
+
+    #[test]
+    fn signals_slot_buzz_suppressed_when_alerts_present() {
+        // Even if signals_show_buzz is true, alerts (non-empty signals) take priority.
+        // The rendering condition is: signals_slot_buzz = signals_show_buzz && signals_slot_calm.
+        let mut app = app_with_signals(1);
+        app.signals_show_buzz = true;
+        let signals_slot_calm = app.signals.signals.is_empty();
+        let signals_slot_buzz = app.signals_show_buzz && signals_slot_calm;
+        assert!(!signals_slot_buzz, "alerts should override buzz toggle");
     }
 }
