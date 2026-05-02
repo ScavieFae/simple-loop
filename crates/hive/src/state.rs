@@ -685,6 +685,17 @@ pub struct PendingBrief {
     pub estimated_time: Option<String>,
 }
 
+/// Whether a queued brief is dispatchable, derived from its `Depends-on:` field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueuedReadiness {
+    /// All deps are merged (or no deps).
+    Ready,
+    /// One or more deps are not yet merged.
+    Blocked { first_unmet: String, more: usize },
+    /// Direct dependency cycle detected (A depends on B, B depends on A).
+    CycleDetected,
+}
+
 pub struct QueuedBrief {
     pub brief: String,
     /// Position in `.loop/state/goals.md` `## Queued next` (0 = top).
@@ -695,6 +706,8 @@ pub struct QueuedBrief {
     /// Non-empty means this brief is credential-gated and won't dispatch until
     /// all listed vars are set in the daemon's env. Rendered with a key marker.
     pub depends_on_secrets: Vec<String>,
+    /// Derived from `Depends-on:` frontmatter — whether all deps are merged.
+    pub readiness: QueuedReadiness,
 }
 
 pub struct DraftBrief {
@@ -1103,6 +1116,168 @@ pub fn parse_depends_on_secrets(brief_path: &Path) -> Vec<String> {
     vec![]
 }
 
+/// Check whether a string looks like a brief ID (`brief-NNN` or `brief-NNN-slug`).
+fn is_brief_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("brief-") else { return false; };
+    let digit_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if digit_end == 0 { return false; }
+    let after = &rest[digit_end..];
+    after.is_empty() || after.starts_with('-')
+}
+
+/// Extract all `brief-NNN-*` substrings from freeform prose (legacy cards).
+fn extract_brief_ids_from_prose(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut remaining = s;
+    while let Some(pos) = remaining.find("brief-") {
+        let from_brief = &remaining[pos..];
+        let end = from_brief
+            .find(|c: char| c.is_whitespace() || ",;()[]".contains(c))
+            .unwrap_or(from_brief.len());
+        let candidate = from_brief[..end].trim_matches(|c: char| ".,;".contains(c));
+        if is_brief_id(candidate) {
+            out.push(candidate.to_string());
+        }
+        remaining = &remaining[pos + 6..];
+    }
+    out
+}
+
+/// Split a raw `Depends-on` value into a list of brief IDs.
+///
+/// Handles comma-separated IDs and freeform prose (extracts `brief-NNN-*`).
+/// Returns `[]` for `_none_` or when no valid tokens survive.
+fn split_depends_on_value(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed == "_none_" || trimmed.eq_ignore_ascii_case("none") {
+        return vec![];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for tok in trimmed.split(',') {
+        let cleaned = tok.trim().trim_matches(|c: char| ".,;".contains(c));
+        if cleaned.is_empty() { continue; }
+        // Strip trailing parenthetical annotation: "brief-078 (hard)" → "brief-078"
+        let stripped = cleaned.split('(').next().unwrap_or("").trim().trim_matches(|c: char| ".,;".contains(c));
+        if is_brief_id(stripped) {
+            out.push(stripped.to_string());
+        } else {
+            let extracted = extract_brief_ids_from_prose(stripped);
+            if extracted.is_empty() {
+                eprintln!("parse_depends_on: dropping non-brief-id token: {cleaned:?}");
+            } else {
+                out.extend(extracted);
+            }
+        }
+    }
+    out
+}
+
+/// Parse `Depends-on:` from a brief markdown file.
+///
+/// Handles YAML frontmatter (`Depends-on: brief-X`) and bold-markdown legacy
+/// form (`**Depends-on:** brief-X`). Comma-separated IDs are supported; freeform
+/// prose falls back to extracting `brief-NNN-*` substrings. Returns empty Vec
+/// when absent, unreadable, or value is `_none_`.
+pub fn parse_depends_on(brief_path: &Path) -> Vec<String> {
+    let Ok(content) = fs::read_to_string(brief_path) else {
+        return vec![];
+    };
+    let lines: Vec<&str> = content.lines().collect();
+
+    // YAML frontmatter: between opening and closing `---`
+    if lines.first().map(|l| l.trim()) == Some("---") {
+        for line in lines.iter().skip(1) {
+            if line.trim() == "---" { break; }
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("depends-on:") {
+                let after = &line["depends-on:".len()..];
+                return split_depends_on_value(after.trim());
+            }
+        }
+    }
+
+    // Bold markdown fallback: `**Depends-on:** value`
+    for line in &lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("**depends-on:**") {
+            if let Some(pos) = lower.find("**depends-on:**") {
+                let after = &line[pos + "**depends-on:**".len()..];
+                return split_depends_on_value(after.trim());
+            }
+        }
+    }
+
+    vec![]
+}
+
+/// Build a map of `brief_id → Status` for every card in `cards_dir`.
+fn build_card_status_map(cards_dir: &Path) -> std::collections::HashMap<String, String> {
+    let Ok(entries) = fs::read_dir(cards_dir) else {
+        return std::collections::HashMap::new();
+    };
+    let mut map = std::collections::HashMap::new();
+    for entry in entries.flatten() {
+        let card_dir = entry.path();
+        if !card_dir.is_dir() { continue; }
+        let Some(brief_id) = card_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            continue;
+        };
+        if brief_id.starts_with('.') { continue; }
+        let index_path = card_dir.join("index.md");
+        if let Some(status) = parse_brief_status(&index_path) {
+            map.insert(brief_id, status);
+        }
+    }
+    map
+}
+
+/// Compute whether a queued brief is ready to dispatch or blocked.
+///
+/// Deps with status `merged` are met. Missing cards render as `[card not found]`.
+/// Direct cycles (A→B and B→A) render as `CycleDetected`.
+fn compute_readiness(
+    cards_dir: &Path,
+    deps: &[String],
+    current_id: &str,
+    status_map: &std::collections::HashMap<String, String>,
+) -> QueuedReadiness {
+    if deps.is_empty() {
+        return QueuedReadiness::Ready;
+    }
+    let mut unmet: Vec<String> = Vec::new();
+    for dep in deps {
+        let card_entry = status_map.iter().find(|(k, _)| brief_id_matches(k, dep));
+        match card_entry {
+            None => {
+                eprintln!("hive: Depends-on dep {dep:?} has no card — rendering as blocked");
+                unmet.push(format!("{dep} [card not found]"));
+            }
+            Some((card_id, status)) => {
+                if status == "merged" {
+                    // dep is met
+                } else {
+                    // Check for direct cycle: does dep also depend on current_id?
+                    let dep_path = cards_dir.join(card_id).join("index.md");
+                    let dep_deps = parse_depends_on(&dep_path);
+                    if dep_deps.iter().any(|d| brief_id_matches(d, current_id)) {
+                        eprintln!("hive: dependency cycle between {current_id} and {card_id}");
+                        return QueuedReadiness::CycleDetected;
+                    }
+                    unmet.push(dep.clone());
+                }
+            }
+        }
+    }
+    if unmet.is_empty() {
+        QueuedReadiness::Ready
+    } else {
+        QueuedReadiness::Blocked {
+            first_unmet: unmet[0].clone(),
+            more: unmet.len() - 1,
+        }
+    }
+}
+
 /// Normalize a Status field value to lowercase-hyphenated form for comparison.
 /// Accepts variations like `not-doing`, `Not-Doing`, `not_doing`.
 fn normalize_status(s: &str) -> String {
@@ -1239,6 +1414,7 @@ pub fn discover_queued_from_cards(
         return vec![];
     };
     let priority = parse_goals_priority(goals_path);
+    let status_map = build_card_status_map(cards_dir);
     let mut out: Vec<QueuedBrief> = Vec::new();
     for entry in entries.flatten() {
         let card_dir = entry.path();
@@ -1257,17 +1433,25 @@ pub fn discover_queued_from_cards(
         }
         let priority_rank = priority.iter().position(|p| priority_matches(p, &brief_id));
         let depends_on_secrets = parse_depends_on_secrets(&index_path);
+        let deps = parse_depends_on(&index_path);
+        let readiness = compute_readiness(cards_dir, &deps, &brief_id, &status_map);
         out.push(QueuedBrief {
             brief: brief_id,
             priority_rank,
             depends_on_secrets,
+            readiness,
         });
     }
+    // Sort: ready before blocked, then by priority_rank, then by brief_sort_key.
     out.sort_by(|a, b| {
-        let rank_a = a.priority_rank.unwrap_or(usize::MAX);
-        let rank_b = b.priority_rank.unwrap_or(usize::MAX);
-        rank_a
-            .cmp(&rank_b)
+        let rw_a: u8 = if matches!(a.readiness, QueuedReadiness::Ready) { 0 } else { 1 };
+        let rw_b: u8 = if matches!(b.readiness, QueuedReadiness::Ready) { 0 } else { 1 };
+        rw_a.cmp(&rw_b)
+            .then_with(|| {
+                let rank_a = a.priority_rank.unwrap_or(usize::MAX);
+                let rank_b = b.priority_rank.unwrap_or(usize::MAX);
+                rank_a.cmp(&rank_b)
+            })
             .then_with(|| brief_sort_key(&a.brief).cmp(&brief_sort_key(&b.brief)))
     });
     out
@@ -4190,6 +4374,172 @@ some non-bracket junk line
         }
         let result = discover_recently_finished_from_cards(&dir);
         assert!(result.len() <= RECENTLY_FINISHED_LIMIT, "must cap at RECENTLY_FINISHED_LIMIT");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── parse_depends_on tests (brief-117) ────────────────────────────────────
+
+    #[test]
+    fn parse_depends_on_none_value_returns_empty() {
+        let dir = std::env::temp_dir().join(format!("hive_dep_none_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.md");
+        std::fs::write(&path, "---\nStatus: queued\nDepends-on: _none_\n---\n").unwrap();
+        assert_eq!(parse_depends_on(&path), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_depends_on_missing_field_returns_empty() {
+        let dir = std::env::temp_dir().join(format!("hive_dep_missing_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.md");
+        std::fs::write(&path, "---\nStatus: queued\n---\n# no depends-on field\n").unwrap();
+        assert_eq!(parse_depends_on(&path), Vec::<String>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_depends_on_single_dep_yaml() {
+        let dir = std::env::temp_dir().join(format!("hive_dep_single_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.md");
+        std::fs::write(&path, "---\nStatus: queued\nDepends-on: brief-091-modal-training\n---\n").unwrap();
+        assert_eq!(parse_depends_on(&path), vec!["brief-091-modal-training"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_depends_on_multiple_deps_yaml() {
+        let dir = std::env::temp_dir().join(format!("hive_dep_multi_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.md");
+        std::fs::write(&path, "---\nStatus: queued\nDepends-on: brief-010-foo, brief-011-bar, brief-012-baz\n---\n").unwrap();
+        assert_eq!(
+            parse_depends_on(&path),
+            vec!["brief-010-foo", "brief-011-bar", "brief-012-baz"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_depends_on_bold_markdown_fallback() {
+        let dir = std::env::temp_dir().join(format!("hive_dep_bold_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.md");
+        std::fs::write(&path, "# legacy card\n**Depends-on:** brief-018-smolvla-adapter\n").unwrap();
+        assert_eq!(parse_depends_on(&path), vec!["brief-018-smolvla-adapter"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── discover_queued_from_cards readiness tests (brief-117) ───────────────
+
+    fn nanos() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    }
+
+    fn make_card(dir: &std::path::PathBuf, id: &str, status: &str, depends_on: Option<&str>) {
+        let card_dir = dir.join(id);
+        std::fs::create_dir_all(&card_dir).unwrap();
+        let dep_line = match depends_on {
+            Some(d) => format!("Depends-on: {d}\n"),
+            None => String::new(),
+        };
+        std::fs::write(
+            card_dir.join("index.md"),
+            format!("---\nStatus: {status}\n{dep_line}---\n"),
+        ).unwrap();
+    }
+
+    #[test]
+    fn queued_brief_with_all_deps_merged_is_ready() {
+        let dir = std::env::temp_dir().join(format!("hive_ready_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        make_card(&dir, "brief-001-upstream", "merged", None);
+        make_card(&dir, "brief-002-queued", "queued", Some("brief-001-upstream"));
+        let goals = dir.join("goals.md");
+        let result = discover_queued_from_cards(&dir, &goals);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].readiness, QueuedReadiness::Ready);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queued_brief_with_unmet_dep_is_blocked() {
+        let dir = std::env::temp_dir().join(format!("hive_blocked_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        make_card(&dir, "brief-001-upstream", "active", None);
+        make_card(&dir, "brief-002-downstream", "queued", Some("brief-001-upstream"));
+        let goals = dir.join("goals.md");
+        let result = discover_queued_from_cards(&dir, &goals);
+        assert_eq!(result.len(), 1);
+        assert!(
+            matches!(&result[0].readiness, QueuedReadiness::Blocked { first_unmet, more: 0 }
+                if first_unmet == "brief-001-upstream"),
+            "expected blocked on brief-001-upstream, got {:?}", result[0].readiness
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queued_brief_with_multiple_unmet_deps_shows_first_plus_count() {
+        let dir = std::env::temp_dir().join(format!("hive_multi_blocked_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        make_card(&dir, "brief-010-a", "active", None);
+        make_card(&dir, "brief-011-b", "active", None);
+        make_card(&dir, "brief-012-c", "active", None);
+        make_card(&dir, "brief-020-downstream", "queued", Some("brief-010-a, brief-011-b, brief-012-c"));
+        let goals = dir.join("goals.md");
+        let result = discover_queued_from_cards(&dir, &goals);
+        assert_eq!(result.len(), 1);
+        assert!(
+            matches!(&result[0].readiness, QueuedReadiness::Blocked { more, .. } if *more == 2),
+            "expected 2 more blocked deps, got {:?}", result[0].readiness
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queued_brief_with_orphan_dep_renders_card_not_found() {
+        let dir = std::env::temp_dir().join(format!("hive_orphan_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        make_card(&dir, "brief-050-queued", "queued", Some("brief-9999-nonexistent"));
+        let goals = dir.join("goals.md");
+        let result = discover_queued_from_cards(&dir, &goals);
+        assert_eq!(result.len(), 1);
+        assert!(
+            matches!(&result[0].readiness, QueuedReadiness::Blocked { first_unmet, .. }
+                if first_unmet.contains("[card not found]")),
+            "expected card-not-found marker, got {:?}", result[0].readiness
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn queued_briefs_sort_ready_before_blocked() {
+        let dir = std::env::temp_dir().join(format!("hive_sort_ready_{}", nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        make_card(&dir, "brief-001-upstream", "active", None);
+        // brief-010: blocked (dep active)
+        make_card(&dir, "brief-010-blocked", "queued", Some("brief-001-upstream"));
+        // brief-020: ready (no deps)
+        make_card(&dir, "brief-020-ready", "queued", None);
+        // brief-030: blocked (dep active)
+        make_card(&dir, "brief-030-also-blocked", "queued", Some("brief-001-upstream"));
+        // brief-040: ready (dep merged)
+        make_card(&dir, "brief-040-also-ready", "queued", None);
+        let goals = dir.join("goals.md");
+        let result = discover_queued_from_cards(&dir, &goals);
+        assert_eq!(result.len(), 4);
+        // First two must be ready
+        assert!(matches!(result[0].readiness, QueuedReadiness::Ready), "index 0 must be ready");
+        assert!(matches!(result[1].readiness, QueuedReadiness::Ready), "index 1 must be ready");
+        // Last two must be blocked
+        assert!(matches!(result[2].readiness, QueuedReadiness::Blocked { .. }), "index 2 must be blocked");
+        assert!(matches!(result[3].readiness, QueuedReadiness::Blocked { .. }), "index 3 must be blocked");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

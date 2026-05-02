@@ -720,6 +720,29 @@ fn render_cells<'a>(cells: &state::CellsState, active_section_height: u16) -> Te
                 qb.brief.clone(),
                 Style::default().fg(Color::White),
             ));
+            match &qb.readiness {
+                state::QueuedReadiness::Ready => {
+                    spans.push(Span::styled("  (ready)", Style::default().fg(STAMP_GREEN)));
+                }
+                state::QueuedReadiness::Blocked { first_unmet, more: 0 } => {
+                    spans.push(Span::styled(
+                        format!("  (blocked: waiting on {first_unmet})"),
+                        Style::default().fg(AMBER),
+                    ));
+                }
+                state::QueuedReadiness::Blocked { first_unmet, more } => {
+                    spans.push(Span::styled(
+                        format!("  (blocked: waiting on {first_unmet} +{more} more)"),
+                        Style::default().fg(AMBER),
+                    ));
+                }
+                state::QueuedReadiness::CycleDetected => {
+                    spans.push(Span::styled(
+                        "  (blocked: cycle detected)",
+                        Style::default().fg(CORAL),
+                    ));
+                }
+            }
             if !qb.depends_on_secrets.is_empty() {
                 let missing: Vec<&str> = qb.depends_on_secrets.iter().map(|s| s.as_str()).collect();
                 spans.push(Span::styled(
